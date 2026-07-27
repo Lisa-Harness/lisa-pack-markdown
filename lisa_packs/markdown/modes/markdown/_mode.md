@@ -6,6 +6,7 @@ mode_kind: chat
 routable: true
 priority: 6
 routing_intent_tags: [write]
+satisfies_intents: [write]
 routing_intent_keywords:
   write:
     - write
