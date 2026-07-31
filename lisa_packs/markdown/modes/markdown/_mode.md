@@ -28,7 +28,10 @@ allowed_tool_ids:
   - markdown_generate
   - write_file
   - read_file
+  - list_files
   - memory.search
+  - okf_emit_concept
+  - okf_log
 tools_authoritative: true
 command_pattern: '^(?:/)?markdown(?:[\s,:;]+(?P<query>.+))?$'
 description: "Forge and iterate on a markdown document from user input + recalled memory, validate it with markdown-it-py, and store it via lisa-storage."
@@ -65,6 +68,44 @@ store the document. Use them in this order:
   something.
 - When the user starts a new document, skip the read step.
 
+## Consolidation (source_paths)
+
+When the user wants to consolidate multiple existing documents into one
+coherent narrative, pass `source_paths` to `markdown_forge_document`. Each
+entry is a path (or glob) plus an optional NL `priority` note:
+
+```jsonc
+{
+  "document_path": "lisa-framework-narrative.md",
+  "source_paths": [
+    {"path": "artifacts/files/architecture_gap_swot.md", "priority": "primary — keep its section structure"},
+    {"path": "artifacts/files/agent_framework_swot.md", "priority": "secondary — dedupe against source 1, keep anything unique"},
+    {"path": "artifacts/files/lisa-runtime-state-reflection.md", "priority": "background — one paragraph max"},
+    {"path": "artifacts/files/*.md"}
+  ],
+  "okf_bundle_path": "okf/forge-provenance"
+}
+```
+
+In consolidation mode the operation:
+
+1. Expands globs via `list_files` and reads every source via `read_file`.
+2. Injects the sources with their per-source priority notes into a
+   preserve-detail system prompt — the model is instructed to PRESERVE
+   DETAIL, not summarize.
+3. Applies a density floor (output bytes vs source bytes, scaled by source
+   count). A sub-floor output triggers one re-forge pass with a sharpened
+   instruction; if it still fails, the artifact is persisted with a
+   density-FAILED annotation so the user knows it may be a lossy abridgment.
+4. Captures full provenance to an OKF `forge-provenance` concept (per-source
+   table, processing passes, density check) and appends a `log.md` entry.
+5. Writes an extended non-rendering HTML footer to the document with a
+   model/sources/processing/OKF-pointer summary.
+
+The priority note is free NL prose — "keep verbatim", "dedupe against
+source 1", "background, one paragraph max" — scoped to exactly the source
+it labels. Do NOT generalize a "background" note to the other sources.
+
 ## Rules
 
 - Never claim a document was stored unless the `write_file` tool result
@@ -73,3 +114,5 @@ store the document. Use them in this order:
   absolute paths); the storage server re-validates.
 - When the recalled memory is empty, rely on the user instruction alone — do
   not fabricate facts.
+- In consolidation mode, PRESERVE DETAIL. A short output for a large source
+  set is a FAILURE, not a virtue. Length is not a quality signal.
