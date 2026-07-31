@@ -16,4 +16,4 @@ Re-forge the document, this time PRESERVING SOURCE DETAIL:
 
 The original instruction, source documents, and priority notes are in the
 prior messages. Return ONLY the re-forged document as a single fenced
-```markdown block.
+markdown block.

@@ -24,6 +24,7 @@ fast_path_patterns:
   - '\b(document|doc|markdown|runbook|post|note)\b.*\b(forge|draft|write|compose|output|create|generate|make|produce)\b'
   - '\bmarkdown\b'
 allowed_operation_ids: []
+required_capabilities: [tools]
 allowed_tool_ids:
   - markdown_generate
   - write_file
