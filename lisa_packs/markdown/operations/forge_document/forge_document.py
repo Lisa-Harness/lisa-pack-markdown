@@ -113,7 +113,7 @@ _DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_density_retry.md"
 # into ``ctx`` for ``execution_kind: runtime``). See
 # /memories/repo/operation-tunables-placement.md and
 # /memories/repo/forge-document-truncation-contract.md.
-_MAX_COMPLETION_TOKENS = 7500
+_MAX_COMPLETION_TOKENS = 50_000
 # Continuation pass uses the same cap. The continuation appends only the
 # missing tail, so the same budget is sufficient for nearly all cases.
 _MAX_CONTINUE_TOKENS = _MAX_COMPLETION_TOKENS
@@ -121,8 +121,8 @@ _MAX_CONTINUE_TOKENS = _MAX_COMPLETION_TOKENS
 # "model ran out of tokens one section early" case; two covers the
 # rare "still truncated, one more chunk needed" case. Beyond this we
 # give up and annotate the document as truncated rather than looping.
-_MAX_CONTINUE_ATTEMPTS = 2
-_MAX_RECALL_RECORDS = 8
+_MAX_CONTINUE_ATTEMPTS = 4
+_MAX_RECALL_RECORDS = 25
 # Hard ceiling on the persisted document. The original 20K cap (from the
 # single-doc/memory era) forced summarization of anything larger and was a
 # root cause of the 2026-07-30 "summarizing instead of writing" incident:
@@ -130,9 +130,9 @@ _MAX_RECALL_RECORDS = 8
 # consolidations raise the cap so the preservation directive is
 # enforceable. The map-reduce path (future work) will handle the case
 # where even this cap is too small for one pass.
-_MAX_DOCUMENT_CHARS = 20_000
-_MAX_DOCUMENT_CHARS_WITH_SOURCES = 240_000
-_MAX_QUERY_CHARS = 2_000
+_MAX_DOCUMENT_CHARS = 500_000
+_MAX_DOCUMENT_CHARS_WITH_SOURCES = 1_500_000
+_MAX_QUERY_CHARS = 20_000
 
 # Density floor (consolidation anti-abridgment gate, added 2026-07-30).
 # When the caller supplied source_paths, the output must preserve enough of
