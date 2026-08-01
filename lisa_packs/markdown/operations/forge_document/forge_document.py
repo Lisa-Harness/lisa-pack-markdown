@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -93,12 +94,24 @@ _SYSTEM_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_system_sources.md"
 _USER_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_user_sources.md"
 _DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_density_retry.md"
 
-# Token cap for the synthesizing pass. Bumped from 2000 → 7500 on
-# 2026-07-18 after a local Ollama gemma4:cloud run truncated a detailed
-# SWOT mid-section ("finished" at section 2.1 with finish_reason=unknown).
-# 2000 tokens is tight for any document with a SWOT + architectural
-# invariants section; 7500 matches the yml ``completion_max_tokens`` so
-# the python-authored op and the declarative metadata agree. See
+# Fallback defaults for the operation's configurable budgets. The
+# authoritative source is the session manifest's
+# ``resources.packs.configuration.markdown.<key>`` block, surfaced to the
+# op at runtime as ``ctx.pack_config`` (an immutable mapping loaded by
+# ``kernel/pack_configuration.SessionPackConfigurationResolver`` before
+# ``execute`` runs). These constants are only the last-resort fallback when
+# no manifest config is supplied so the op still works in a bare host.
+#
+# Manifest keys (all under ``resources.packs.configuration.markdown``):
+#   forge_max_completion_tokens, forge_max_continue_tokens,
+#   forge_max_continue_attempts, forge_max_recall_records,
+#   forge_max_document_chars, forge_max_document_chars_with_sources,
+#   forge_max_query_chars.
+#
+# The YAML ``completion_max_tokens`` mirrors ``forge_max_completion_tokens``
+# but is documentary-only for runtime ops (the kernel does not inject it
+# into ``ctx`` for ``execution_kind: runtime``). See
+# /memories/repo/operation-tunables-placement.md and
 # /memories/repo/forge-document-truncation-contract.md.
 _MAX_COMPLETION_TOKENS = 7500
 # Continuation pass uses the same cap. The continuation appends only the
@@ -245,13 +258,70 @@ def _extract_document_path(params: dict[str, Any]) -> str:
     raw = str(params.get("document_path") or "").strip()
     if not raw:
         return "docs/forge.md"
-    # Reject absolute paths and parent traversal before the storage server
     # sees them; the storage server re-validates, but we fail early with a
     # clearer error.
     normalized = raw.replace("\\", "/").lstrip("/")
     if ".." in normalized.split("/"):
         raise RuntimeError("document_path may not contain '..' segments")
     return normalized
+
+
+@dataclass(frozen=True)
+class _ResolvedSettings:
+    """Resolved operation budgets: ``ctx.pack_config`` overrides module fallbacks.
+
+    The authoritative source is the session manifest's
+    ``resources.packs.configuration.markdown.<key>`` block, surfaced at
+    runtime as ``ctx.pack_config`` (an immutable MappingProxyType populated
+    by ``kernel/operations/registry._resolve_execution_configuration`` before
+    ``execute`` runs). The module ``_MAX_*`` constants are last-resort
+    fallbacks used only when the manifest supplies no value, so the op still
+    works in a bare host with no manifest config.
+
+    See /memories/repo/operation-tunables-placement.md.
+    """
+
+    max_completion_tokens: int
+    max_continue_tokens: int
+    max_continue_attempts: int
+    max_recall_records: int
+    max_document_chars: int
+    max_document_chars_with_sources: int
+    max_query_chars: int
+
+
+def _cfg_int(pack_config: Any, key: str, default: int) -> int:
+    """Read an int from ``ctx.pack_config`` with a module-constant fallback.
+
+    Coerces non-int values to the default rather than raising, since pack
+    config is session-authored and a malformed value should not crash the
+    op mid-turn (the fallback is the safe, known-good default). The mapping
+    is immutable (MappingProxyType), so we only read from it.
+    """
+    if pack_config is None:
+        return default
+    raw = pack_config.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("forge_document: pack_config[%r]=%r is not an int; using default %d", key, raw, default)
+        return default
+
+
+def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
+    """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
+    pc = ctx.pack_config
+    return _ResolvedSettings(
+        max_completion_tokens=_cfg_int(pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS),
+        max_continue_tokens=_cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
+        max_continue_attempts=_cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
+        max_recall_records=_cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
+        max_document_chars=_cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
+        max_document_chars_with_sources=_cfg_int(pc, "forge_max_document_chars_with_sources", _MAX_DOCUMENT_CHARS_WITH_SOURCES),
+        max_query_chars=_cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
+    )
 
 
 def _document_stem(document_path: str) -> str:
@@ -267,11 +337,11 @@ def _document_stem(document_path: str) -> str:
     return base or "forge"
 
 
-def _extract_query(ctx: OperationExecutionContext, params: dict[str, Any]) -> str:
+def _extract_query(ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int) -> str:
     """Return the user-supplied instruction, bounded in length."""
     raw = str(params.get("query") or ctx.query or "").strip()
-    if len(raw) > _MAX_QUERY_CHARS:
-        raw = raw[:_MAX_QUERY_CHARS] + "…"
+    if len(raw) > max_query_chars:
+        raw = raw[:max_query_chars] + "…"
     return raw
 
 
@@ -320,7 +390,8 @@ async def _read_existing_document(
 async def _recall_memory(
     ctx: OperationExecutionContext,
     query: str,
-    limit: int = _MAX_RECALL_RECORDS,
+    *,
+    limit: int,
 ) -> str:
     """Recall relevant memories via the ``memory.search`` MCP alias.
 
@@ -391,6 +462,8 @@ async def _call_llm(
     memory_context: str,
     existing_document: str = "",
     source_block: str = "",
+    *,
+    max_tokens: int,
 ) -> tuple[str, Any, str | None]:
     """Call the host's completion function with the forging prompt.
 
@@ -434,7 +507,7 @@ async def _call_llm(
     completion = await ctx.complete_fn(
         messages=messages,
         model_def=model_def,
-        max_tokens=_MAX_COMPLETION_TOKENS,
+        max_tokens=max_tokens,
         temperature=0.2,
         tools=None,
         response_format=None,
@@ -470,6 +543,8 @@ async def _continue_llm(
     user_input: str,
     document_so_far: str,
     model_def: Any,
+    *,
+    max_tokens: int,
 ) -> tuple[str, str | None]:
     """Issue one continuation pass to finish a truncated document.
 
@@ -493,7 +568,7 @@ async def _continue_llm(
     completion = await ctx.complete_fn(
         messages=messages,
         model_def=model_def,
-        max_tokens=_MAX_CONTINUE_TOKENS,
+        max_tokens=max_tokens,
         temperature=0.2,
         tools=None,
         response_format=None,
@@ -733,6 +808,8 @@ async def _continue_until_complete(
     document: str,
     model_def: Any,
     first_finish_reason: str | None,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
 ) -> tuple[str, bool, int, str | None]:
     """Run continuation passes until the document looks complete or budget is hit.
 
@@ -761,13 +838,14 @@ async def _continue_until_complete(
     attempts = 0
     final_finish_reason = first_finish_reason
     current = document
-    for attempt in range(1, _MAX_CONTINUE_ATTEMPTS + 1):
+    for attempt in range(1, max_continue_attempts + 1):
         attempts = attempt
         continuation_text, cont_finish_reason = await _continue_llm(
             ctx,
             user_input=user_input,
             document_so_far=current,
             model_def=model_def,
+            max_tokens=max_continue_tokens,
         )
         final_finish_reason = cont_finish_reason
         if not continuation_text or not continuation_text.strip():
@@ -800,7 +878,7 @@ async def _continue_until_complete(
                 "forge_document: continuation pass %d completed the document", attempt,
             )
             return current, False, attempts, cont_finish_reason
-        if attempt >= _MAX_CONTINUE_ATTEMPTS:
+        if attempt >= max_continue_attempts:
             logger.warning(
                 "forge_document: exhausted %d continuation attempts; "
                 "persisting with truncated annotation (final finish_reason=%r)",
@@ -866,6 +944,7 @@ async def _reforge_for_density(
     source_total_bytes: int,
     output_bytes: int,
     source_count: int,
+    max_tokens: int,
 ) -> tuple[str, str | None]:
     """Issue one density-retry forge pass with a sharpened instruction.
 
@@ -906,7 +985,7 @@ async def _reforge_for_density(
     completion = await ctx.complete_fn(
         messages=messages,
         model_def=model_def,
-        max_tokens=_MAX_COMPLETION_TOKENS,
+        max_tokens=max_tokens,
         temperature=0.2,
         tools=None,
         response_format=None,
@@ -1199,7 +1278,8 @@ async def _write_okf_provenance(
 async def execute(ctx: OperationExecutionContext) -> OperationResult:
     """Forge a markdown document from user input + recalled memory and persist it."""
     params = ctx.params or {}
-    user_input = _extract_query(ctx, params)
+    cfg = _resolve_settings(ctx)
+    user_input = _extract_query(ctx, params, cfg.max_query_chars)
     if not user_input:
         return OperationResult(output_text=_load_text(ctx, _NO_INPUT_PATH))
 
@@ -1248,7 +1328,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             )
         source_block = render_source_block(sources)
 
-    recall_limit = int(params.get("limit") or _MAX_RECALL_RECORDS)
+    recall_limit = int(params.get("limit") or cfg.max_recall_records)
     memory_context = await _recall_memory(ctx, user_input, limit=recall_limit)
 
     # Iteration: when the caller supplies an existing document, use it. When
@@ -1267,6 +1347,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         memory_context,
         existing_document=existing_document,
         source_block=source_block,
+        max_tokens=cfg.max_completion_tokens,
     )
     # _call_llm returns (content, model_def, finish_reason).
     completion_text, model_def, first_finish_reason = completion
@@ -1295,6 +1376,8 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             document=document,
             model_def=model_def,
             first_finish_reason=first_finish_reason,
+            max_continue_attempts=cfg.max_continue_attempts,
+            max_continue_tokens=cfg.max_continue_tokens,
         )
     )
 
@@ -1336,6 +1419,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                     source_total_bytes=source_total,
                     output_bytes=len(document.encode("utf-8")),
                     source_count=n_readable,
+                    max_tokens=cfg.max_completion_tokens,
                 )
                 if not retry_text or not retry_text.strip():
                     break
@@ -1350,6 +1434,8 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                         document=retry_document,
                         model_def=model_def,
                         first_finish_reason=retry_finish,
+                        max_continue_attempts=cfg.max_continue_attempts,
+                        max_continue_tokens=cfg.max_continue_tokens,
                     )
                 )
                 document = retry_document
@@ -1370,8 +1456,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
 
     # Char cap: source-aware consolidations get the raised cap so the
     # preservation directive is physically enforceable. The single-doc path
-    # keeps the original 20K cap.
-    max_chars = _MAX_DOCUMENT_CHARS_WITH_SOURCES if sources else _MAX_DOCUMENT_CHARS
+    # keeps the original 20K cap. Both are session-configurable via
+    # ``forge_max_document_chars`` / ``forge_max_document_chars_with_sources``.
+    max_chars = (
+        cfg.max_document_chars_with_sources if sources else cfg.max_document_chars
+    )
     if len(document) > max_chars:
         document = document[:max_chars] + "\n\n<!-- truncated -->\n"
         # A char-budget truncation overrides the model-finish signal: the

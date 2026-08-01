@@ -4,6 +4,6 @@ mode_allowlist: [markdown]
 tool_ids: [markdown_generate, write_file, read_file, list_files, memory.search, okf_emit_concept, okf_log]
 timeout_seconds: 120
 max_calls_per_turn: 3
-completion_max_tokens: 7500
+completion_max_tokens: 7500  # documentary for runtime ops; real source is session manifest resources.packs.configuration.markdown.forge_max_completion_tokens (fallback 7500)
 completion_temperature: 0.2
 preferred_model_id: default
