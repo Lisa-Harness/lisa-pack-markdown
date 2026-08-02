@@ -70,15 +70,21 @@ def _make_tool_executor(
     memory_records: list[str] | None = None,
     write_ok: bool = True,
     okf_emit_ok: bool = True,
+    stat_sizes: dict[str, int] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Fake execute_tool_fn with list_files + OKF support.
 
     ``stored_sources`` seeds read_file responses (path -> text).
     ``list_files_map`` seeds list_files responses (prefix -> list of paths).
-    ``captures`` records write_file, okf_emit_concept, and okf_log calls.
+    ``stat_sizes`` seeds stat_file responses (path -> byte size); when a
+    path is absent, stat falls back to the stored text length (or 0).
+    ``captures`` records write_file, okf_emit_concept, okf_log, stat,
+    read_file_range, and append_file calls.
     """
     store: dict[str, str] = dict(stored_sources or {})
     list_map: dict[str, list[str]] = dict(list_files_map or {})
+    stat_map: dict[str, int] = dict(stat_sizes or {})
+    appends: dict[str, str] = {}
     captures: dict[str, Any] = {
         "writes": [],
         "okf_emits": [],
@@ -87,6 +93,10 @@ def _make_tool_executor(
         "list_prefixes": [],
         "memory_query": None,
         "outline_markdown": None,
+        "stat_paths": [],
+        "read_file_ranges": [],
+        "append_file_calls": [],
+        "appended_text": appends,
     }
 
     async def execute_tool_fn(tool_id: str, ctx: Any) -> ToolResult:
@@ -118,6 +128,56 @@ def _make_tool_executor(
             return ToolResult(
                 tool_id=tool_id,
                 output_text=json.dumps({"error": f"file not found: {path}"}),
+            )
+        if tool_id == "stat_file":
+            path = str(params.get("path") or "")
+            captures["stat_paths"].append(path)
+            if path in stat_map:
+                size = stat_map[path]
+            elif path in store:
+                size = len(store[path].encode("utf-8"))
+            else:
+                return ToolResult(
+                    tool_id=tool_id,
+                    output_text=json.dumps({"error": f"not found: {path}"}),
+                )
+            return ToolResult(
+                tool_id=tool_id,
+                output_text=json.dumps(
+                    {"path": path, "size": size, "modified": "2026-08-02T00:00:00+00:00", "is_dir": False}
+                ),
+            )
+        if tool_id == "read_file_range":
+            path = str(params.get("path") or "")
+            start = int(params.get("start") or 0)
+            length = int(params.get("length") or 4096)
+            captures["read_file_ranges"].append({"path": path, "start": start, "length": length})
+            if path not in store:
+                return ToolResult(
+                    tool_id=tool_id,
+                    output_text=json.dumps({"error": f"file not found: {path}"}),
+                )
+            text = store[path]
+            total = len(text)
+            content = text[start:start + length]
+            end = start + length
+            eof = end >= total
+            return ToolResult(
+                tool_id=tool_id,
+                output_text=json.dumps(
+                    {"content": content, "start": start, "length": len(content), "total": total, "eof": eof}
+                ),
+            )
+        if tool_id == "append_file":
+            path = str(params.get("path") or "")
+            content = str(params.get("content") or "")
+            captures["append_file_calls"].append({"path": path, "content": content})
+            appends[path] = appends.get(path, "") + content
+            return ToolResult(
+                tool_id=tool_id,
+                output_text=json.dumps(
+                    {"ok": True, "path": path, "bytes": len(appends[path].encode("utf-8"))}
+                ),
             )
         if tool_id == "list_files":
             prefix = str(params.get("prefix") or "")
@@ -920,3 +980,161 @@ async def test_okf_provenance_single_pass_emits_na_density_columns() -> None:
     # Single-pass path emits 0 passes and n/a density per source.
     assert "| 0 | n/a |" in body
     assert "| pass |" not in body
+
+
+# ── Phase 3: rolling accumulation (gated, default off) ────────────────
+# These pin the 2026-08-02 rolling-accumulation path: a single oversize
+# source (>MAX_PER_SOURCE_CHARS) is chunked via read_file_range and forged
+# chunk-by-chunk into a running document — but only when the
+# forge_rolling_accumulation gate is opted in. Default off → map-reduce
+# still handles the same source with no read_file_range calls.
+
+from lisa_packs.markdown.operations.forge_document._source_paths import (  # noqa: E402
+    MAX_PER_SOURCE_CHARS,
+    read_source_chunks,
+)
+from lisa_packs.markdown.operations.forge_document._source_paths import (  # noqa: E402
+    SourceSpec as _SourceSpec,
+)
+
+
+# A source deliberately larger than MAX_PER_SOURCE_CHARS so the rolling
+# gate trips. Built by repeating _SOURCE_A well past the 32K cap.
+_OVERSIZE_SOURCE = ("# Big Source\n\n## Section\n\n" + ("detail line.\n" * 4000))
+assert len(_OVERSIZE_SOURCE) > MAX_PER_SOURCE_CHARS
+
+
+def _rolling_pack_config() -> dict[str, Any]:
+    """Pack config that opts into the rolling-accumulation gate + map-reduce."""
+    cfg = _map_reduce_pack_config()
+    cfg["forge_rolling_accumulation"] = True
+    return cfg
+
+
+@pytest.mark.asyncio
+async def test_read_source_chunks_plans_chunks_from_stat() -> None:
+    """read_source_chunks stats the file and returns ordered chunks until eof."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"big.md": _OVERSIZE_SOURCE},
+        stat_sizes={"big.md": len(_OVERSIZE_SOURCE.encode("utf-8"))},
+    )
+    ctx = _make_ctx(
+        execute_tool_fn=tool_fn,
+        params={"document_path": "n.md"},
+    )
+    spec = _SourceSpec(path="big.md", priority="primary")
+    chunks = await read_source_chunks(spec, ctx=ctx, chunk_chars=8000)
+    # stat_file must have been called once.
+    assert captures["stat_paths"] == ["big.md"]
+    # Multiple read_file_range calls, advancing start by chunk_chars.
+    ranges = captures["read_file_ranges"]
+    assert len(ranges) >= 2
+    # Chunks are ordered, contiguous, and the last carries chunk_eof.
+    assert chunks[0].extra["chunk_index"] == 0
+    assert chunks[-1].extra.get("chunk_eof") is True
+    assert all(c.path == "big.md" for c in chunks)
+    # chunk_total must be set on every chunk and match the count.
+    assert all(c.extra["chunk_total"] == len(chunks) for c in chunks)
+    # The concatenated chunk content covers the planned read range.
+    joined = "".join(c.text for c in chunks)
+    assert len(joined) > 0
+
+
+@pytest.mark.asyncio
+async def test_rolling_accumulation_extends_running_doc() -> None:
+    """A single oversize source with the gate on takes the rolling path."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"big.md": _OVERSIZE_SOURCE},
+        stat_sizes={"big.md": len(_OVERSIZE_SOURCE.encode("utf-8"))},
+    )
+    call_log: list[dict[str, Any]] = []
+    # Each rolling chunk call returns a short extension referencing its index.
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        if "Rolling Accumulation" in system_content:
+            user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+            # Extract chunk index from the template marker.
+            import re as _re
+            m = _re.search(r"chunk (\d+) of", user_content)
+            idx = m.group(1) if m else "?"
+            call_log.append({"phase": "rolling", "chunk": idx})
+            return _FakeCompletion(
+                content=f"```markdown\n## Chunk {idx} section\n\ndetail from chunk {idx}.\n```",
+                finish_reason="stop",
+            )
+        if "Section Merge" in system_content:
+            call_log.append({"phase": "merge"})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        if "Per-Source Consolidation Section" in system_content:
+            call_log.append({"phase": "per-source"})
+            return _FakeCompletion(content="```markdown\n# Section\n\nforged.\n```")
+        call_log.append({"phase": "unknown"})
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": ["big.md"],
+        },
+        pack_config=_rolling_pack_config(),
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # The rolling path must have been taken (multiple rolling completion calls).
+    rolling_calls = [c for c in call_log if c["phase"] == "rolling"]
+    assert len(rolling_calls) >= 2
+    # read_file_range must have been called to chunk the source.
+    assert len(captures["read_file_ranges"]) >= 2
+    # The op result must report rolling_accumulation_used=True.
+    assert result.output_json.get("rolling_accumulation_used") is True
+    # The persisted document must contain content from multiple chunks.
+    persisted = captures["writes"][0]["content"]
+    assert "Chunk" in persisted
+
+
+@pytest.mark.asyncio
+async def test_rolling_accumulation_default_off_uses_map_reduce() -> None:
+    """Same oversize source, default config → map-reduce path (no read_file_range)."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"big.md": _OVERSIZE_SOURCE},
+        stat_sizes={"big.md": len(_OVERSIZE_SOURCE.encode("utf-8"))},
+    )
+    call_log: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        if "Rolling Accumulation" in system_content:
+            call_log.append({"phase": "rolling"})
+            return _FakeCompletion(content="```markdown\n# rolling\n```")
+        if "Per-Source Consolidation Section" in system_content:
+            call_log.append({"phase": "per-source"})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        if "Section Merge" in system_content:
+            call_log.append({"phase": "merge"})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        call_log.append({"phase": "unknown"})
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": ["big.md"],
+        },
+        # Default map-reduce config — rolling gate NOT opted in.
+        pack_config=_map_reduce_pack_config(),
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # No rolling calls and no read_file_range calls (default off → map-reduce).
+    assert all(c["phase"] != "rolling" for c in call_log)
+    assert captures["read_file_ranges"] == []
+    # The op result must report rolling_accumulation_used=False.
+    assert result.output_json.get("rolling_accumulation_used") is False

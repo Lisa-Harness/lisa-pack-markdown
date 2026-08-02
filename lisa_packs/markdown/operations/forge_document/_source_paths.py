@@ -41,21 +41,33 @@ __all__ = [
     "parse_source_paths",
     "expand_globs",
     "read_sources",
+    "read_source_chunks",
+    "stat_source_chars",
     "render_source_block",
     "render_one_source_block",
     "render_priorities_block",
     "total_source_bytes",
     "has_sources",
+    "MAX_PER_SOURCE_CHARS",
 ]
 
 # Tool ids routed through ctx.execute_tool_fn (lisa-storage MCP server).
 _LIST_FILES_TOOL_ID = "list_files"
 _READ_FILE_TOOL_ID = "read_file"
+# Storage tools shipped in Phase 1 (commits 126e7b5/2695234), used by the
+# Phase 3 rolling-accumulation path to chunk a single oversize source.
+_STAT_FILE_TOOL_ID = "stat_file"
+_READ_FILE_RANGE_TOOL_ID = "read_file_range"
 
 # Caps that keep a single runaway source from blowing the model context.
 _MAX_PER_SOURCE_CHARS = 32_000
 _MAX_TOTAL_SOURCE_CHARS = 240_000
 _DEFAULT_PRIORITY = "normal"
+
+# Public alias for the per-source char cap, re-exported so the
+# rolling-accumulation gate (Phase 3) can single-source the threshold from
+# this module rather than re-declaring it in forge_document.py.
+MAX_PER_SOURCE_CHARS = _MAX_PER_SOURCE_CHARS
 
 
 @dataclass
@@ -444,3 +456,240 @@ def render_priorities_block(specs: list[SourceSpec]) -> str:
     for idx, spec in enumerate(readable, start=1):
         lines.append(f"{idx}. `{spec.path}` — {spec.priority}")
     return "\n".join(lines)
+
+
+async def read_source_chunks(
+    spec: SourceSpec,
+    *,
+    ctx: OperationExecutionContext,
+    chunk_chars: int = 8000,
+) -> list[SourceSpec]:
+    """Chunk ONE oversize source into bounded windows via ``read_file_range``.
+
+    Phase 3 rolling-accumulation helper (added 2026-08-02). Calls
+    ``stat_file`` to get the total char length, then plans chunk count from
+    ``chunk_chars`` and reads successive windows via ``read_file_range``
+    until ``eof``. Each window is returned as a ``SourceSpec`` reusing the
+    original ``path``/``priority`` with the chunk text in ``text``, its byte
+    count in ``bytes``, and a ``chunk_index`` (0-based) + ``chunk_total`` in
+    ``extra``. The last chunk carries ``extra["chunk_eof"] = True``.
+
+    Respects ``_MAX_PER_SOURCE_CHARS`` by default: windows are not read
+    beyond the per-source cap unless ``chunk_chars`` is raised above it.
+
+    This goes through ``ctx.execute_tool_fn`` routed to ``lisa-storage``
+    (same pattern as :func:`read_sources`) — no direct filesystem access.
+    Per the pack boundary, all chunking policy stays in the pack; the
+    storage server only returns bytes/chars.
+
+    Failures degrade gracefully: a ``stat_file`` or ``read_file_range``
+    error returns a single-element list with the spec's ``read_error`` set
+    (mirroring :func:`read_sources`'s per-source failure contract) so the
+    caller can surface it rather than aborting the forge.
+    """
+    if not callable(ctx.execute_tool_fn):
+        raise RuntimeError(
+            "read_source_chunks requires execute_tool_fn to call "
+            "stat_file/read_file_range"
+        )
+    if chunk_chars <= 0:
+        chunk_chars = 8000
+
+    # Cap the total we will read at the per-source cap unless the caller
+    # explicitly raised chunk_chars above it (opt-in to read more).
+    read_cap = _MAX_PER_SOURCE_CHARS
+    if chunk_chars > _MAX_PER_SOURCE_CHARS:
+        read_cap = chunk_chars
+
+    # Plan from stat_file (char total). Fall back to reading the whole
+    # source via read_file if stat is unavailable (degrade gracefully).
+    stat_total = await _stat_file_chars(ctx, spec.path)
+    if stat_total is None:
+        # stat failed; degrade to a single read_file chunk so the caller
+        # still gets the source (read_sources-style fallback).
+        text, err = await _read_one(ctx, spec.path)
+        if err is not None:
+            failed = SourceSpec(path=spec.path, priority=spec.priority)
+            failed.read_error = err
+            return [failed]
+        if len(text) > read_cap:
+            text = text[:read_cap] + "\n\n<!-- truncated to fit per-source cap -->\n"
+        chunk = SourceSpec(
+            path=spec.path,
+            priority=spec.priority,
+            text=text,
+            bytes=len(text.encode("utf-8")),
+            truncated_to_fit=len(text) >= read_cap,
+        )
+        chunk.extra["chunk_index"] = 0
+        chunk.extra["chunk_total"] = 1
+        chunk.extra["chunk_eof"] = True
+        return [chunk]
+
+    if stat_total <= 0:
+        # Empty source — one empty chunk with eof.
+        chunk = SourceSpec(path=spec.path, priority=spec.priority)
+        chunk.extra["chunk_index"] = 0
+        chunk.extra["chunk_total"] = 1
+        chunk.extra["chunk_eof"] = True
+        return [chunk]
+
+    # Plan chunk boundaries. We read up to read_cap chars total; each window
+    # is chunk_chars wide (the last may be shorter). read_file_range is
+    # char-based and reports eof when the window reaches/passes total.
+    total_to_read = min(stat_total, read_cap)
+    chunks: list[SourceSpec] = []
+    offset = 0
+    chunk_index = 0
+    while offset < total_to_read:
+        window = min(chunk_chars, total_to_read - offset)
+        content, eof, err = await _read_file_range(ctx, spec.path, offset, window)
+        if err is not None:
+            failed = SourceSpec(path=spec.path, priority=spec.priority)
+            failed.read_error = err
+            return [failed]
+        if not content and chunk_index > 0:
+            # No content returned mid-stream — stop to avoid an infinite loop.
+            break
+        chunk = SourceSpec(
+            path=spec.path,
+            priority=spec.priority,
+            text=content,
+            bytes=len(content.encode("utf-8")),
+            truncated_to_fit=(offset + window) >= read_cap and not eof and total_to_read < stat_total,
+        )
+        chunk.extra["chunk_index"] = chunk_index
+        chunk.extra["chunk_eof"] = eof
+        chunks.append(chunk)
+        chunk_index += 1
+        if eof:
+            break
+        # Defensive: ensure forward progress (read_file_range always
+        # returns >= 0 chars; a zero-length non-eof window would loop
+        # forever, so stop if the backend stalls).
+        if len(content) == 0:
+            break
+        offset += len(content)
+    # Finalize chunk_total now that we know the count.
+    chunk_total = len(chunks)
+    for c in chunks:
+        c.extra["chunk_total"] = chunk_total
+    if chunks:
+        chunks[-1].extra["chunk_eof"] = True
+    return chunks
+
+
+async def _stat_file_chars(
+    ctx: OperationExecutionContext,
+    path: str,
+) -> int | None:
+    """Call ``stat_file`` and return the file's char/byte size, or None on error.
+
+    ``stat_file`` returns ``size`` in bytes; for text sources byte length ≈
+    char length for the chunk-planning purpose (the chunk window is a soft
+    cap, and read_file_range is char-based so a slight miscount just shifts
+    the last window). Returns None on any tool/JSON error so the caller
+    degrades to a single read_file chunk.
+    """
+    import json
+
+    try:
+        result = await ctx.execute_tool_fn(
+            _STAT_FILE_TOOL_ID,
+            ToolExecutionContext(
+                tool_id=_STAT_FILE_TOOL_ID,
+                workspace_id=ctx.workspace_id,
+                user_id=ctx.user_id,
+                user_slug=ctx.user_slug,
+                surface_type=ctx.surface_type,
+                surface_id=ctx.surface_id,
+                memory_scope=ctx.memory_scope,
+                mode_id=ctx.mode_id,
+                parameters={"path": path},
+            ),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("source_paths: stat_file(path=%r) raised: %s", path, exc)
+        return None
+    error_text = getattr(result, "error", "") or ""
+    if error_text:
+        logger.warning("source_paths: stat_file(path=%r) error: %s", path, error_text)
+        return None
+    output_text = getattr(result, "output_text", "") or ""
+    try:
+        data = json.loads(output_text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict) and data.get("error"):
+        return None
+    if isinstance(data, dict):
+        try:
+            return int(data.get("size") or 0)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def stat_source_chars(
+    spec: SourceSpec,
+    *,
+    ctx: OperationExecutionContext,
+) -> int | None:
+    """Public wrapper around :func:`_stat_file_chars` for a SourceSpec.
+
+    Returns the file's byte size (≈ char count for text) via the
+    ``stat_file`` storage tool, or ``None`` on any tool/JSON error. Used by
+    the Phase 3 rolling-accumulation gate to decide whether a single source
+    exceeds ``MAX_PER_SOURCE_CHARS`` (note: read_sources truncates
+    ``spec.bytes`` to the cap, so the gate must stat the real file size
+    rather than inspect ``spec.bytes``).
+    """
+    return await _stat_file_chars(ctx, spec.path)
+
+
+async def _read_file_range(
+    ctx: OperationExecutionContext,
+    path: str,
+    start: int,
+    length: int,
+) -> tuple[str, bool, str | None]:
+    """Call ``read_file_range``. Returns ``(content, eof, error_or_None)``.
+
+    ``read_file_range`` returns a JSON object with ``content``, ``start``,
+    ``length``, ``total``, and ``eof``. We surface ``content`` and ``eof``
+    to the chunk planner; ``error`` is set on any tool/JSON failure.
+    """
+    import json
+
+    try:
+        result = await ctx.execute_tool_fn(
+            _READ_FILE_RANGE_TOOL_ID,
+            ToolExecutionContext(
+                tool_id=_READ_FILE_RANGE_TOOL_ID,
+                workspace_id=ctx.workspace_id,
+                user_id=ctx.user_id,
+                user_slug=ctx.user_slug,
+                surface_type=ctx.surface_type,
+                surface_id=ctx.surface_id,
+                memory_scope=ctx.memory_scope,
+                mode_id=ctx.mode_id,
+                parameters={"path": path, "start": start, "length": length},
+            ),
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        return "", False, f"read_file_range raised: {exc}"
+    error_text = getattr(result, "error", "") or ""
+    if error_text:
+        return "", False, f"read_file_range error: {error_text}"
+    output_text = getattr(result, "output_text", "") or ""
+    try:
+        data = json.loads(output_text)
+    except (json.JSONDecodeError, TypeError):
+        return "", False, "read_file_range returned non-JSON"
+    if isinstance(data, dict) and data.get("error"):
+        return "", False, f"read_file_range error: {data['error']}"
+    if not isinstance(data, dict):
+        return "", False, "read_file_range returned non-object"
+    content = str(data.get("content") or "")
+    eof = bool(data.get("eof") or False)
+    return content, eof, None

@@ -37,12 +37,19 @@ from lisa_packs.markdown.operations.forge_document._source_paths import (
     failed_specs,
     has_sources,
     parse_source_paths,
+    read_source_chunks,
     read_sources,
     readable_count,
     render_one_source_block,
     render_priorities_block,
     render_source_block,
+    stat_source_chars,
     total_source_bytes,
+)
+# Per-source char cap (public alias) from _source_paths — the
+# rolling-accumulation gate trips when a single source exceeds this.
+from lisa_packs.markdown.operations.forge_document._source_paths import (
+    MAX_PER_SOURCE_CHARS as _MAX_PER_SOURCE_CHARS,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,9 @@ __all__ = ["Parameters", "execute"]
 _OUTLINE_TOOL_ID = "markdown_generate"
 _WRITE_TOOL_ID = "write_file"
 _READ_TOOL_ID = "read_file"
+# Storage tool shipped in Phase 1 (commit 126e7b5), used by the Phase 3
+# rolling-accumulation path for opt-in incremental persistence.
+_APPEND_TOOL_ID = "append_file"
 _MEMORY_SEARCH_TOOL_ID = "memory.search"
 
 # Tool ids used by the source-paths consolidation path (added 2026-07-30).
@@ -110,6 +120,13 @@ _USER_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_user_merge.md"
 # this sharpened instruction re-sends the per-source prompt and names the
 # deficit explicitly. Mirrors the global _DENSITY_RETRY_PATH shape.
 _PER_SOURCE_DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_per_source_density_retry.md"
+# Rolling-accumulation prompts (Phase 3, added 2026-08-02). When a single
+# source exceeds _MAX_PER_SOURCE_CHARS and the forge_rolling_accumulation
+# gate is opted in, the operation chunks the source via read_file_range and
+# forges a running document chunk by chunk. See
+# /memories/session/plan.md (Phase 3).
+_SYSTEM_PROMPT_ROLLING_PATH = f"{_PROMPT_DIR}/forge_document_system_rolling.md"
+_USER_PROMPT_ROLLING_PATH = f"{_PROMPT_DIR}/forge_document_user_rolling.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
@@ -332,6 +349,8 @@ class _ResolvedSettings:
     map_reduce_byte_threshold: int
     map_reduce_source_threshold: int
     per_source_min_ratio: float
+    forge_rolling_accumulation: bool
+    forge_rolling_incremental_persist: bool
 
 
 def _cfg_int(pack_config: Any, key: str, default: int) -> int:
@@ -373,6 +392,30 @@ def _cfg_float(pack_config: Any, key: str, default: float) -> float:
         return default
 
 
+def _cfg_bool(pack_config: Any, key: str, default: bool) -> bool:
+    """Read a bool from ``ctx.pack_config`` with a module-constant fallback.
+
+    Accepts native bools and the string forms ``true``/``false``/``1``/``0``
+    (case-insensitive). Coerces anything else to the default rather than
+    raising, so a malformed session value falls back to the safe default
+    instead of crashing mid-turn.
+    """
+    if pack_config is None:
+        return default
+    raw = pack_config.get(key)
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off", ""):
+        return False
+    logger.warning("forge_document: pack_config[%r]=%r is not a bool; using default %s", key, raw, default)
+    return default
+
+
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
     pc = ctx.pack_config
@@ -387,6 +430,8 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         map_reduce_byte_threshold=_cfg_int(pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD),
         map_reduce_source_threshold=_cfg_int(pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD),
         per_source_min_ratio=_cfg_float(pc, "forge_per_source_min_ratio", _PER_SOURCE_MIN_RATIO),
+        forge_rolling_accumulation=_cfg_bool(pc, "forge_rolling_accumulation", False),
+        forge_rolling_incremental_persist=_cfg_bool(pc, "forge_rolling_incremental_persist", False),
     )
 
 
@@ -1274,6 +1319,11 @@ async def _reforge_one_source_for_density(
     user prompt (so the model has the source + priority in context) followed
     by the per-source density-retry instruction naming the deficit. The
     caller extracts the fenced markdown block and re-runs the density check.
+
+    ``max_continue_attempts``/``max_continue_tokens`` are accepted for
+    signature symmetry with the other forge helpers but are not used here —
+    continuation handling for the retry section is the caller's job (it
+    runs ``_continue_until_complete`` on whichever section wins).
     """
     if ctx.complete_fn is None:
         return "", None
@@ -1317,6 +1367,150 @@ async def _reforge_one_source_for_density(
     finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
     section = _extract_markdown_block(content)
     return section.strip(), finish_reason
+
+
+def _tail_headings(document: str, *, max_headings: int = 3) -> str:
+    """Return the running tail of a document — the last ``max_headings`` headings
+    plus the body under the final one — so a rolling-accumulation pass can
+    extend coherently without re-sending the whole document.
+
+    Capped to the last few headings (default 3) so the per-chunk context
+    stays bounded even for a very long running document. If the document has
+    no headings, returns its last ~2000 chars so the model still has a
+    continuity anchor.
+    """
+    if not document or not document.strip():
+        return "(running document is empty — start fresh)"
+    lines = document.splitlines()
+    # Collect indices of ATX heading lines (# .. ######) not inside fences.
+    heading_indices: list[int] = []
+    in_fence = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if re.match(r"^#{1,6}\s+\S", stripped):
+            heading_indices.append(i)
+    if not heading_indices:
+        # No headings — return the last ~2000 chars as a continuity anchor.
+        tail = document.rstrip()[-2000:]
+        return tail if tail.strip() else "(running document has no headings yet)"
+    # Take the last max_headings headings and everything after the final one.
+    start_idx = heading_indices[-min(max_headings, len(heading_indices))]
+    tail = "\n".join(lines[start_idx:]).rstrip()
+    return tail if tail.strip() else "(running tail is empty)"
+
+
+async def _forge_rolling(
+    ctx: OperationExecutionContext,
+    chunks: list[SourceSpec],
+    *,
+    user_input: str,
+    memory_context: str,
+    model_def: Any,
+    max_tokens: int,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
+    document_path: str,
+    incremental_persist: bool,
+) -> tuple[str, list[str | None]]:
+    """Forge a running document chunk-by-chunk (Phase 3 rolling accumulation).
+
+    Maintains a running ``document`` string. For each chunk, sends the
+    running tail (capped to the last few headings via :func:`_tail_headings`)
+    + the next chunk to the rolling forge prompt, appends the extension, and
+    runs :func:`_continue_until_complete` per chunk. When
+    ``incremental_persist`` is True, appends each chunk's extension to the
+    target path via ``append_file`` (Phase 1) so progress survives a
+    mid-forge crash — opt-in since it leaves partial docs on disk.
+
+    Returns ``(document, finish_reasons)`` where ``finish_reasons`` is one
+    entry per chunk. Only an oversize SINGLE source takes this path
+    (caller gates on ``forge_rolling_accumulation`` AND a single source
+    exceeding ``_MAX_PER_SOURCE_CHARS``); multi-source consolidations stay
+    on map-reduce. See /memories/session/plan.md (Phase 3).
+    """
+    if ctx.complete_fn is None:
+        return "", []
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_ROLLING_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_ROLLING_PATH)
+    chunk_total = len(chunks)
+    document = ""
+    finish_reasons: list[str | None] = []
+    for chunk in chunks:
+        chunk_index = int(chunk.extra.get("chunk_index", 0))
+        running_tail = _tail_headings(document, max_headings=3)
+        chunk_text = chunk.text
+        user_prompt = _format_template(
+            user_template,
+            user_input=user_input,
+            running_tail=running_tail,
+            chunk_text=chunk_text,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            source_path=chunk.path,
+            priority=chunk.priority,
+            memory_context=memory_context or "(no recalled context)",
+            max_headings=3,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        completion = await ctx.complete_fn(
+            messages=messages,
+            model_def=model_def,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            tools=None,
+            response_format=None,
+        )
+        content = getattr(completion, "content", "") or ""
+        finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
+        extension = _extract_markdown_block(content)
+        if extension.strip():
+            extension, _truncated, _attempts, finish_reason = await _continue_until_complete(
+                ctx,
+                user_input=user_input,
+                document=extension,
+                model_def=model_def,
+                first_finish_reason=finish_reason,
+                max_continue_attempts=max_continue_attempts,
+                max_continue_tokens=max_continue_tokens,
+            )
+        if extension.strip():
+            if document:
+                document = _merge_continuation(document, extension)
+            else:
+                document = extension.rstrip() + "\n"
+            # Opt-in incremental persistence: append this chunk's extension
+            # to the target path so progress survives a mid-forge crash.
+            # Leaves partial docs on disk, hence default-off.
+            if incremental_persist and callable(ctx.execute_tool_fn):
+                try:
+                    await ctx.execute_tool_fn(
+                        _APPEND_TOOL_ID,
+                        ToolExecutionContext(
+                            tool_id=_APPEND_TOOL_ID,
+                            workspace_id=ctx.workspace_id,
+                            user_id=ctx.user_id,
+                            user_slug=ctx.user_slug,
+                            surface_type=ctx.surface_type,
+                            surface_id=ctx.surface_id,
+                            memory_scope=ctx.memory_scope,
+                            mode_id=ctx.mode_id,
+                            parameters={"path": document_path, "content": extension + "\n\n"},
+                        ),
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning(
+                        "forge_document: rolling incremental append failed (non-fatal): %s", exc
+                    )
+        finish_reasons.append(finish_reason)
+    return document, finish_reasons
 
 
 async def _merge_sections(
@@ -1794,6 +1988,12 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     per_source_passes: list[int] = []
     per_source_density: list[str] = []  # "pass" | "FAILED" | "n/a"
     per_source_meta: list[dict[str, Any]] | None = None
+    # Phase 3 rolling-accumulation telemetry (default off; only set True when
+    # the gate opts an oversize single source onto the rolling path).
+    rolling_used = False
+    # Phase 3 rolling-accumulation telemetry (default off; only set when the
+    # gate opts an oversize single source onto the rolling path).
+    rolling_used = False
 
     if use_map_reduce:
         # Resolve the model once for both the per-source and merge passes.
@@ -1812,7 +2012,57 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         per_source_passes = []
         per_source_density = []
         density_markers: list[str] = []
+        rolling_used = False
         for idx, spec in enumerate(readable, start=1):
+            # Phase 3 gate (default off): when forge_rolling_accumulation is
+            # opted in AND this single source exceeds the per-source cap,
+            # chunk it via read_file_range and forge a running document
+            # chunk-by-chunk instead of one bounded-context pass. Only an
+            # oversize single source takes the rolling path; multi-source
+            # consolidations still use map-reduce per source. See
+            # /memories/session/plan.md (Phase 3).
+            #
+            # Note: read_sources truncates spec.bytes to _MAX_PER_SOURCE_CHARS,
+            # so the gate must stat the real file size rather than inspect
+            # spec.bytes (a truncated source's bytes == the cap, never above).
+            use_rolling = False
+            if cfg.forge_rolling_accumulation and len(readable) == 1:
+                stat_size = await stat_source_chars(spec, ctx=ctx)
+                if stat_size is not None and stat_size > _MAX_PER_SOURCE_CHARS:
+                    use_rolling = True
+            if use_rolling:
+                rolling_used = True
+                chunks = await read_source_chunks(spec, ctx=ctx)
+                # Skip chunks that failed to read (read_source_chunks returns
+                # a single failed spec with read_error set in that case).
+                if chunks and chunks[0].read_error:
+                    sections.append("")
+                    per_source_finish_reasons.append(None)
+                    per_source_passes.append(1)
+                    per_source_density.append("n/a")
+                    continue
+                section, chunk_finishs = await _forge_rolling(
+                    ctx,
+                    chunks,
+                    user_input=user_input,
+                    memory_context=memory_context,
+                    model_def=model_def,
+                    max_tokens=cfg.max_completion_tokens,
+                    max_continue_attempts=cfg.max_continue_attempts,
+                    max_continue_tokens=cfg.max_continue_tokens,
+                    document_path=document_path,
+                    incremental_persist=cfg.forge_rolling_incremental_persist,
+                )
+                sections.append(section)
+                per_source_finish_reasons.append(
+                    chunk_finishs[-1] if chunk_finishs else None
+                )
+                # Rolling path has no per-source density floor (the document
+                # is built incrementally; the global density check on the
+                # merged doc is the gate). Passes = chunk count.
+                per_source_passes.append(max(1, len(chunks)))
+                per_source_density.append("n/a")
+                continue
             section, sec_finish, _passed, _reason, failed, passes, marker = await _forge_one_source(
                 ctx,
                 spec=spec,
@@ -1836,17 +2086,25 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             else:
                 per_source_density.append("pass")
         first_finish_reason = per_source_finish_reasons[0] if per_source_finish_reasons else None
-        merged, merge_finish = await _merge_sections(
-            ctx,
-            sections=sections,
-            specs=readable,
-            user_input=user_input,
-            memory_context=memory_context,
-            model_def=model_def,
-            max_tokens=cfg.max_completion_tokens,
-            max_continue_attempts=cfg.max_continue_attempts,
-            max_continue_tokens=cfg.max_continue_tokens,
-        )
+        # When the rolling path produced the document for a single oversize
+        # source, the rolling document IS the final artifact — skip the
+        # merge pass (which would rewrite it). Multi-source consolidations
+        # still merge the per-source sections.
+        if rolling_used and len(sections) == 1:
+            merged = sections[0]
+            merge_finish = per_source_finish_reasons[0] if per_source_finish_reasons else None
+        else:
+            merged, merge_finish = await _merge_sections(
+                ctx,
+                sections=sections,
+                specs=readable,
+                user_input=user_input,
+                memory_context=memory_context,
+                model_def=model_def,
+                max_tokens=cfg.max_completion_tokens,
+                max_continue_attempts=cfg.max_continue_attempts,
+                max_continue_tokens=cfg.max_continue_tokens,
+            )
         if not merged or not merged.strip():
             return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
         document = _extract_markdown_block(merged) if "```" in merged else merged
@@ -2164,6 +2422,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "first_finish_reason": first_finish_reason,
             "final_finish_reason": final_finish_reason,
             "source_count": n_readable,
+            "rolling_accumulation_used": rolling_used,
             "source_total_bytes": source_total,
             "density_ratio": density_ratio,
             "density_passed": density_passed,
