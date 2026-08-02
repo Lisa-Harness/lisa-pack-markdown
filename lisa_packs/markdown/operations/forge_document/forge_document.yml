@@ -1,6 +1,16 @@
 operation_id: markdown_forge_document
 description: Combine user input with recalled memory context (and optionally an existing document), synthesize or revise a markdown document via an LLM, validate its structure with the markdown-it-py outline tool, and persist it to lisa-storage. When source_paths is supplied, switches to consolidation mode — reads every source with per-source NL priority notes, enforces a preserve-detail (anti-abridgment) directive, applies a density floor, and captures provenance to an OKF concept.
 mode_allowlist: [markdown]
-tool_ids: [markdown_generate, write_file, read_file, list_files, memory.search, okf_emit_concept, okf_log]
-timeout_seconds: 300
+# read_file_range + append_file were shipped to lisa-storage in Phase 1
+# (commits 126e7b5 / 2695234). Phase 3 (rolling accumulation) uses
+# read_file_range to chunk a single oversize source; append_file is used
+# for opt-in incremental persistence. Both must be declared here so the
+# kernel allows the op to route them through ctx.execute_tool_fn.
+tool_ids: [markdown_generate, write_file, read_file, read_file_range, append_file, list_files, memory.search, okf_emit_concept, okf_log]
+# Raised from 300s to 600s for the map-reduce path: a 7-source
+# consolidation issues N per-source forge calls + 1 merge (8 calls). At
+# ~60s per call on a local Ollama backend, 300s was sized for one pass
+# and would time out mid-consolidation. 600s covers 8 calls with
+# headroom. (Per-call sub-deadlines would be a kernel change — deferred.)
+timeout_seconds: 600
 preferred_model_id: default
