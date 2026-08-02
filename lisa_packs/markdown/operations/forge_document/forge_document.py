@@ -189,10 +189,15 @@ _MAP_REDUCE_SOURCE_THRESHOLD = 2
 _DENSITY_FLOOR_MANY_SOURCES_RATIO = 0.15   # 5+ readable sources
 _DENSITY_FLOOR_FEW_SOURCES_RATIO = 0.30    # 2-4 readable sources
 _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD = 5
-# Allow one retry when the floor trips. The retry uses a sharpened prompt
-# that names the deficit explicitly. If the retry still trips, we persist
-# with the truncated annotation (honest failure) rather than looping.
-_DENSITY_RETRY_ATTEMPTS = 1
+# Allow up to two retries when the floor trips. The first retry names the
+# deficit abstractly; the second (added 2026-08-02 after the
+# "summarizing instead of writing a spec" incident) names an explicit
+# minimum byte/word target the model must hit — the strongest lever for
+# breaking the summarize-despite-preserve-detail failure mode. Beyond two
+# retries we persist with the density-FAILED annotation (honest failure)
+# rather than looping indefinitely. Session-configurable via
+# ``forge_density_retry_attempts``.
+_DENSITY_RETRY_ATTEMPTS = 2
 
 # Per-source density floor (map-reduce path, added 2026-08-02). A section
 # forged from a single source must preserve enough of THAT source's
@@ -276,9 +281,12 @@ class Parameters(BaseModel):
     )
     limit: int = Field(
         default=8,
-        ge=1,
+        ge=0,
         le=20,
-        description="Maximum number of recalled memory records to inject as context.",
+        description="Maximum number of recalled memory records to inject as context. "
+        "0 means 'use the default' (the operation coerces 0 to the configured "
+        "default) — accepted so a caller that explicitly passes 0 to mean "
+        "'no special limit' is not rejected at the schema gate.",
     )
     annotate_model: bool = Field(
         default=True,
@@ -351,6 +359,7 @@ class _ResolvedSettings:
     per_source_min_ratio: float
     forge_rolling_accumulation: bool
     forge_rolling_incremental_persist: bool
+    density_retry_attempts: int
 
 
 def _cfg_int(pack_config: Any, key: str, default: int) -> int:
@@ -432,6 +441,7 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         per_source_min_ratio=_cfg_float(pc, "forge_per_source_min_ratio", _PER_SOURCE_MIN_RATIO),
         forge_rolling_accumulation=_cfg_bool(pc, "forge_rolling_accumulation", False),
         forge_rolling_incremental_persist=_cfg_bool(pc, "forge_rolling_incremental_persist", False),
+        density_retry_attempts=_cfg_int(pc, "forge_density_retry_attempts", _DENSITY_RETRY_ATTEMPTS),
     )
 
 
@@ -696,6 +706,14 @@ def _looks_complete(document: str) -> bool:
     plausibly finished or whether we should try another continuation. A
     document ending mid-word, mid-sentence, or with a dangling list marker
     is treated as still-truncated.
+
+    A heading as the very last content line is treated as TRUNCATED: the
+    model opened a section ("### 5.1 ...") and stopped before writing its
+    body. This was the root cause of the 2026-08-02 "short doc ending on a
+    heading" incident — the model emitted a section heading with no body
+    and returned ``finish_reason="stop"``, and the old heuristic treated
+    a trailing heading as complete, so no continuation was attempted and
+    the half-written section was persisted as-is.
     """
     if not document:
         return False
@@ -712,17 +730,50 @@ def _looks_complete(document: str) -> bool:
     last_line = stripped.splitlines()[-1].rstrip()
     if not last_line:
         return True  # ends on a blank line — clean
-    # Ends with sentence-final punctuation, a heading, or a code fence.
+    # Ends with sentence-final punctuation, a code fence, or blockquote.
     if last_line.endswith(("```", ".", "!", "?", ":", ";", ">", ")")):
         return True
     # Ends with a list item that has content after the marker.
     if re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(r"^\s*\d+\. +\S", last_line):
         return True
-    # Ends with a heading line.
+    # A heading as the LAST content line is a truncation signal: the model
+    # opened a section but wrote no body. (A heading followed by its body
+    # ends on the body's last line, not on the heading, so this only fires
+    # for a heading with nothing after it.)
     if last_line.lstrip().startswith("#"):
-        return True
-    # Otherwise: mid-sentence — treat as truncated.
+        return False
+    # Ends with a heading line that has body content above it is already
+    # covered by the sentence/code/list branches above; any other heading
+    # placement at the tail is mid-section — treat as truncated.
     return False
+
+
+def _ends_on_dangling_heading(document: str) -> bool:
+    """Return True when the document's last content line is a heading.
+
+    Narrow structural-incompleteness detector used to override a clean
+    provider ``finish_reason="stop"``: a section heading with no body
+    following it is incomplete regardless of the provider's finish signal.
+    This is the exact shape of the 2026-08-02 "short doc ending on a
+    heading" incident (the model emitted "### 5.1 Hook on ..." with no
+    body and returned ``stop``).
+
+    Kept narrow (headings only) rather than reusing the broader
+    :func:`_looks_complete` so a clean stop on a table row, a line ending
+    in non-sentence punctuation, or other legitimate-but-unconventional
+    endings does NOT spuriously trigger a continuation pass.
+    """
+    if not document:
+        return False
+    stripped = document.rstrip()
+    if not stripped:
+        return False
+    # Skip a trailing blank line (the heading is the last non-empty line).
+    lines = [ln for ln in stripped.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    last = lines[-1].rstrip()
+    return bool(re.match(r"^#{1,6}\s+\S", last.lstrip()))
 
 
 def _merge_continuation(document_so_far: str, tail: str) -> str:
@@ -921,6 +972,7 @@ async def _continue_until_complete(
     first_finish_reason: str | None,
     max_continue_attempts: int,
     max_continue_tokens: int,
+    structural_override: bool = True,
 ) -> tuple[str, bool, int, str | None]:
     """Run continuation passes until the document looks complete or budget is hit.
 
@@ -938,9 +990,36 @@ async def _continue_until_complete(
     - A merged document that ends on a clean boundary (``_looks_complete``)
       AND whose continuation reported a non-truncating finish_reason is
       considered complete; otherwise we keep going up to the budget.
+
+    Structural-incompleteness override (added 2026-08-02 after the
+    "short doc ending on a heading" incident): a provider can return a
+    clean ``finish_reason="stop"`` while the document is structurally
+    incomplete — e.g. a trailing section heading with no body. When the
+    document ends on a dangling heading (:func:`_ends_on_dangling_heading`),
+    attempt continuation even on a clean stop, since the provider's
+    finish signal is not authoritative for structural completeness. The
+    check is deliberately narrow (dangling headings only) so a clean
+    stop on a table row or unconventional ending does not spuriously
+    trigger a continuation. The continuation's own finish_reason still
+    governs whether we mark the final artifact truncated.
+
+    ``structural_override`` defaults to True (the final single-pass /
+    merge document benefits from it). Per-source sections set it False:
+    their completeness is governed by the per-source density floor, and a
+    heading-only section is the density floor's job to catch, not the
+    continuation path's (otherwise the continuation consumes the retry
+    budget duplicating a heading-only tail before the density retry runs).
     """
-    if not _is_truncated(first_finish_reason):
+    structurally_incomplete = _ends_on_dangling_heading(document) if structural_override else False
+    if not _is_truncated(first_finish_reason) and not structurally_incomplete:
         return document, False, 0, first_finish_reason
+    if structurally_incomplete and not _is_truncated(first_finish_reason):
+        logger.warning(
+            "forge_document: first pass finish_reason=%r but document ends "
+            "on a dangling heading (section opened with no body); attempting "
+            "continuation despite clean stop",
+            first_finish_reason,
+        )
 
     logger.warning(
         "forge_document: first pass finish_reason=%r; attempting continuation",
@@ -1079,6 +1158,16 @@ async def _reforge_for_density(
     )
     retry_template = _load_text(ctx, _DENSITY_RETRY_PATH)
     min_ratio = _density_floor_ratio(source_count)
+    # Concrete minimum output target so the sharpened retry names an
+    # explicit length the model must hit, not just an abstract ratio.
+    # The floor is ``ceil(min_ratio * source_total_bytes)``; the word
+    # estimate uses ~6 bytes/word (English prose average incl. markdown
+    # punctuation). Giving the model a number to aim at is the strongest
+    # lever for breaking the "summarize despite the preserve-detail
+    # directive" failure mode — an abstract "below the floor" warning
+    # does not change model behavior the way a byte/word target does.
+    min_output_bytes = max(1, int(min_ratio * source_total_bytes)) if source_total_bytes else 0
+    min_output_words = max(1, min_output_bytes // 6) if min_output_bytes else 0
     retry_instruction = _format_template(
         retry_template,
         output_bytes=output_bytes,
@@ -1086,6 +1175,8 @@ async def _reforge_for_density(
         ratio=(output_bytes / source_total_bytes) if source_total_bytes else 0.0,
         source_count=source_count,
         min_ratio=min_ratio,
+        min_output_bytes=min_output_bytes,
+        min_output_words=min_output_words,
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1172,6 +1263,12 @@ async def _forge_one_source(
     failed_paths: list[str] = []
     if section.strip():
         # Continuation handling reuses the shared tail-append machinery.
+        # ``structural_override=False``: per-source section completeness is
+        # governed by the per-source density floor below, not the dangling-
+        # heading continuation override (a heading-only section is the
+        # density floor's job to catch and re-forge, not the continuation
+        # path's — otherwise the continuation duplicates a heading-only tail
+        # and consumes the retry budget before the density retry runs).
         section, _truncated, _attempts, finish_reason = await _continue_until_complete(
             ctx,
             user_input=user_input,
@@ -1180,6 +1277,7 @@ async def _forge_one_source(
             first_finish_reason=finish_reason,
             max_continue_attempts=max_continue_attempts,
             max_continue_tokens=max_continue_tokens,
+            structural_override=False,
         )
 
     # Per-source density floor: a section under the ratio of its source is
@@ -1224,6 +1322,7 @@ async def _forge_one_source(
                     first_finish_reason=retry_finish,
                     max_continue_attempts=max_continue_attempts,
                     max_continue_tokens=max_continue_tokens,
+                    structural_override=False,
                 )
                 retry_reason = _per_source_density_check(
                     section=retry_section,
@@ -1340,6 +1439,11 @@ async def _reforge_one_source_for_density(
         memory_context=memory_context or "(no recalled context)",
     )
     retry_template = _load_text(ctx, _PER_SOURCE_DENSITY_RETRY_PATH)
+    # Concrete minimum section target (mirrors the global density retry):
+    # naming an explicit byte/word length the section must hit is the
+    # strongest lever for breaking per-source summarization.
+    min_section_bytes = max(1, int(min_ratio * source_bytes)) if source_bytes else 0
+    min_section_words = max(1, min_section_bytes // 6) if min_section_bytes else 0
     retry_instruction = _format_template(
         retry_template,
         source_path=spec.path,
@@ -1348,6 +1452,8 @@ async def _reforge_one_source_for_density(
         source_bytes=source_bytes,
         ratio=(section_bytes / source_bytes) if source_bytes else 0.0,
         min_ratio=min_ratio,
+        min_section_bytes=min_section_bytes,
+        min_section_words=min_section_words,
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1939,6 +2045,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             )
         source_block = render_source_block(sources)
 
+    # ``limit`` accepts 0 to mean "use the configured default" (the
+    # schema gate allows 0 so a caller passing ``limit: 0`` is not
+    # rejected). A falsy value (0, None, missing) falls back to
+    # ``cfg.max_recall_records``. ``_recall_memory`` then clamps to
+    # [1, 20] for the actual memory.search ``limit`` argument.
     recall_limit = int(params.get("limit") or cfg.max_recall_records)
     memory_context = await _recall_memory(ctx, user_input, limit=recall_limit)
 
@@ -2186,7 +2297,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             if density_violation is not None:
                 density_passed = False
                 violation_msg = density_violation  # narrowed to str for the retry call
-                for _ in range(_DENSITY_RETRY_ATTEMPTS):
+                for _ in range(cfg.density_retry_attempts):
                     density_retried = True
                     retry_text, retry_finish = await _reforge_for_density(
                         ctx,

@@ -18,7 +18,10 @@ from typing import Any
 import pytest
 
 from kernel.models import OperationExecutionContext, ToolResult
-from lisa_packs.markdown.operations.forge_document.forge_document import execute
+from lisa_packs.markdown.operations.forge_document.forge_document import (
+    Parameters,
+    execute,
+)
 
 _CONTENT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -236,6 +239,36 @@ async def test_uses_default_path_when_none_supplied() -> None:
     result = await execute(ctx)
     assert "docs/forge.md" in result.output_text
     assert captures["writes"][0]["path"] == "docs/forge.md"
+
+
+@pytest.mark.asyncio
+async def test_limit_zero_is_accepted_and_coerced_to_default() -> None:
+    """``limit: 0`` must not be rejected by the Parameters schema gate.
+
+    Regression for the 2026-08-02 incident where the model called
+    ``markdown_forge_document`` with ``limit: 0`` and the kernel rejected
+    the whole call with ``Input should be greater than or equal to 1``
+    before ``execute`` ran. The schema now allows 0; ``execute`` coerces
+    a falsy limit to the configured default (``forge_max_recall_records``)
+    so the forge proceeds and still recalls memory.
+    """
+    # The schema gate (kernel _validate_parameters runs Parameters.model_validate)
+    # must accept limit=0 — this is the actual regression: the unit tests call
+    # execute() directly with a dict and never exercise the schema, so a too-
+    # strict Field constraint shipped unnoticed.
+    Parameters.model_validate({"document_path": "docs/runbook.md", "limit": 0})
+    tool_fn, captures = _make_tool_executor(memory_records=["a recalled fact"])
+    ctx = _make_ctx(
+        complete_fn=_fake_complete_returning(_VALID_DOCUMENT),
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"document_path": "docs/runbook.md", "limit": 0},
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # Memory recall must still have happened (0 coerced to the default,
+    # not treated as "disable recall").
+    assert captures["memory_query"] is not None
 
 
 @pytest.mark.asyncio
@@ -680,6 +713,55 @@ async def test_clean_stop_does_not_trigger_continuation() -> None:
     # Only one completion call — no continuation pass.
     assert call_count["n"] == 1
     persisted = captures["writes"][0]["content"]
+    assert "truncated by model" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_on_trailing_heading_triggers_continuation() -> None:
+    """A clean ``stop`` ending on a dangling heading is structurally incomplete.
+
+    Regression for the 2026-08-02 "short doc ending on a heading" incident:
+    the model emitted a section heading ("### 5.1 Hook on ...") with no
+    body and returned ``finish_reason="stop"``. The old heuristic treated
+    a trailing heading as complete, so no continuation ran and the
+    half-written section was persisted. The fix: a trailing heading with
+    no body is a truncation signal regardless of finish_reason; the op
+    attempts a continuation that supplies the missing body.
+    """
+    tool_fn, captures = _make_tool_executor()
+    # First pass: ends on a heading with no body, clean stop.
+    # Continuation pass: supplies the body and ends on a clean sentence.
+    heading_only_doc = (
+        "# Spec\n"
+        "\n"
+        "## Design\n"
+        "Body of the design section.\n"
+        "\n"
+        "### 5.1 Hook on OperationExecutionContext\n"
+    )
+    continuation_body = (
+        "A new callable attribute `delegate_fn` is added to the context.\n"
+        "It captures the parent's tool-call loop return address.\n"
+    )
+    complete_fn = _fake_complete_sequence(
+        documents=[heading_only_doc, continuation_body],
+        finish_reasons=["stop", "stop"],
+    )
+    ctx = _make_ctx(
+        query="forge a delegate design spec",
+        complete_fn=complete_fn,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # A continuation must have been attempted despite the clean stop.
+    assert result.output_json["continue_attempts"] == 1
+    # The continuation supplied the body, so the final artifact is NOT marked truncated.
+    assert result.output_json["truncated"] is False
+    persisted = captures["writes"][0]["content"]
+    # The missing body must be present in the persisted document.
+    assert "delegate_fn" in persisted
     assert "truncated by model" not in persisted
 
 

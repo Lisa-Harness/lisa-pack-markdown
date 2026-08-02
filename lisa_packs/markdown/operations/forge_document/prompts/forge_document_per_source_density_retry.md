@@ -7,12 +7,16 @@ floor — your previous section summarized instead of preserving this
 source's substance.
 
 Re-forge the section for this ONE source, this time PRESERVING SOURCE
-DETAIL:
+DETAIL. Your re-forged section MUST be at least **{min_section_bytes}
+bytes** (roughly {min_section_words} words). If you produce less, you
+have summarized this source, not preserved it — keep going until the
+section carries this source's substance.
 
 - Do NOT abridge. Do NOT compress sections to one line.
 - Preserve tables, code blocks, lists, and qualifications from the source.
 - If the source has headings, preserve its section structure as the
-  backbone of your section.
+  backbone of your section. Walk through every one of the source's
+  headings and emit a corresponding subsection.
 - A short section for a large source is a FAILURE. Your job is
   completeness for this source, not brevity. Length is not a quality signal.
 - Respect the source's priority note (in the prior messages) — it may
