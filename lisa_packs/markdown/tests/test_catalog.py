@@ -33,6 +33,25 @@ def test_forge_document_tool_ids_declared() -> None:
     } <= tool_ids
 
 
+def test_consolidate_operation_discovered() -> None:
+    root = markdown.get_content_root() / "operations"
+    catalog = json.loads(build_operation_catalog_json([root]))
+    assert "markdown_consolidate_sources" in catalog
+    op = catalog["markdown_consolidate_sources"]
+    assert op["description"]
+    assert "markdown" in op["mode_allowlist"]
+    tool_ids = set(op["tool_ids"])
+    assert {
+        "markdown_generate",
+        "write_file",
+        "read_file",
+        "list_files",
+        "memory.search",
+        "okf_emit_concept",
+        "okf_log",
+    } <= tool_ids
+
+
 def test_outline_markdown_tool_discovered() -> None:
     root = markdown.get_content_root() / "tools"
     catalog = json.loads(build_tool_catalog_json([root]))
@@ -43,12 +62,12 @@ def test_outline_markdown_tool_discovered() -> None:
 
 
 def test_markdown_mode_exposes_tools_directly() -> None:
-    """The mode exposes storage/memory/outline tools, not the operation."""
+    """The mode exposes storage/memory/outline tools directly plus the consolidate op."""
     root = markdown.get_content_root() / "modes"
     catalog = json.loads(build_mode_catalog_json([root]))
     mode = catalog["markdown"]
     assert mode["mode_kind"] == "chat"
-    assert mode["allowed_operation_ids"] == []
+    assert "markdown_consolidate_sources" in mode["allowed_operation_ids"]
     assert set(mode["allowed_tool_ids"]) >= {
         "markdown_generate",
         "write_file",

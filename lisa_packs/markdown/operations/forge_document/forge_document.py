@@ -1,28 +1,35 @@
-"""Forge-document operation — memory-grounded markdown synthesis.
+"""Forge-document operation — memory-grounded single markdown document synthesis.
 
 Pipeline:
 
 1. Recall context from long-term memory via the ``memory.search`` MCP alias
    (routed by the host to the configured memory backend).
 2. Call an LLM with an authored system prompt + the user input + recalled
-   context to synthesize a markdown document.
-3. Validate the synthesized document's structure by calling the
-   ``markdown_generate`` tool (backed by ``markdown-it-py``). The
-   outline must contain at least one heading.
-4. Persist the document to the ``lisa-storage`` MCP server's ``write_file``
+   context (and optionally the existing document) to synthesize or revise a
+   markdown document.
+3. Handle mid-stream truncation via continuation passes (shared
+   ``operations/_continuation`` machinery).
+4. Validate the synthesized document's structure by calling the
+   ``markdown_generate`` tool (backed by ``markdown-it-py``). The outline
+   must contain at least one heading.
+5. Persist the document to the ``lisa-storage`` MCP server's ``write_file``
    tool under a caller-supplied relative path (default ``docs/``).
 
-The operation never touches the filesystem directly — all reads (memory)
-and writes (storage) go through ``ctx.execute_tool_fn``. Authored prompts
-are loaded via ``ctx.read_authored_text_fn``; per the pack-content rule,
-a missing/empty loader raises rather than silently falling back.
+This is the original single-document purpose of the markdown pack. Multi-source
+consolidation (source_paths, map-reduce, density floors, OKF provenance) lives
+in the separate ``markdown_consolidate_sources`` operation — see
+``operations/consolidate/consolidate.py``.
+
+The operation never touches the filesystem directly — all reads (memory) and
+writes (storage) go through ``ctx.execute_tool_fn``. Authored prompts are
+loaded via ``ctx.read_authored_text_fn``; per the pack-content rule, a
+missing/empty loader raises rather than silently falling back.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -31,25 +38,11 @@ from pydantic import BaseModel, Field
 
 from kernel.models import OperationExecutionContext, OperationResult, ToolExecutionContext
 
-from lisa_packs.markdown.operations.forge_document._source_paths import (
-    SourceSpec,
-    expand_globs,
-    failed_specs,
-    has_sources,
-    parse_source_paths,
-    read_source_chunks,
-    read_sources,
-    readable_count,
-    render_one_source_block,
-    render_priorities_block,
-    render_source_block,
-    stat_source_chars,
-    total_source_bytes,
-)
-# Per-source char cap (public alias) from _source_paths — the
-# rolling-accumulation gate trips when a single source exceeds this.
-from lisa_packs.markdown.operations.forge_document._source_paths import (
-    MAX_PER_SOURCE_CHARS as _MAX_PER_SOURCE_CHARS,
+from lisa_packs.markdown.operations._config import cfg_int
+from lisa_packs.markdown.operations._continuation import (
+    coerce_finish_reason,
+    continue_until_complete,
+    extract_markdown_block,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,24 +51,12 @@ __all__ = ["Parameters", "execute"]
 
 # Tool ids — declared in the operation YAML ``tool_ids`` and routed through
 # ``ctx.execute_tool_fn``. ``markdown_generate`` is a pack-contributed
-# in-process tool; ``write_file`` and ``memory.search`` are MCP tools served
-# by ``lisa-storage`` and the memory backend respectively.
+# in-process tool; ``write_file`` / ``read_file`` and ``memory.search`` are
+# MCP tools served by ``lisa-storage`` and the memory backend respectively.
 _OUTLINE_TOOL_ID = "markdown_generate"
 _WRITE_TOOL_ID = "write_file"
 _READ_TOOL_ID = "read_file"
-# Storage tool shipped in Phase 1 (commit 126e7b5), used by the Phase 3
-# rolling-accumulation path for opt-in incremental persistence.
-_APPEND_TOOL_ID = "append_file"
 _MEMORY_SEARCH_TOOL_ID = "memory.search"
-
-# Tool ids used by the source-paths consolidation path (added 2026-07-30).
-# ``list_files`` and ``read_file`` are served by the lisa-storage MCP server
-# (same backend as _READ_TOOL_ID/_WRITE_TOOL_ID). ``okf_emit_concept`` and
-# ``okf_log`` are served by the lisa-pack-okf pack's default-available
-# operations, consumed here as tools via ctx.execute_tool_fn — the same
-# pattern used for memory.search. See the consolidation design discussion.
-_OKF_EMIT_TOOL_ID = "okf_emit_concept"
-_OKF_LOG_TOOL_ID = "okf_log"
 
 # User-instruction phrases that opt out of model attribution.
 _NO_ANNOTATE_PHRASES = (
@@ -97,130 +78,22 @@ _EMPTY_DOCUMENT_PATH = f"{_PROMPT_DIR}/forge_document_empty_document.md"
 _NO_OUTLINE_PATH = f"{_PROMPT_DIR}/forge_document_no_outline.md"
 _STORAGE_FAILED_PATH = f"{_PROMPT_DIR}/forge_document_storage_failed.md"
 _CONTINUE_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_continue.md"
-# Source-aware consolidation prompts (added 2026-07-30). When the caller
-# supplies ``source_paths``, the operation swaps to these prompts so the
-# model receives the per-source priority notes and the "preserve detail,
-# do not summarize" directive. The single-doc/memory-only path keeps the
-# original prompts unchanged — no regression for existing callers.
-_SYSTEM_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_system_sources.md"
-_USER_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_user_sources.md"
-_DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_density_retry.md"
-# Per-source map-reduce consolidation prompts (added 2026-08-01). When the
-# aggregate source size exceeds the single-pass budget, the operation forges
-# one section per source (bounded context) then merges the sections. This
-# keeps every model call's context small enough for a local backend to
-# satisfy the preserve-detail directive. See
-# /memories/session/plan.md (Phase 2).
-_SYSTEM_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_system_per_source.md"
-_USER_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_user_per_source.md"
-_SYSTEM_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_system_merge.md"
-_USER_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_user_merge.md"
-# Per-source density retry prompt (map-reduce path, added 2026-08-02). When
-# a per-source section comes back implausibly tiny relative to its source,
-# this sharpened instruction re-sends the per-source prompt and names the
-# deficit explicitly. Mirrors the global _DENSITY_RETRY_PATH shape.
-_PER_SOURCE_DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_per_source_density_retry.md"
-# Rolling-accumulation prompts (Phase 3, added 2026-08-02). When a single
-# source exceeds _MAX_PER_SOURCE_CHARS and the forge_rolling_accumulation
-# gate is opted in, the operation chunks the source via read_file_range and
-# forges a running document chunk by chunk. See
-# /memories/session/plan.md (Phase 3).
-_SYSTEM_PROMPT_ROLLING_PATH = f"{_PROMPT_DIR}/forge_document_system_rolling.md"
-_USER_PROMPT_ROLLING_PATH = f"{_PROMPT_DIR}/forge_document_user_rolling.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
 # ``resources.packs.configuration.markdown.<key>`` block, surfaced to the
-# op at runtime as ``ctx.pack_config`` (an immutable mapping loaded by
-# ``kernel/pack_configuration.SessionPackConfigurationResolver`` before
-# ``execute`` runs). These constants are only the last-resort fallback when
-# no manifest config is supplied so the op still works in a bare host.
-#
-# Manifest keys (all under ``resources.packs.configuration.markdown``):
-#   forge_max_completion_tokens, forge_max_continue_tokens,
-#   forge_max_continue_attempts, forge_max_recall_records,
-#   forge_max_document_chars, forge_max_document_chars_with_sources,
-#   forge_max_query_chars.
-#
-# The YAML ``completion_max_tokens`` mirrors ``forge_max_completion_tokens``
-# but is documentary-only for runtime ops (the kernel does not inject it
-# into ``ctx`` for ``execution_kind: runtime``). See
-# /memories/repo/operation-tunables-placement.md and
-# /memories/repo/forge-document-truncation-contract.md.
+# op at runtime as ``ctx.pack_config``. These constants are the last-resort
+# fallback when no manifest config is supplied so the op still works in a
+# bare host.
 _MAX_COMPLETION_TOKENS = 50_000
-# Continuation pass uses the same cap. The continuation appends only the
-# missing tail, so the same budget is sufficient for nearly all cases.
 _MAX_CONTINUE_TOKENS = _MAX_COMPLETION_TOKENS
-# Hard ceiling on continuation attempts. One retry covers the
-# "model ran out of tokens one section early" case; two covers the
-# rare "still truncated, one more chunk needed" case. Beyond this we
-# give up and annotate the document as truncated rather than looping.
 _MAX_CONTINUE_ATTEMPTS = 4
 _MAX_RECALL_RECORDS = 25
-# Hard ceiling on the persisted document. The original 20K cap (from the
-# single-doc/memory era) forced summarization of anything larger and was a
-# root cause of the 2026-07-30 "summarizing instead of writing" incident:
-# a 130KB consolidation could not physically exceed ~20K. Source-aware
-# consolidations raise the cap so the preservation directive is
-# enforceable. The map-reduce path (future work) will handle the case
-# where even this cap is too small for one pass.
-_MAX_DOCUMENT_CHARS = 500_000
-_MAX_DOCUMENT_CHARS_WITH_SOURCES = 1_500_000
+_MAX_DOCUMENT_CHARS = 20_000
 _MAX_QUERY_CHARS = 20_000
-# Map-reduce consolidation thresholds (added 2026-08-01). When the aggregate
-# source size exceeds the single-pass budget, forge one section per source
-# then merge. The byte threshold is the point at which a local backend can
-# no longer reliably emit a proportional preserve-detail document in one
-# pass (empirically ~8KB on small Ollama models); the source threshold
-# forces the chunked path whenever 2+ sources are present regardless of
-# size, since per-source boundaries are cleaner than one giant block.
-# Both are session-configurable via
-# ``forge_map_reduce_byte_threshold`` / ``forge_map_reduce_source_threshold``.
-_MAP_REDUCE_BYTE_THRESHOLD = 8_000
-_MAP_REDUCE_SOURCE_THRESHOLD = 2
-
-# Density floor (consolidation anti-abridgment gate, added 2026-07-30).
-# When the caller supplied source_paths, the output must preserve enough of
-# the source substance to not be a lossy summary. The floor is a ratio of
-# output bytes to source bytes, scaled by source count: more sources allow
-# a lower ratio (legitimate de-duping), but a sub-floor output is presumed
-# to be summarizing and triggers one re-forge pass. The thresholds are
-# conservative starting points, tunable per-operation.
-_DENSITY_FLOOR_MANY_SOURCES_RATIO = 0.15   # 5+ readable sources
-_DENSITY_FLOOR_FEW_SOURCES_RATIO = 0.30    # 2-4 readable sources
-_DENSITY_FLOOR_MANY_SOURCES_THRESHOLD = 5
-# Allow up to two retries when the floor trips. The first retry names the
-# deficit abstractly; the second (added 2026-08-02 after the
-# "summarizing instead of writing a spec" incident) names an explicit
-# minimum byte/word target the model must hit — the strongest lever for
-# breaking the summarize-despite-preserve-detail failure mode. Beyond two
-# retries we persist with the density-FAILED annotation (honest failure)
-# rather than looping indefinitely. Session-configurable via
-# ``forge_density_retry_attempts``.
-_DENSITY_RETRY_ATTEMPTS = 2
-
-# Per-source density floor (map-reduce path, added 2026-08-02). A section
-# forged from a single source must preserve enough of THAT source's
-# substance to not be a lossy abridgment. Unlike the global density floor
-# (which needs >=2 sources to be meaningful), this applies per source in
-# the map-reduce path: a 100B section for a 20KB source is abridged even
-# though no cross-source consolidation is happening. The floor is a ratio
-# of section bytes to source bytes; a section below the ratio trips one
-# retry with a sharpened per-source instruction. If the retry still trips,
-# the section is kept but annotated with an inline HTML comment and the
-# source path is recorded in ``density_failed_sources`` for the op result.
-# Session-configurable via ``forge_per_source_min_ratio``.
-_PER_SOURCE_MIN_RATIO = 0.10
 
 # Minimum structural bar for a forged document: at least one heading.
 _MIN_HEADINGS = 1
-
-# Finish-reason values that signal the model stopped before completing
-# the document. ``"length"`` is the OpenAI-standard "hit max_tokens"
-# signal. ``"unknown"`` / ``None`` cover local backends (Ollama) that do
-# not populate ``finish_reason`` — empirically these stop mid-stream on
-# long documents. ``"stop"`` and ``"tool_calls"`` are NOT truncation.
-_TRUNCATING_FINISH_REASONS = frozenset({"length", "unknown", None})
 
 
 def _load_text(ctx: OperationExecutionContext, path: str) -> str:
@@ -285,8 +158,7 @@ class Parameters(BaseModel):
         le=20,
         description="Maximum number of recalled memory records to inject as context. "
         "0 means 'use the default' (the operation coerces 0 to the configured "
-        "default) — accepted so a caller that explicitly passes 0 to mean "
-        "'no special limit' is not rejected at the schema gate.",
+        "default).",
     )
     annotate_model: bool = Field(
         default=True,
@@ -295,28 +167,6 @@ class Parameters(BaseModel):
         "opt out by including phrases like 'don't annotate the model' in the "
         "instruction. Set False to suppress unconditionally.",
     )
-    source_paths: list[str | dict[str, str]] = Field(
-        default_factory=list,
-        description="Ordered list of source documents to consolidate. Each entry is "
-        "either a path/glob string (default priority 'normal') or a dict with "
-        "'path' (required) and 'priority' (optional NL prose, e.g. 'primary — "
-        "keep section structure', 'secondary — dedupe against source 1', "
-        "'background — one paragraph max'). Globs (paths with * or ?) are "
-        "expanded via the list_files storage tool. When supplied, the "
-        "operation switches to consolidation mode: it reads every source, "
-        "injects them with their per-source priority notes, and instructs "
-        "the model to PRESERVE DETAIL rather than summarize. A density floor "
-        "validates the output is not a lossy abridgment. Provenance is "
-        "captured to an OKF concept (see okf_bundle_path).",
-    )
-    okf_bundle_path: str = Field(
-        default="okf/forge-provenance",
-        description="Relative path of the OKF bundle directory where the forge "
-        "provenance concept is written (only when source_paths is supplied). "
-        "Set to empty to skip OKF provenance capture. The concept uses OKF "
-        "type 'forge-provenance' and records the model, sources, processing "
-        "passes, and density check result.",
-    )
 
 
 def _extract_document_path(params: dict[str, Any]) -> str:
@@ -324,8 +174,6 @@ def _extract_document_path(params: dict[str, Any]) -> str:
     raw = str(params.get("document_path") or "").strip()
     if not raw:
         return "docs/forge.md"
-    # sees them; the storage server re-validates, but we fail early with a
-    # clearer error.
     normalized = raw.replace("\\", "/").lstrip("/")
     if ".." in normalized.split("/"):
         raise RuntimeError("document_path may not contain '..' segments")
@@ -334,128 +182,27 @@ def _extract_document_path(params: dict[str, Any]) -> str:
 
 @dataclass(frozen=True)
 class _ResolvedSettings:
-    """Resolved operation budgets: ``ctx.pack_config`` overrides module fallbacks.
-
-    The authoritative source is the session manifest's
-    ``resources.packs.configuration.markdown.<key>`` block, surfaced at
-    runtime as ``ctx.pack_config`` (an immutable MappingProxyType populated
-    by ``kernel/operations/registry._resolve_execution_configuration`` before
-    ``execute`` runs). The module ``_MAX_*`` constants are last-resort
-    fallbacks used only when the manifest supplies no value, so the op still
-    works in a bare host with no manifest config.
-
-    See /memories/repo/operation-tunables-placement.md.
-    """
+    """Resolved operation budgets: ``ctx.pack_config`` overrides module fallbacks."""
 
     max_completion_tokens: int
     max_continue_tokens: int
     max_continue_attempts: int
     max_recall_records: int
     max_document_chars: int
-    max_document_chars_with_sources: int
     max_query_chars: int
-    map_reduce_byte_threshold: int
-    map_reduce_source_threshold: int
-    per_source_min_ratio: float
-    forge_rolling_accumulation: bool
-    forge_rolling_incremental_persist: bool
-    density_retry_attempts: int
-
-
-def _cfg_int(pack_config: Any, key: str, default: int) -> int:
-    """Read an int from ``ctx.pack_config`` with a module-constant fallback.
-
-    Coerces non-int values to the default rather than raising, since pack
-    config is session-authored and a malformed value should not crash the
-    op mid-turn (the fallback is the safe, known-good default). The mapping
-    is immutable (MappingProxyType), so we only read from it.
-    """
-    if pack_config is None:
-        return default
-    raw = pack_config.get(key)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        logger.warning("forge_document: pack_config[%r]=%r is not an int; using default %d", key, raw, default)
-        return default
-
-
-def _cfg_float(pack_config: Any, key: str, default: float) -> float:
-    """Read a float from ``ctx.pack_config`` with a module-constant fallback.
-
-    Same contract as :func:`_cfg_int` but for ratio/percentage thresholds.
-    Coerces non-float values to the default rather than raising; a malformed
-    session value falls back to the safe default instead of crashing mid-turn.
-    """
-    if pack_config is None:
-        return default
-    raw = pack_config.get(key)
-    if raw is None or raw == "":
-        return default
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        logger.warning("forge_document: pack_config[%r]=%r is not a float; using default %s", key, raw, default)
-        return default
-
-
-def _cfg_bool(pack_config: Any, key: str, default: bool) -> bool:
-    """Read a bool from ``ctx.pack_config`` with a module-constant fallback.
-
-    Accepts native bools and the string forms ``true``/``false``/``1``/``0``
-    (case-insensitive). Coerces anything else to the default rather than
-    raising, so a malformed session value falls back to the safe default
-    instead of crashing mid-turn.
-    """
-    if pack_config is None:
-        return default
-    raw = pack_config.get(key)
-    if raw is None or raw == "":
-        return default
-    if isinstance(raw, bool):
-        return raw
-    text = str(raw).strip().lower()
-    if text in ("true", "1", "yes", "on"):
-        return True
-    if text in ("false", "0", "no", "off", ""):
-        return False
-    logger.warning("forge_document: pack_config[%r]=%r is not a bool; using default %s", key, raw, default)
-    return default
 
 
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
     pc = ctx.pack_config
     return _ResolvedSettings(
-        max_completion_tokens=_cfg_int(pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS),
-        max_continue_tokens=_cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
-        max_continue_attempts=_cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
-        max_recall_records=_cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
-        max_document_chars=_cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
-        max_document_chars_with_sources=_cfg_int(pc, "forge_max_document_chars_with_sources", _MAX_DOCUMENT_CHARS_WITH_SOURCES),
-        max_query_chars=_cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
-        map_reduce_byte_threshold=_cfg_int(pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD),
-        map_reduce_source_threshold=_cfg_int(pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD),
-        per_source_min_ratio=_cfg_float(pc, "forge_per_source_min_ratio", _PER_SOURCE_MIN_RATIO),
-        forge_rolling_accumulation=_cfg_bool(pc, "forge_rolling_accumulation", False),
-        forge_rolling_incremental_persist=_cfg_bool(pc, "forge_rolling_incremental_persist", False),
-        density_retry_attempts=_cfg_int(pc, "forge_density_retry_attempts", _DENSITY_RETRY_ATTEMPTS),
+        max_completion_tokens=cfg_int(pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS),
+        max_continue_tokens=cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
+        max_continue_attempts=cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
+        max_recall_records=cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
+        max_document_chars=cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
+        max_query_chars=cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
     )
-
-
-def _document_stem(document_path: str) -> str:
-    """Return the filename stem (no extension) of a storage path.
-
-    Used to derive the OKF provenance concept filename from the forged
-    document path, e.g. ``docs/narrative.md`` → ``narrative``.
-    """
-    normalized = document_path.replace("\\", "/").rstrip("/")
-    base = normalized.rsplit("/", 1)[-1]
-    if "." in base:
-        base = base.rsplit(".", 1)[0]
-    return base or "forge"
 
 
 def _extract_query(ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int) -> str:
@@ -494,9 +241,6 @@ async def _read_existing_document(
     if error_text:
         raise RuntimeError(f"{_READ_TOOL_ID} failed: {error_text}")
     output_text = getattr(tool_result, "output_text", "") or ""
-    # The storage server returns the raw file text on success, or a JSON
-    # error object on failure. A JSON error with "not found" is a normal
-    # first-forge condition — return "".
     try:
         data = json.loads(output_text)
     except (json.JSONDecodeError, TypeError):
@@ -550,8 +294,6 @@ async def _recall_memory(
         logger.warning("markdown: memory.search returned error: %s", error_text)
         return ""
     output_text = getattr(tool_result, "output_text", "") or ""
-    # The memory backend returns newline-formatted text (or a JSON list).
-    # If it's JSON, flatten to bullets; otherwise pass through.
     try:
         data = json.loads(output_text)
     except (json.JSONDecodeError, TypeError):
@@ -582,7 +324,6 @@ async def _call_llm(
     user_input: str,
     memory_context: str,
     existing_document: str = "",
-    source_block: str = "",
     *,
     max_tokens: int,
 ) -> tuple[str, Any, str | None]:
@@ -590,12 +331,7 @@ async def _call_llm(
 
     Returns a ``(content, model_def, finish_reason)`` triple so the caller
     can annotate the document with the resolved model and detect
-    mid-document truncation (``finish_reason in {"length", "unknown", None}``).
-
-    When ``source_block`` is non-empty, the operation swaps to the
-    source-aware consolidation prompts (preserve-detail directive +
-    per-source priority notes). The single-doc/memory-only path keeps
-    the original prompts.
+    mid-document truncation.
     """
     if ctx.complete_fn is None or ctx.resolve_model_fn is None:
         raise RuntimeError("markdown requires complete_fn and resolve_model_fn")
@@ -603,22 +339,15 @@ async def _call_llm(
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
     model_def = ctx.resolve_model_fn(preferred_model_id)
     if model_def is None:
-        raise RuntimeError(
-            f"markdown could not resolve model '{preferred_model_id}'"
-        )
+        raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
 
-    if source_block:
-        system_prompt = _load_text(ctx, _SYSTEM_PROMPT_SOURCES_PATH)
-        user_template = _load_text(ctx, _USER_PROMPT_SOURCES_PATH)
-    else:
-        system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PATH)
-        user_template = _load_text(ctx, _USER_PROMPT_PATH)
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_PATH)
     user_prompt = _format_template(
         user_template,
         user_input=user_input,
         memory_context=memory_context or "(no recalled context)",
         existing_document=existing_document or "(no existing document — start fresh)",
-        source_block=source_block,
     )
 
     messages = [
@@ -634,221 +363,14 @@ async def _call_llm(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
+    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
     return content.strip(), model_def, finish_reason
 
 
-def _coerce_finish_reason(raw: Any) -> str | None:
-    """Normalize a provider finish_reason into a comparable string or None.
-
-    Providers occasionally return ``""`` or whitespace for "no signal"; coerce
-    those to ``None`` so they fall into the truncation set (a missing signal
-    on a long document is empirically a truncation, not a clean stop).
-    """
-    if raw is None:
-        return None
-    text = str(raw).strip().lower()
-    if not text:
-        return None
-    return text
-
-
-def _is_truncated(finish_reason: str | None) -> bool:
-    """Return True when the finish reason signals mid-stream truncation."""
-    normalized = finish_reason if finish_reason is not None else None
-    return normalized in _TRUNCATING_FINISH_REASONS
-
-
-async def _continue_llm(
-    ctx: OperationExecutionContext,
-    user_input: str,
-    document_so_far: str,
-    model_def: Any,
-    *,
-    max_tokens: int,
-) -> tuple[str, str | None]:
-    """Issue one continuation pass to finish a truncated document.
-
-    Appends a continuation instruction to the original message list (so the
-    model has full context) and asks for ONLY the remaining tail. Returns
-    ``(continuation_content, finish_reason)`` where ``continuation_content``
-    is the raw model output (caller extracts the fenced markdown block).
-    """
-    if ctx.complete_fn is None:
-        raise RuntimeError("markdown requires complete_fn to continue a truncated document")
-
-    continue_template = _load_text(ctx, _CONTINUE_PROMPT_PATH)
-    continue_prompt = _format_template(
-        continue_template,
-        user_input=user_input,
-        document_so_far=document_so_far,
-    )
-    messages = [
-        {"role": "user", "content": continue_prompt},
-    ]
-    completion = await ctx.complete_fn(
-        messages=messages,
-        model_def=model_def,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        tools=None,
-        response_format=None,
-    )
-    content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-    return content.strip(), finish_reason
-
-
-def _looks_complete(document: str) -> bool:
-    """Heuristic: does the document end on a clean paragraph/list boundary?
-
-    Used after a continuation pass to decide whether the merged document is
-    plausibly finished or whether we should try another continuation. A
-    document ending mid-word, mid-sentence, or with a dangling list marker
-    is treated as still-truncated.
-
-    A heading as the very last content line is treated as TRUNCATED: the
-    model opened a section ("### 5.1 ...") and stopped before writing its
-    body. This was the root cause of the 2026-08-02 "short doc ending on a
-    heading" incident — the model emitted a section heading with no body
-    and returned ``finish_reason="stop"``, and the old heuristic treated
-    a trailing heading as complete, so no continuation was attempted and
-    the half-written section was persisted as-is.
-    """
-    if not document:
-        return False
-    stripped = document.rstrip()
-    if not stripped:
-        return False
-    # Dangling list marker (e.g. "- " or "1. " at end of file) = truncated.
-    if re.search(r"[\-\*\+] +$", stripped):
-        return False
-    # Dangling fenced code block (odd number of fences) = truncated.
-    fence_count = len(re.findall(r"^```", stripped, flags=re.MULTILINE))
-    if fence_count % 2 == 1:
-        return False
-    last_line = stripped.splitlines()[-1].rstrip()
-    if not last_line:
-        return True  # ends on a blank line — clean
-    # Ends with sentence-final punctuation, a code fence, or blockquote.
-    if last_line.endswith(("```", ".", "!", "?", ":", ";", ">", ")")):
-        return True
-    # Ends with a list item that has content after the marker.
-    if re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(r"^\s*\d+\. +\S", last_line):
-        return True
-    # A heading as the LAST content line is a truncation signal: the model
-    # opened a section but wrote no body. (A heading followed by its body
-    # ends on the body's last line, not on the heading, so this only fires
-    # for a heading with nothing after it.)
-    if last_line.lstrip().startswith("#"):
-        return False
-    # Ends with a heading line that has body content above it is already
-    # covered by the sentence/code/list branches above; any other heading
-    # placement at the tail is mid-section — treat as truncated.
-    return False
-
-
-def _ends_on_dangling_heading(document: str) -> bool:
-    """Return True when the document's last content line is a heading.
-
-    Narrow structural-incompleteness detector used to override a clean
-    provider ``finish_reason="stop"``: a section heading with no body
-    following it is incomplete regardless of the provider's finish signal.
-    This is the exact shape of the 2026-08-02 "short doc ending on a
-    heading" incident (the model emitted "### 5.1 Hook on ..." with no
-    body and returned ``stop``).
-
-    Kept narrow (headings only) rather than reusing the broader
-    :func:`_looks_complete` so a clean stop on a table row, a line ending
-    in non-sentence punctuation, or other legitimate-but-unconventional
-    endings does NOT spuriously trigger a continuation pass.
-    """
-    if not document:
-        return False
-    stripped = document.rstrip()
-    if not stripped:
-        return False
-    # Skip a trailing blank line (the heading is the last non-empty line).
-    lines = [ln for ln in stripped.splitlines() if ln.strip()]
-    if not lines:
-        return False
-    last = lines[-1].rstrip()
-    return bool(re.match(r"^#{1,6}\s+\S", last.lstrip()))
-
-
-def _merge_continuation(document_so_far: str, tail: str) -> str:
-    """Concatenate the document-so-far with a continuation tail.
-
-    The continuation prompt asks for ONLY the remaining body, but local
-    models sometimes re-emit a leading heading or blank line. This helper
-    collapses the join boundary to exactly one blank line and strips any
-    leading blank lines from the tail so the merge does not produce
-    doubled paragraph breaks.
-    """
-    head = document_so_far.rstrip()
-    tail_body = tail.lstrip("\n").rstrip()
-    if not tail_body:
-        return document_so_far
-    if not head:
-        return tail_body + "\n"
-    return head + "\n\n" + tail_body + "\n"
-
-
-def _tail_is_duplicate(document_so_far: str, tail: str) -> bool:
-    """Return True when the continuation just re-emits the existing tail.
-
-    Some local models, when asked to "continue", repeat the last paragraph or
-    the entire document-so-far instead of appending new content. Detecting
-    this prevents the merge from producing a doubled or looped document. The
-    check is conservative: it only flags tails whose non-empty lines are a
-    contiguous suffix of the existing document.
-    """
-    head_lines = [ln for ln in document_so_far.splitlines() if ln.strip()]
-    tail_lines = [ln for ln in tail.splitlines() if ln.strip()]
-    if not tail_lines:
-        return True
-    if len(tail_lines) > len(head_lines):
-        # The continuation is longer than the entire document-so-far — it
-        # must contain new content, so not a pure duplicate.
-        return False
-    # Compare the last len(tail_lines) lines of the head to the tail.
-    suffix = head_lines[-len(tail_lines):]
-    return suffix == tail_lines
-
-
-def _extract_markdown_block(text: str) -> str:
-    """Extract the first fenced ```markdown ...``` block, else return text.
-
-    Accepts fenced blocks tagged ``markdown`` or untagged. Falls back to the
-    raw text when no fence is present so the outline tool can still assess it.
-    """
-    match = re.search(r"```(?:markdown|md)?\s*\n(.*?)```", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
-
-
-def _format_markdown(document: str) -> str:
-    """Lint/format the document via ``mdformat`` if available.
-
-    ``mdformat`` is the canonical CommonMark formatter and is the natural
-    companion to ``markdown-it-py`` (which the pack already depends on for
-    outline validation). When installed it normalizes bullet markers,
-    collapses redundant blank lines, fixes heading spacing, and guarantees a
-    single trailing newline — producing clean, consistent output. When not
-    installed the document passes through unchanged so the pack remains
-    importable without the optional dependency.
-    """
-    try:
-        import mdformat  # type: ignore[import-not-found]
-    except ImportError:
-        logger.debug("mdformat not installed; skipping markdown formatting")
-        return document
-    try:
-        return mdformat.text(document, options={"number": True}).rstrip() + "\n"
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("forge_document: mdformat failed (%s); using unformatted document", exc)
-        return document
+def _user_asked_not_to_annotate(user_input: str) -> bool:
+    """Return True when the user instruction explicitly opts out of attribution."""
+    lowered = user_input.lower()
+    return any(phrase in lowered for phrase in _NO_ANNOTATE_PHRASES)
 
 
 def _build_model_annotation(
@@ -860,14 +382,9 @@ def _build_model_annotation(
 ) -> str:
     """Build a trailing HTML-comment attribution line for the resolved model.
 
-    The comment is non-rendering in every CommonMark renderer, so it annotates
-    the source without polluting the visible document.
-
     When ``truncated`` is True, an explicit ``truncated by model`` marker is
     appended so a reader scanning the artifact knows the document is
-    incomplete even though the operation persisted it. The final
-    ``finish_reason`` and the number of continuation attempts are included
-    for triage.
+    incomplete even though the operation persisted it.
     """
     provider = str(getattr(model_def, "provider", "") or "").strip()
     model_id = str(getattr(model_def, "model_id", "") or "").strip()
@@ -885,12 +402,6 @@ def _build_model_annotation(
         return ""
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d")
     return f"<!-- generated by lisa · {' · '.join(parts)} · {timestamp} -->"
-
-
-def _user_asked_not_to_annotate(user_input: str) -> bool:
-    """Return True when the user instruction explicitly opts out of attribution."""
-    lowered = user_input.lower()
-    return any(phrase in lowered for phrase in _NO_ANNOTATE_PHRASES)
 
 
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
@@ -917,7 +428,6 @@ async def _validate_outline(ctx: OperationExecutionContext, document: str) -> di
         raise RuntimeError(f"{_OUTLINE_TOOL_ID} failed: {error_text}")
     output_json = getattr(tool_result, "output_json", {}) or {}
     if not output_json:
-        # Try to parse output_text as JSON for backends that only return text.
         output_text = getattr(tool_result, "output_text", "") or ""
         try:
             output_json = json.loads(output_text)
@@ -963,1033 +473,18 @@ async def _persist_document(
     return data if isinstance(data, dict) else {}
 
 
-async def _continue_until_complete(
-    ctx: OperationExecutionContext,
-    *,
-    user_input: str,
-    document: str,
-    model_def: Any,
-    first_finish_reason: str | None,
-    max_continue_attempts: int,
-    max_continue_tokens: int,
-    structural_override: bool = True,
-) -> tuple[str, bool, int, str | None]:
-    """Run continuation passes until the document looks complete or budget is hit.
-
-    Returns ``(document, was_truncated, attempts, final_finish_reason)``.
-    The caller annotates and persists ``document``; the other three values
-    feed the truncated-annotation marker and the triage fields in
-    ``OperationResult.output_json``.
-
-    The contract is documented in
-    /memories/repo/forge-document-truncation-contract.md:
-    - Only truncate-flagged first passes (``length``/``unknown``/``None``)
-      trigger continuation; clean ``stop`` returns the document as-is.
-    - A continuation that returns empty or duplicates the existing tail is
-      treated as "model has nothing more to add" — stop and mark truncated.
-    - A merged document that ends on a clean boundary (``_looks_complete``)
-      AND whose continuation reported a non-truncating finish_reason is
-      considered complete; otherwise we keep going up to the budget.
-
-    Structural-incompleteness override (added 2026-08-02 after the
-    "short doc ending on a heading" incident): a provider can return a
-    clean ``finish_reason="stop"`` while the document is structurally
-    incomplete — e.g. a trailing section heading with no body. When the
-    document ends on a dangling heading (:func:`_ends_on_dangling_heading`),
-    attempt continuation even on a clean stop, since the provider's
-    finish signal is not authoritative for structural completeness. The
-    check is deliberately narrow (dangling headings only) so a clean
-    stop on a table row or unconventional ending does not spuriously
-    trigger a continuation. The continuation's own finish_reason still
-    governs whether we mark the final artifact truncated.
-
-    ``structural_override`` defaults to True (the final single-pass /
-    merge document benefits from it). Per-source sections set it False:
-    their completeness is governed by the per-source density floor, and a
-    heading-only section is the density floor's job to catch, not the
-    continuation path's (otherwise the continuation consumes the retry
-    budget duplicating a heading-only tail before the density retry runs).
-    """
-    structurally_incomplete = _ends_on_dangling_heading(document) if structural_override else False
-    if not _is_truncated(first_finish_reason) and not structurally_incomplete:
-        return document, False, 0, first_finish_reason
-    if structurally_incomplete and not _is_truncated(first_finish_reason):
-        logger.warning(
-            "forge_document: first pass finish_reason=%r but document ends "
-            "on a dangling heading (section opened with no body); attempting "
-            "continuation despite clean stop",
-            first_finish_reason,
-        )
-
-    logger.warning(
-        "forge_document: first pass finish_reason=%r; attempting continuation",
-        first_finish_reason,
-    )
-    attempts = 0
-    final_finish_reason = first_finish_reason
-    current = document
-    for attempt in range(1, max_continue_attempts + 1):
-        attempts = attempt
-        continuation_text, cont_finish_reason = await _continue_llm(
-            ctx,
-            user_input=user_input,
-            document_so_far=current,
-            model_def=model_def,
-            max_tokens=max_continue_tokens,
-        )
-        final_finish_reason = cont_finish_reason
-        if not continuation_text or not continuation_text.strip():
-            logger.warning(
-                "forge_document: continuation pass %d returned empty; giving up",
-                attempt,
-            )
-            break
-        tail = _extract_markdown_block(continuation_text)
-        # If the fenced block extracted was empty but the raw continuation
-        # had content, the model emitted prose outside the fence (or an
-        # empty fence). Either way, there is no usable markdown tail to
-        # append — treat this as "continuation had nothing to add" and
-        # stop. Persisting prose-as-tail would corrupt the document.
-        if not tail.strip():
-            logger.warning(
-                "forge_document: continuation pass %d yielded no markdown tail; giving up",
-                attempt,
-            )
-            break
-        if _tail_is_duplicate(current, tail):
-            logger.warning(
-                "forge_document: continuation pass %d duplicated existing tail; giving up",
-                attempt,
-            )
-            break
-        current = _merge_continuation(current, tail)
-        if _looks_complete(current) and not _is_truncated(cont_finish_reason):
-            logger.info(
-                "forge_document: continuation pass %d completed the document", attempt,
-            )
-            return current, False, attempts, cont_finish_reason
-        if attempt >= max_continue_attempts:
-            logger.warning(
-                "forge_document: exhausted %d continuation attempts; "
-                "persisting with truncated annotation (final finish_reason=%r)",
-                attempt, cont_finish_reason,
-            )
-    return current, True, attempts, final_finish_reason
-
-
-def _density_floor_ratio(source_count: int) -> float:
-    """Return the minimum output/source byte ratio that is NOT a lossy abridgment.
-
-    Scaled by source count: more sources allow a lower ratio (legitimate
-    de-duping across many sources), but a sub-floor output is presumed to
-    be summarizing. See _DENSITY_FLOOR_* constants for the thresholds.
-    """
-    if source_count >= _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD:
-        return _DENSITY_FLOOR_MANY_SOURCES_RATIO
-    if source_count >= 2:
-        return _DENSITY_FLOOR_FEW_SOURCES_RATIO
-    # Single source or zero: no floor (the single-doc path already has the
-    # revise-vs-replace contract; the floor only catches consolidation
-    # abridgment, which requires multiple sources to be meaningful).
-    return 0.0
-
-
-def _density_floor_check(
-    *,
-    source_total_bytes: int,
-    output_bytes: int,
-    source_count: int,
-) -> str | None:
-    """Return a violation message if the output looks like a lossy abridgment.
-
-    Returns ``None`` when the output passes the floor (or when no floor
-    applies — zero/single source, or zero source bytes). The message is
-    used both as a log signal and as input to the density-retry prompt
-    so the re-forge pass can name the deficit explicitly.
-    """
-    if source_total_bytes <= 0 or source_count < 2:
-        return None
-    min_ratio = _density_floor_ratio(source_count)
-    if min_ratio <= 0.0:
-        return None
-    ratio = output_bytes / source_total_bytes if source_total_bytes else 1.0
-    if ratio >= min_ratio:
-        return None
-    return (
-        f"Output is {output_bytes}B vs {source_total_bytes}B of source "
-        f"({ratio:.0%}, {source_count} sources) — below the {min_ratio:.0%} "
-        f"preservation floor. Re-forge preserving source detail."
-    )
-
-
-async def _reforge_for_density(
-    ctx: OperationExecutionContext,
-    *,
-    user_input: str,
-    memory_context: str,
-    existing_document: str,
-    source_block: str,
-    model_def: Any,
-    violation: str,
-    source_total_bytes: int,
-    output_bytes: int,
-    source_count: int,
-    max_tokens: int,
-) -> tuple[str, str | None]:
-    """Issue one density-retry forge pass with a sharpened instruction.
-
-    Returns ``(content, finish_reason)``. The retry re-sends the full
-    source-aware user prompt (so the model has the sources + priorities
-    in context) followed by the density-retry instruction naming the
-    deficit. The caller extracts the fenced markdown block and re-runs
-    the density check; if it still fails, the caller persists with the
-    truncated annotation (honest failure) rather than looping.
-    """
-    if ctx.complete_fn is None:
-        return "", None
-    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_SOURCES_PATH)
-    user_template = _load_text(ctx, _USER_PROMPT_SOURCES_PATH)
-    base_user_prompt = _format_template(
-        user_template,
-        user_input=user_input,
-        memory_context=memory_context or "(no recalled context)",
-        existing_document=existing_document or "(no existing document — start fresh)",
-        source_block=source_block,
-    )
-    retry_template = _load_text(ctx, _DENSITY_RETRY_PATH)
-    min_ratio = _density_floor_ratio(source_count)
-    # Concrete minimum output target so the sharpened retry names an
-    # explicit length the model must hit, not just an abstract ratio.
-    # The floor is ``ceil(min_ratio * source_total_bytes)``; the word
-    # estimate uses ~6 bytes/word (English prose average incl. markdown
-    # punctuation). Giving the model a number to aim at is the strongest
-    # lever for breaking the "summarize despite the preserve-detail
-    # directive" failure mode — an abstract "below the floor" warning
-    # does not change model behavior the way a byte/word target does.
-    min_output_bytes = max(1, int(min_ratio * source_total_bytes)) if source_total_bytes else 0
-    min_output_words = max(1, min_output_bytes // 6) if min_output_bytes else 0
-    retry_instruction = _format_template(
-        retry_template,
-        output_bytes=output_bytes,
-        source_total_bytes=source_total_bytes,
-        ratio=(output_bytes / source_total_bytes) if source_total_bytes else 0.0,
-        source_count=source_count,
-        min_ratio=min_ratio,
-        min_output_bytes=min_output_bytes,
-        min_output_words=min_output_words,
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": base_user_prompt},
-        {"role": "user", "content": retry_instruction},
-    ]
-    logger.warning("forge_document: density floor violated — %s", violation)
-    completion = await ctx.complete_fn(
-        messages=messages,
-        model_def=model_def,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        tools=None,
-        response_format=None,
-    )
-    content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-    return content.strip(), finish_reason
-
-
-async def _forge_one_source(
-    ctx: OperationExecutionContext,
-    *,
-    spec: SourceSpec,
-    idx: int,
-    user_input: str,
-    memory_context: str,
-    model_def: Any,
-    max_tokens: int,
-    max_continue_attempts: int,
-    max_continue_tokens: int,
-    per_source_min_ratio: float,
-) -> tuple[str, str | None, bool, str | None, list[str], int, str]:
-    """Forge one preserve-detail section from a single source.
-
-    Returns ``(section, finish_reason, density_passed, density_reason,
-    failed_paths, passes, density_marker)``.
-
-    The section is the fenced markdown block extracted from the model
-    output (already continuation-handled). A per-source density floor
-    (added 2026-08-02) checks the section is not implausibly tiny relative
-    to ITS source: ``len(section_bytes) < per_source_min_ratio *
-    spec.bytes`` trips one retry with the sharpened per-source density
-    prompt. If the retry still trips, the section is kept, the source
-    path is appended to ``failed_paths`` so the caller surfaces it in the
-    op result (``density_failed_sources``), and a ``density_marker`` HTML
-    comment is returned for the caller to inject into the merged document
-    (the merge pass rewrites sections, so an inline section marker would
-    not survive; the caller prepends a consolidated marker block).
-    ``passes`` is the number of forge passes issued for this source
-    (1 + retry count) — used by the OKF provenance ``Passes`` column. See
-    /memories/session/plan.md (Phase 2 completion).
-    """
-    if ctx.complete_fn is None:
-        return "", None, True, None, [], 1, ""
-    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
-    user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
-    source_text = render_one_source_block(spec)
-    user_prompt = _format_template(
-        user_template,
-        user_input=user_input,
-        source_index=idx,
-        source_path=spec.path,
-        priority=spec.priority,
-        source_text=source_text,
-        memory_context=memory_context or "(no recalled context)",
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    completion = await ctx.complete_fn(
-        messages=messages,
-        model_def=model_def,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        tools=None,
-        response_format=None,
-    )
-    content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-    section = _extract_markdown_block(content)
-    passes = 1
-    failed_paths: list[str] = []
-    if section.strip():
-        # Continuation handling reuses the shared tail-append machinery.
-        # ``structural_override=False``: per-source section completeness is
-        # governed by the per-source density floor below, not the dangling-
-        # heading continuation override (a heading-only section is the
-        # density floor's job to catch and re-forge, not the continuation
-        # path's — otherwise the continuation duplicates a heading-only tail
-        # and consumes the retry budget before the density retry runs).
-        section, _truncated, _attempts, finish_reason = await _continue_until_complete(
-            ctx,
-            user_input=user_input,
-            document=section,
-            model_def=model_def,
-            first_finish_reason=finish_reason,
-            max_continue_attempts=max_continue_attempts,
-            max_continue_tokens=max_continue_tokens,
-            structural_override=False,
-        )
-
-    # Per-source density floor: a section under the ratio of its source is
-    # presumed abridged. Retry once with the sharpened per-source density
-    # prompt; if it still trips, keep the section and record the source path
-    # + a density marker (returned to the caller, which prepends a
-    # consolidated marker block to the merged document — the merge pass
-    # rewrites sections, so an inline section marker would not survive).
-    density_reason: str | None = None
-    density_passed = True
-    density_marker = ""
-    if section.strip() and per_source_min_ratio > 0.0 and spec.bytes > 0:
-        density_reason = _per_source_density_check(
-            section=section,
-            source_bytes=spec.bytes,
-            min_ratio=per_source_min_ratio,
-            priority=spec.priority,
-        )
-        if density_reason is not None:
-            retry_section, retry_finish = await _reforge_one_source_for_density(
-                ctx,
-                spec=spec,
-                idx=idx,
-                user_input=user_input,
-                memory_context=memory_context,
-                model_def=model_def,
-                violation=density_reason,
-                section_bytes=len(section.encode("utf-8")),
-                source_bytes=spec.bytes,
-                min_ratio=per_source_min_ratio,
-                max_tokens=max_tokens,
-                max_continue_attempts=max_continue_attempts,
-                max_continue_tokens=max_continue_tokens,
-            )
-            passes += 1
-            if retry_section.strip():
-                retry_section, _t, _a, retry_finish = await _continue_until_complete(
-                    ctx,
-                    user_input=user_input,
-                    document=retry_section,
-                    model_def=model_def,
-                    first_finish_reason=retry_finish,
-                    max_continue_attempts=max_continue_attempts,
-                    max_continue_tokens=max_continue_tokens,
-                    structural_override=False,
-                )
-                retry_reason = _per_source_density_check(
-                    section=retry_section,
-                    source_bytes=spec.bytes,
-                    min_ratio=per_source_min_ratio,
-                    priority=spec.priority,
-                )
-                if retry_reason is None:
-                    # Retry recovered — use the retry section.
-                    section = retry_section
-                    finish_reason = retry_finish
-                    density_passed = True
-                    density_reason = None
-                else:
-                    # Retry still trips — keep whichever section is larger
-                    # (honest failure), record the path + marker.
-                    if len(retry_section.encode("utf-8")) > len(section.encode("utf-8")):
-                        section = retry_section
-                        finish_reason = retry_finish
-                    density_passed = False
-                    density_reason = retry_reason
-                    failed_paths.append(spec.path)
-                    density_marker = (
-                        f"<!-- section density floor failed: "
-                        f"`{spec.path}` — {len(section.encode('utf-8'))}B "
-                        f"vs {spec.bytes}B source -->"
-                    )
-            # If the retry returned nothing usable, keep the original
-            # section and record the failure (the floor still tripped).
-            else:
-                density_passed = False
-                failed_paths.append(spec.path)
-                density_marker = (
-                    f"<!-- section density floor failed: "
-                    f"`{spec.path}` — {len(section.encode('utf-8'))}B "
-                    f"vs {spec.bytes}B source -->"
-                )
-    return section, finish_reason, density_passed, density_reason, failed_paths, passes, density_marker
-
-
-def _per_source_density_check(
-    *,
-    section: str,
-    source_bytes: int,
-    min_ratio: float,
-    priority: str,
-) -> str | None:
-    """Return a violation message if a per-source section is abridged.
-
-    Returns ``None`` when the section passes the floor, when no floor
-    applies (zero source bytes), or when the priority note explicitly
-    grants condensation latitude ("background", "one paragraph",
-    "brief", "verbatim"). The priority latitude check keeps the floor
-    from forcing expansion of a source the user explicitly asked to
-    condense.
-    """
-    if source_bytes <= 0 or min_ratio <= 0.0:
-        return None
-    lowered = (priority or "").lower()
-    latitude_tokens = ("background", "one paragraph", "brief", "summary", "condense", "verbatim")
-    if any(tok in lowered for tok in latitude_tokens):
-        return None
-    section_bytes = len(section.encode("utf-8"))
-    ratio = section_bytes / source_bytes if source_bytes else 1.0
-    if ratio >= min_ratio:
-        return None
-    return (
-        f"Per-source section for is {section_bytes}B vs {source_bytes}B source "
-        f"({ratio:.0%}, floor {min_ratio:.0%}) — below the per-source "
-        f"preservation floor. The section summarized instead of preserving."
-    )
-
-
-async def _reforge_one_source_for_density(
-    ctx: OperationExecutionContext,
-    *,
-    spec: SourceSpec,
-    idx: int,
-    user_input: str,
-    memory_context: str,
-    model_def: Any,
-    violation: str,
-    section_bytes: int,
-    source_bytes: int,
-    min_ratio: float,
-    max_tokens: int,
-    max_continue_attempts: int,
-    max_continue_tokens: int,
-) -> tuple[str, str | None]:
-    """Issue one per-source density-retry forge pass with a sharpened instruction.
-
-    Returns ``(section, finish_reason)``. The retry re-sends the per-source
-    user prompt (so the model has the source + priority in context) followed
-    by the per-source density-retry instruction naming the deficit. The
-    caller extracts the fenced markdown block and re-runs the density check.
-
-    ``max_continue_attempts``/``max_continue_tokens`` are accepted for
-    signature symmetry with the other forge helpers but are not used here —
-    continuation handling for the retry section is the caller's job (it
-    runs ``_continue_until_complete`` on whichever section wins).
-    """
-    if ctx.complete_fn is None:
-        return "", None
-    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
-    user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
-    source_text = render_one_source_block(spec)
-    base_user_prompt = _format_template(
-        user_template,
-        user_input=user_input,
-        source_index=idx,
-        source_path=spec.path,
-        priority=spec.priority,
-        source_text=source_text,
-        memory_context=memory_context or "(no recalled context)",
-    )
-    retry_template = _load_text(ctx, _PER_SOURCE_DENSITY_RETRY_PATH)
-    # Concrete minimum section target (mirrors the global density retry):
-    # naming an explicit byte/word length the section must hit is the
-    # strongest lever for breaking per-source summarization.
-    min_section_bytes = max(1, int(min_ratio * source_bytes)) if source_bytes else 0
-    min_section_words = max(1, min_section_bytes // 6) if min_section_bytes else 0
-    retry_instruction = _format_template(
-        retry_template,
-        source_path=spec.path,
-        priority=spec.priority,
-        section_bytes=section_bytes,
-        source_bytes=source_bytes,
-        ratio=(section_bytes / source_bytes) if source_bytes else 0.0,
-        min_ratio=min_ratio,
-        min_section_bytes=min_section_bytes,
-        min_section_words=min_section_words,
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": base_user_prompt},
-        {"role": "user", "content": retry_instruction},
-    ]
-    logger.warning("forge_document: per-source density floor violated — %s", violation)
-    completion = await ctx.complete_fn(
-        messages=messages,
-        model_def=model_def,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        tools=None,
-        response_format=None,
-    )
-    content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-    section = _extract_markdown_block(content)
-    return section.strip(), finish_reason
-
-
-def _tail_headings(document: str, *, max_headings: int = 3) -> str:
-    """Return the running tail of a document — the last ``max_headings`` headings
-    plus the body under the final one — so a rolling-accumulation pass can
-    extend coherently without re-sending the whole document.
-
-    Capped to the last few headings (default 3) so the per-chunk context
-    stays bounded even for a very long running document. If the document has
-    no headings, returns its last ~2000 chars so the model still has a
-    continuity anchor.
-    """
-    if not document or not document.strip():
-        return "(running document is empty — start fresh)"
-    lines = document.splitlines()
-    # Collect indices of ATX heading lines (# .. ######) not inside fences.
-    heading_indices: list[int] = []
-    in_fence = False
-    for i, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if re.match(r"^#{1,6}\s+\S", stripped):
-            heading_indices.append(i)
-    if not heading_indices:
-        # No headings — return the last ~2000 chars as a continuity anchor.
-        tail = document.rstrip()[-2000:]
-        return tail if tail.strip() else "(running document has no headings yet)"
-    # Take the last max_headings headings and everything after the final one.
-    start_idx = heading_indices[-min(max_headings, len(heading_indices))]
-    tail = "\n".join(lines[start_idx:]).rstrip()
-    return tail if tail.strip() else "(running tail is empty)"
-
-
-async def _forge_rolling(
-    ctx: OperationExecutionContext,
-    chunks: list[SourceSpec],
-    *,
-    user_input: str,
-    memory_context: str,
-    model_def: Any,
-    max_tokens: int,
-    max_continue_attempts: int,
-    max_continue_tokens: int,
-    document_path: str,
-    incremental_persist: bool,
-) -> tuple[str, list[str | None]]:
-    """Forge a running document chunk-by-chunk (Phase 3 rolling accumulation).
-
-    Maintains a running ``document`` string. For each chunk, sends the
-    running tail (capped to the last few headings via :func:`_tail_headings`)
-    + the next chunk to the rolling forge prompt, appends the extension, and
-    runs :func:`_continue_until_complete` per chunk. When
-    ``incremental_persist`` is True, appends each chunk's extension to the
-    target path via ``append_file`` (Phase 1) so progress survives a
-    mid-forge crash — opt-in since it leaves partial docs on disk.
-
-    Returns ``(document, finish_reasons)`` where ``finish_reasons`` is one
-    entry per chunk. Only an oversize SINGLE source takes this path
-    (caller gates on ``forge_rolling_accumulation`` AND a single source
-    exceeding ``_MAX_PER_SOURCE_CHARS``); multi-source consolidations stay
-    on map-reduce. See /memories/session/plan.md (Phase 3).
-    """
-    if ctx.complete_fn is None:
-        return "", []
-    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_ROLLING_PATH)
-    user_template = _load_text(ctx, _USER_PROMPT_ROLLING_PATH)
-    chunk_total = len(chunks)
-    document = ""
-    finish_reasons: list[str | None] = []
-    for chunk in chunks:
-        chunk_index = int(chunk.extra.get("chunk_index", 0))
-        running_tail = _tail_headings(document, max_headings=3)
-        chunk_text = chunk.text
-        user_prompt = _format_template(
-            user_template,
-            user_input=user_input,
-            running_tail=running_tail,
-            chunk_text=chunk_text,
-            chunk_index=chunk_index,
-            chunk_total=chunk_total,
-            source_path=chunk.path,
-            priority=chunk.priority,
-            memory_context=memory_context or "(no recalled context)",
-            max_headings=3,
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        completion = await ctx.complete_fn(
-            messages=messages,
-            model_def=model_def,
-            max_tokens=max_tokens,
-            temperature=0.2,
-            tools=None,
-            response_format=None,
-        )
-        content = getattr(completion, "content", "") or ""
-        finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-        extension = _extract_markdown_block(content)
-        if extension.strip():
-            extension, _truncated, _attempts, finish_reason = await _continue_until_complete(
-                ctx,
-                user_input=user_input,
-                document=extension,
-                model_def=model_def,
-                first_finish_reason=finish_reason,
-                max_continue_attempts=max_continue_attempts,
-                max_continue_tokens=max_continue_tokens,
-            )
-        if extension.strip():
-            if document:
-                document = _merge_continuation(document, extension)
-            else:
-                document = extension.rstrip() + "\n"
-            # Opt-in incremental persistence: append this chunk's extension
-            # to the target path so progress survives a mid-forge crash.
-            # Leaves partial docs on disk, hence default-off.
-            if incremental_persist and callable(ctx.execute_tool_fn):
-                try:
-                    await ctx.execute_tool_fn(
-                        _APPEND_TOOL_ID,
-                        ToolExecutionContext(
-                            tool_id=_APPEND_TOOL_ID,
-                            workspace_id=ctx.workspace_id,
-                            user_id=ctx.user_id,
-                            user_slug=ctx.user_slug,
-                            surface_type=ctx.surface_type,
-                            surface_id=ctx.surface_id,
-                            memory_scope=ctx.memory_scope,
-                            mode_id=ctx.mode_id,
-                            parameters={"path": document_path, "content": extension + "\n\n"},
-                        ),
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.warning(
-                        "forge_document: rolling incremental append failed (non-fatal): %s", exc
-                    )
-        finish_reasons.append(finish_reason)
-    return document, finish_reasons
-
-
-async def _merge_sections(
-    ctx: OperationExecutionContext,
-    *,
-    sections: list[str],
-    specs: list[SourceSpec],
-    user_input: str,
-    memory_context: str,
-    model_def: Any,
-    max_tokens: int,
-    max_continue_attempts: int,
-    max_continue_tokens: int,
-) -> tuple[str, str | None]:
-    """Merge pre-forged sections into one coherent document.
-
-    Returns ``(document, finish_reason)``. The merge pass receives all
-    sections (small, bounded) plus the per-source priority notes and the
-    user instruction. It must preserve every section's content while
-    harmonizing the heading hierarchy and eliminating true cross-section
-    duplication. Continuation handling applies to the merged document.
-    """
-    if ctx.complete_fn is None:
-        return "", None
-    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_MERGE_PATH)
-    user_template = _load_text(ctx, _USER_PROMPT_MERGE_PATH)
-    # Render each section under a stable heading so the model can reference
-    # "Section N" in its merge reasoning. Drop empty sections.
-    rendered: list[str] = []
-    for idx, (section, spec) in enumerate(zip(sections, specs), start=1):
-        if not section.strip():
-            continue
-        rendered.append(
-            f"### Section {idx} — `{spec.path}` (priority: {spec.priority})\n\n"
-            f"```markdown\n{section.rstrip()}\n```"
-        )
-    sections_block = "\n\n".join(rendered) or "(no sections were forged)"
-    priorities_block = render_priorities_block(specs)
-    user_prompt = _format_template(
-        user_template,
-        user_input=user_input,
-        sections_block=sections_block,
-        priorities_block=priorities_block,
-        memory_context=memory_context or "(no recalled context)",
-    )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    completion = await ctx.complete_fn(
-        messages=messages,
-        model_def=model_def,
-        max_tokens=max_tokens,
-        temperature=0.2,
-        tools=None,
-        response_format=None,
-    )
-    content = getattr(completion, "content", "") or ""
-    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
-    document = _extract_markdown_block(content)
-    if not document.strip():
-        return content.strip(), finish_reason
-    document, _truncated, _attempts, finish_reason = await _continue_until_complete(
-        ctx,
-        user_input=user_input,
-        document=document,
-        model_def=model_def,
-        first_finish_reason=finish_reason,
-        max_continue_attempts=max_continue_attempts,
-        max_continue_tokens=max_continue_tokens,
-    )
-    return document, finish_reason
-
-
-def _build_extended_annotation(
-    model_def: Any,
-    *,
-    sources: list[SourceSpec],
-    processing_summary: str,
-    density_line: str,
-    okf_concept_path: str,
-    truncated: bool = False,
-    final_finish_reason: str | None = None,
-    continue_attempts: int = 0,
-) -> str:
-    """Build the extended non-rendering provenance footer for a source-aware forge.
-
-    The footer is a single HTML comment (non-rendering in every CommonMark
-    renderer) with four logical lines:
-      1. model attribution (provider · model · date)
-      2. sources summary (count + the priority-tier breakdown, not all paths)
-      3. processing summary (passes, finish_reason)
-      4. OKF provenance concept pointer (the full per-source record lives there)
-
-    The footer is the index card; the OKF concept is the filing cabinet.
-    Keeping it one comment block means the visible document stays clean
-    while the audit trail travels in-source.
-    """
-    provider = str(getattr(model_def, "provider", "") or "").strip()
-    model_id = str(getattr(model_def, "model_id", "") or "").strip()
-    parts: list[str] = []
-    attribution_bits: list[str] = []
-    if provider:
-        attribution_bits.append(f"provider: {provider}")
-    if model_id:
-        attribution_bits.append(f"model: {model_id}")
-    if truncated:
-        reason = final_finish_reason or "unknown"
-        attribution_bits.append(f"truncated by model · finish_reason: {reason}")
-        if continue_attempts:
-            attribution_bits.append(f"continue_attempts: {continue_attempts}")
-    timestamp = datetime.now(UTC).strftime("%Y-%m-%d")
-    parts.append(f"generated by lisa · {' · '.join(attribution_bits)} · {timestamp}")
-
-    readable = [s for s in sources if s.text]
-    failed = failed_specs(sources)
-    # Summarize the priority tiers compactly: group paths by priority keyword.
-    tier_summary = _summarize_source_tiers(readable)
-    sources_line = f"sources: {len(readable)} readable"
-    if failed:
-        sources_line += f", {len(failed)} unreadable"
-    if tier_summary:
-        sources_line += f" ({tier_summary})"
-    parts.append(sources_line)
-
-    parts.append(f"processing: {processing_summary}")
-    if density_line:
-        parts.append(f"density: {density_line}")
-    if okf_concept_path:
-        parts.append(f"provenance: {okf_concept_path}")
-    body = " · ".join(parts)
-    return f"<!--\n  {body}\n  \n  Full provenance (per-source treatment, exact priorities, density math):\n  {okf_concept_path}\n-->"
-
-
-def _summarize_source_tiers(readable: list[SourceSpec]) -> str:
-    """Render a compact 'primary: a.md; secondary: b.md, c.md; background: d.md' summary.
-
-    Groups readable sources by the leading word of their priority note
-    (case-insensitive), preserving the order tiers first appear. Falls back
-    to listing paths ungrouped if priorities are uniform or unparseable.
-    """
-    if not readable:
-        return ""
-    tiers: dict[str, list[str]] = {}
-    order: list[str] = []
-    for spec in readable:
-        key = (spec.priority or "normal").split("—")[0].split(":")[0].strip().lower() or "normal"
-        if key not in tiers:
-            tiers[key] = []
-            order.append(key)
-        tiers[key].append(spec.path)
-    if len(order) == 1:
-        # All one tier — no point labeling; just list the paths (truncated).
-        paths = "; ".join(tiers[order[0]][:4])
-        if len(tiers[order[0]]) > 4:
-            paths += f"; +{len(tiers[order[0]]) - 4} more"
-        return paths
-    chunks: list[str] = []
-    for key in order:
-        paths = "; ".join(tiers[key][:3])
-        if len(tiers[key]) > 3:
-            paths += f"; +{len(tiers[key]) - 3} more"
-        chunks.append(f"{key}: {paths}")
-    return "; ".join(chunks)
-
-
-def _build_okf_provenance_body(
-    *,
-    sources: list[SourceSpec],
-    stored_path: str,
-    output_bytes: int,
-    heading_count: int,
-    model_id: str,
-    provider: str,
-    passes: int,
-    continue_attempts: int,
-    density_ratio: float,
-    density_floor: float,
-    density_passed: bool,
-    first_finish_reason: str | None,
-    final_finish_reason: str | None,
-    truncated: bool,
-    forge_timestamp: str,
-    per_source_meta: list[dict[str, Any]] | None = None,
-) -> str:
-    """Render the markdown body for the OKF forge-provenance concept.
-
-    This is the machine-legible full record: the per-source table (path,
-    priority, bytes, passes, density, and a treatment column noting
-    truncation/read errors), the processing pass log, and the density
-    check result. The plain markdown footer carries only a summary; this
-    is the complete audit trail an OKF consumer (or a later Lisa turn)
-    can validate/diff.
-
-    ``per_source_meta`` (Task 2, added 2026-08-02) carries per-source
-    ``passes`` (1 + per-source density retries) and ``density`` ("pass" /
-    "FAILED" / "n/a") for the map-reduce path, indexed by readable source
-    order. When ``None`` (single-pass path), the ``Passes`` column emits
-    ``0`` and ``Density`` emits ``n/a`` so the table shape is stable
-    across both paths — the single-pass OKF concept is unchanged in
-    meaning.
-    """
-    lines: list[str] = ["# Forge Provenance", "", "## Sources", ""]
-    readable = [s for s in sources if s.text]
-    failed = failed_specs(sources)
-    # Per-source metadata is indexed by readable source order. When absent
-    # (single-pass path), emit 0 passes and "n/a" density so the table
-    # columns are stable. See Task 2 in PACK_AGENT_MARKDOWN_DEFERRED.md.
-    meta = per_source_meta or []
-    if readable or failed:
-        lines.append("| # | Path | Priority | Bytes | Passes | Density | Treatment |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
-        for idx, spec in enumerate(readable, start=1):
-            treatment = "preserved"
-            if spec.truncated_to_fit:
-                treatment = "truncated to per-source cap"
-            if spec.expanded_from_glob:
-                treatment += f"; glob-expanded from `{spec.origin_glob}`"
-            entry = meta[idx - 1] if idx - 1 < len(meta) else {}
-            src_passes = entry.get("passes", 0) if entry else 0
-            src_density = entry.get("density", "n/a") if entry else "n/a"
-            lines.append(
-                f"| {idx} | `{spec.path}` | {spec.priority} | {spec.bytes} | "
-                f"{src_passes} | {src_density} | {treatment} |"
-            )
-        for spec in failed:
-            lines.append(
-                f"| – | `{spec.path}` | {spec.priority} | 0 | 0 | n/a | "
-                f"UNREADABLE: {spec.read_error} |"
-            )
-    else:
-        lines.append("_(no sources supplied — single-doc/memory-only forge)_")
-    lines.append("")
-    lines.append("## Processing")
-    lines.append("")
-    lines.append(f"- **Model:** {provider}/{model_id}")
-    lines.append(f"- **Passes:** {passes} primary"
-                 + (f" + {continue_attempts} continuation" if continue_attempts else ""))
-    lines.append(f"- **finish_reason:** first={first_finish_reason!r}, final={final_finish_reason!r}")
-    lines.append(f"- **Density check:** output {output_bytes}B "
-                 f"({density_ratio:.0%} of source bytes; floor {density_floor:.0%}) "
-                 f"— {'passed' if density_passed else 'FAILED (lossy abridgment)'}")
-    lines.append(f"- **Truncated:** {'yes' if truncated else 'no'}")
-    lines.append(f"- **Forge timestamp:** {forge_timestamp}")
-    lines.append("")
-    lines.append("## Output")
-    lines.append("")
-    lines.append(f"- **Path:** `{stored_path}`")
-    lines.append(f"- **Size:** {output_bytes} bytes")
-    lines.append(f"- **Headings:** {heading_count}")
-    lines.append("")
-    return "\n".join(lines)
-
-
-async def _write_okf_provenance(
-    ctx: OperationExecutionContext,
-    *,
-    okf_bundle_path: str,
-    document_stem: str,
-    sources: list[SourceSpec],
-    stored_path: str,
-    output_bytes: int,
-    heading_count: int,
-    model_def: Any,
-    passes: int,
-    continue_attempts: int,
-    density_ratio: float,
-    density_floor: float,
-    density_passed: bool,
-    first_finish_reason: str | None,
-    final_finish_reason: str | None,
-    truncated: bool,
-    per_source_meta: list[dict[str, Any]] | None = None,
-) -> str | None:
-    """Write the OKF forge-provenance concept + append a log entry.
-
-    Returns the sandbox-relative path of the written concept, or ``None``
-    when the OKF tools are unavailable or the caller opted out (empty
-    ``okf_bundle_path``). Failures to write provenance are non-fatal — the
-    forge itself already succeeded and persisted the document; provenance
-    is best-effort enrichment, not a gate. A warning is logged.
-    """
-    if not okf_bundle_path:
-        return None
-    if not callable(ctx.execute_tool_fn):
-        return None
-    provider = str(getattr(model_def, "provider", "") or "").strip()
-    model_id = str(getattr(model_def, "model_id", "") or "").strip()
-    forge_timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    body = _build_okf_provenance_body(
-        sources=sources,
-        stored_path=stored_path,
-        output_bytes=output_bytes,
-        heading_count=heading_count,
-        model_id=model_id,
-        provider=provider,
-        passes=passes,
-        continue_attempts=continue_attempts,
-        density_ratio=density_ratio,
-        density_floor=density_floor,
-        density_passed=density_passed,
-        first_finish_reason=first_finish_reason,
-        final_finish_reason=final_finish_reason,
-        truncated=truncated,
-        forge_timestamp=forge_timestamp,
-        per_source_meta=per_source_meta,
-    )
-    concept_rel = f"{document_stem}.forge.md"
+def _format_markdown(document: str) -> str:
+    """Lint/format the document via ``mdformat`` if available."""
     try:
-        emit_result = await ctx.execute_tool_fn(
-            _OKF_EMIT_TOOL_ID,
-            ToolExecutionContext(
-                tool_id=_OKF_EMIT_TOOL_ID,
-                workspace_id=ctx.workspace_id,
-                user_id=ctx.user_id,
-                user_slug=ctx.user_slug,
-                surface_type=ctx.surface_type,
-                surface_id=ctx.surface_id,
-                memory_scope=ctx.memory_scope,
-                mode_id=ctx.mode_id,
-                parameters={
-                    "bundle_path": okf_bundle_path,
-                    "concept_path": concept_rel,
-                    "type": "forge-provenance",
-                    "title": f"Forge provenance for {stored_path}",
-                    "description": (
-                        f"Consolidated {readable_count(sources)} source(s) "
-                        f"into {stored_path}"
-                    ),
-                    "tags": ["forge", "provenance", "markdown"],
-                    "status": "stable",
-                    "generated_by": f"lisa-pack-markdown/{model_id or 'unknown'}",
-                    "resource": f"lisa-storage://{stored_path}",
-                    "body": body,
-                },
-            ),
-        )
-        emit_text = getattr(emit_result, "output_text", "") or ""
-        if "failed" in emit_text.lower() and "emitted" not in emit_text.lower():
-            logger.warning("forge_document: OKF emit_concept failed: %s", emit_text)
-            return None
-    except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("forge_document: OKF emit_concept raised: %s", exc)
-        return None
-    full_path = f"{okf_bundle_path}/{concept_rel}"
-    # Best-effort log entry (okf_log). Failure here is non-fatal.
+        import mdformat  # type: ignore[import-not-found]
+    except ImportError:
+        logger.debug("mdformat not installed; skipping markdown formatting")
+        return document
     try:
-        await ctx.execute_tool_fn(
-            _OKF_LOG_TOOL_ID,
-            ToolExecutionContext(
-                tool_id=_OKF_LOG_TOOL_ID,
-                workspace_id=ctx.workspace_id,
-                user_id=ctx.user_id,
-                user_slug=ctx.user_slug,
-                surface_type=ctx.surface_type,
-                surface_id=ctx.surface_id,
-                memory_scope=ctx.memory_scope,
-                mode_id=ctx.mode_id,
-                parameters={
-                    "bundle_path": okf_bundle_path,
-                    "action": "forge",
-                    "concept_path": concept_rel,
-                    "by": f"lisa-pack-markdown/{model_id or 'unknown'}",
-                    "note": (
-                        f"consolidated {readable_count(sources)} source(s) "
-                        f"into {stored_path}"
-                    ),
-                },
-            ),
-        )
+        return mdformat.text(document, options={"number": True}).rstrip() + "\n"
     except Exception as exc:  # pylint: disable=broad-except
-        logger.debug("forge_document: OKF log append failed (non-fatal): %s", exc)
-    return full_path
+        logger.warning("forge_document: mdformat failed (%s); using unformatted document", exc)
+        return document
 
 
 async def execute(ctx: OperationExecutionContext) -> OperationResult:
@@ -2008,48 +503,6 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     if not callable(ctx.execute_tool_fn):
         return OperationResult(output_text=_load_text(ctx, _USAGE_PATH))
 
-    # ── Source-aware consolidation path (added 2026-07-30) ─────────────
-    # When the caller supplies ``source_paths``, the operation switches to
-    # consolidation mode: it reads every source (expanding globs), injects
-    # them with per-source NL priority notes, uses the preserve-detail
-    # system prompt, applies a density floor against lossy abridgment, and
-    # captures provenance to an OKF concept. The single-doc/memory-only
-    # path (no source_paths) is unchanged — no regression for existing
-    # callers.
-    sources: list[SourceSpec] = []
-    source_block = ""
-    if has_sources(params):
-        try:
-            sources = parse_source_paths(params)
-        except RuntimeError as exc:
-            return OperationResult(output_text=str(exc))
-        if not sources:
-            return OperationResult(
-                output_text=(
-                    "source_paths was supplied but parsed to no entries "
-                    "(all empty or invalid)."
-                )
-            )
-        sources = await expand_globs(sources, ctx=ctx)
-        sources = await read_sources(sources, ctx=ctx)
-        readable = [s for s in sources if s.text]
-        if not readable:
-            failed_note = "; ".join(
-                f"{s.path}: {s.read_error}" for s in failed_specs(sources)
-            ) or "unknown"
-            return OperationResult(
-                output_text=(
-                    "All source_paths entries were unreadable. No source "
-                    f"material to consolidate. Failures: {failed_note}"
-                )
-            )
-        source_block = render_source_block(sources)
-
-    # ``limit`` accepts 0 to mean "use the configured default" (the
-    # schema gate allows 0 so a caller passing ``limit: 0`` is not
-    # rejected). A falsy value (0, None, missing) falls back to
-    # ``cfg.max_recall_records``. ``_recall_memory`` then clamps to
-    # [1, 20] for the actual memory.search ``limit`` argument.
     recall_limit = int(params.get("limit") or cfg.max_recall_records)
     memory_context = await _recall_memory(ctx, user_input, limit=recall_limit)
 
@@ -2063,380 +516,58 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         except RuntimeError as exc:
             return OperationResult(output_text=str(exc))
 
-    # ── Map-reduce consolidation path (added 2026-08-01) ───────────────
-    # When the aggregate source size exceeds the single-pass budget, the
-    # local backend cannot reliably emit a proportional preserve-detail
-    # document in one pass (it abridges, tripping the density floor). The
-    # map-reduce path forges one bounded-context section per source, then
-    # merges the sections. Every model call's context stays small enough
-    # to satisfy the preserve-detail directive. See
-    # /memories/session/plan.md (Phase 2).
-    source_total = total_source_bytes(sources)
-    n_readable = readable_count(sources)
-    use_map_reduce = (
-        bool(sources)
-        and (
-            source_total >= cfg.map_reduce_byte_threshold
-            or n_readable >= cfg.map_reduce_source_threshold
+    completion_text, model_def, first_finish_reason = await _call_llm(
+        ctx,
+        user_input,
+        memory_context,
+        existing_document=existing_document,
+        max_tokens=cfg.max_completion_tokens,
+    )
+    if not completion_text or not completion_text.strip():
+        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+
+    document = extract_markdown_block(completion_text)
+    if not document.strip():
+        text = _format_template(
+            _load_text(ctx, _EMPTY_DOCUMENT_PATH),
+            response_preview=completion_text[:400],
+        )
+        return OperationResult(output_text=text)
+
+    # Truncation handling: when the first pass stopped mid-document
+    # (finish_reason in {length, unknown, None}), issue up to
+    # cfg.max_continue_attempts continuation passes. See
+    # /memories/repo/forge-document-truncation-contract.md.
+    document, was_truncated, continue_attempts, final_finish_reason = (
+        await continue_until_complete(
+            ctx,
+            user_input=user_input,
+            document=document,
+            model_def=model_def,
+            first_finish_reason=first_finish_reason,
+            max_continue_attempts=cfg.max_continue_attempts,
+            max_continue_tokens=cfg.max_continue_tokens,
+            continue_prompt_path=_CONTINUE_PROMPT_PATH,
         )
     )
-
-    # Shared state populated by whichever path runs.
-    model_def: Any = None
-    first_finish_reason: str | None = None
-    final_finish_reason: str | None = None
-    was_truncated = False
-    continue_attempts = 0
-    document = ""
-    density_passed = True
-    density_violation: str | None = None
-    density_ratio = 0.0
-    density_floor_value = 0.0
-    density_retried = False
-    # Map-reduce per-source density state (Task 1). The single-pass path
-    # leaves these empty/None so the op result shape stays stable.
-    density_failed_sources: list[str] = []
-    per_source_passes: list[int] = []
-    per_source_density: list[str] = []  # "pass" | "FAILED" | "n/a"
-    per_source_meta: list[dict[str, Any]] | None = None
-    # Phase 3 rolling-accumulation telemetry (default off; only set True when
-    # the gate opts an oversize single source onto the rolling path).
-    rolling_used = False
-    # Phase 3 rolling-accumulation telemetry (default off; only set when the
-    # gate opts an oversize single source onto the rolling path).
-    rolling_used = False
-
-    if use_map_reduce:
-        # Resolve the model once for both the per-source and merge passes.
-        if ctx.resolve_model_fn is None:
-            raise RuntimeError("markdown requires resolve_model_fn")
-        preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
-        model_def = ctx.resolve_model_fn(preferred_model_id)
-        if model_def is None:
-            raise RuntimeError(
-                f"markdown could not resolve model '{preferred_model_id}'"
-            )
-        readable = [s for s in sources if s.text]
-        sections: list[str] = []
-        per_source_finish_reasons: list[str | None] = []
-        density_failed_sources = []
-        per_source_passes = []
-        per_source_density = []
-        density_markers: list[str] = []
-        rolling_used = False
-        for idx, spec in enumerate(readable, start=1):
-            # Phase 3 gate (default off): when forge_rolling_accumulation is
-            # opted in AND this single source exceeds the per-source cap,
-            # chunk it via read_file_range and forge a running document
-            # chunk-by-chunk instead of one bounded-context pass. Only an
-            # oversize single source takes the rolling path; multi-source
-            # consolidations still use map-reduce per source. See
-            # /memories/session/plan.md (Phase 3).
-            #
-            # Note: read_sources truncates spec.bytes to _MAX_PER_SOURCE_CHARS,
-            # so the gate must stat the real file size rather than inspect
-            # spec.bytes (a truncated source's bytes == the cap, never above).
-            use_rolling = False
-            if cfg.forge_rolling_accumulation and len(readable) == 1:
-                stat_size = await stat_source_chars(spec, ctx=ctx)
-                if stat_size is not None and stat_size > _MAX_PER_SOURCE_CHARS:
-                    use_rolling = True
-            if use_rolling:
-                rolling_used = True
-                chunks = await read_source_chunks(spec, ctx=ctx)
-                # Skip chunks that failed to read (read_source_chunks returns
-                # a single failed spec with read_error set in that case).
-                if chunks and chunks[0].read_error:
-                    sections.append("")
-                    per_source_finish_reasons.append(None)
-                    per_source_passes.append(1)
-                    per_source_density.append("n/a")
-                    continue
-                section, chunk_finishs = await _forge_rolling(
-                    ctx,
-                    chunks,
-                    user_input=user_input,
-                    memory_context=memory_context,
-                    model_def=model_def,
-                    max_tokens=cfg.max_completion_tokens,
-                    max_continue_attempts=cfg.max_continue_attempts,
-                    max_continue_tokens=cfg.max_continue_tokens,
-                    document_path=document_path,
-                    incremental_persist=cfg.forge_rolling_incremental_persist,
-                )
-                sections.append(section)
-                per_source_finish_reasons.append(
-                    chunk_finishs[-1] if chunk_finishs else None
-                )
-                # Rolling path has no per-source density floor (the document
-                # is built incrementally; the global density check on the
-                # merged doc is the gate). Passes = chunk count.
-                per_source_passes.append(max(1, len(chunks)))
-                per_source_density.append("n/a")
-                continue
-            section, sec_finish, _passed, _reason, failed, passes, marker = await _forge_one_source(
-                ctx,
-                spec=spec,
-                idx=idx,
-                user_input=user_input,
-                memory_context=memory_context,
-                model_def=model_def,
-                max_tokens=cfg.max_completion_tokens,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-                per_source_min_ratio=cfg.per_source_min_ratio,
-            )
-            sections.append(section)
-            per_source_finish_reasons.append(sec_finish)
-            per_source_passes.append(passes)
-            if failed:
-                density_failed_sources.extend(failed)
-                per_source_density.append("FAILED")
-                if marker:
-                    density_markers.append(marker)
-            else:
-                per_source_density.append("pass")
-        first_finish_reason = per_source_finish_reasons[0] if per_source_finish_reasons else None
-        # When the rolling path produced the document for a single oversize
-        # source, the rolling document IS the final artifact — skip the
-        # merge pass (which would rewrite it). Multi-source consolidations
-        # still merge the per-source sections.
-        if rolling_used and len(sections) == 1:
-            merged = sections[0]
-            merge_finish = per_source_finish_reasons[0] if per_source_finish_reasons else None
-        else:
-            merged, merge_finish = await _merge_sections(
-                ctx,
-                sections=sections,
-                specs=readable,
-                user_input=user_input,
-                memory_context=memory_context,
-                model_def=model_def,
-                max_tokens=cfg.max_completion_tokens,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-            )
-        if not merged or not merged.strip():
-            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
-        document = _extract_markdown_block(merged) if "```" in merged else merged
-        if not document.strip():
-            text = _format_template(
-                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
-                response_preview=merged[:400],
-            )
-            return OperationResult(output_text=text)
-        # Inject consolidated per-source density markers after the merge.
-        # The merge pass rewrites sections, so inline section markers would
-        # not survive; we prepend a single non-rendering HTML comment block
-        # listing every failed source so the persisted document carries the
-        # honest-failure audit trail.
-        if density_markers:
-            marker_block = "\n\n".join(density_markers)
-            document = marker_block + "\n\n" + document
-        final_finish_reason = merge_finish
-        # The merge pass already ran continuation handling internally; the
-        # merged document is the final artifact. Density is assessed on the
-        # merged document against the aggregate source bytes below.
-    else:
-        # ── Single-pass consolidation / single-doc path ───────────────
-        completion = await _call_llm(
-            ctx,
-            user_input,
-            memory_context,
-            existing_document=existing_document,
-            source_block=source_block,
-            max_tokens=cfg.max_completion_tokens,
-        )
-        # _call_llm returns (content, model_def, finish_reason).
-        completion_text, model_def, first_finish_reason = completion
-        if not completion_text or not completion_text.strip():
-            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
-
-        document = _extract_markdown_block(completion_text)
-        if not document.strip():
-            text = _format_template(
-                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
-                response_preview=completion_text[:400],
-            )
-            return OperationResult(output_text=text)
-
-        # Truncation handling: when the first pass stopped mid-document
-        # (finish_reason in {length, unknown, None}), issue up to
-        # _MAX_CONTINUE_ATTEMPTS continuation passes. Each pass appends only the
-        # missing tail. If the merged document still looks truncated after the
-        # budget is exhausted, mark it truncated and annotate the persisted
-        # artifact so a reader knows it is incomplete. See
-        # /memories/repo/forge-document-truncation-contract.md.
-        document, was_truncated, continue_attempts, final_finish_reason = (
-            await _continue_until_complete(
-                ctx,
-                user_input=user_input,
-                document=document,
-                model_def=model_def,
-                first_finish_reason=first_finish_reason,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-            )
-        )
-
-        # ── Density floor (consolidation anti-abridgment gate) ────────
-        # Only applies when source_paths was supplied. If the output is a
-        # lossy abridgment (output bytes << source bytes, below the
-        # source-count-scaled floor), issue one re-forge pass with a
-        # sharpened "preserve detail" instruction. If the retry still
-        # trips, we proceed and mark the artifact (honest failure) rather
-        # than looping indefinitely.
-        if sources and source_total > 0:
-            density_floor_value = _density_floor_ratio(n_readable)
-            # Run the check before mdformat normalizes the byte count.
-            density_violation = _density_floor_check(
-                source_total_bytes=source_total,
-                output_bytes=len(document.encode("utf-8")),
-                source_count=n_readable,
-            )
-            if density_violation is not None:
-                density_passed = False
-                violation_msg = density_violation  # narrowed to str for the retry call
-                for _ in range(cfg.density_retry_attempts):
-                    density_retried = True
-                    retry_text, retry_finish = await _reforge_for_density(
-                        ctx,
-                        user_input=user_input,
-                        memory_context=memory_context,
-                        existing_document=existing_document,
-                        source_block=source_block,
-                        model_def=model_def,
-                        violation=violation_msg,
-                        source_total_bytes=source_total,
-                        output_bytes=len(document.encode("utf-8")),
-                        source_count=n_readable,
-                        max_tokens=cfg.max_completion_tokens,
-                    )
-                    if not retry_text or not retry_text.strip():
-                        break
-                    retry_document = _extract_markdown_block(retry_text)
-                    if not retry_document.strip():
-                        break
-                    # The retry may itself need continuation handling.
-                    retry_document, was_truncated, continue_attempts, final_finish_reason = (
-                        await _continue_until_complete(
-                            ctx,
-                            user_input=user_input,
-                            document=retry_document,
-                            model_def=model_def,
-                            first_finish_reason=retry_finish,
-                            max_continue_attempts=cfg.max_continue_attempts,
-                            max_continue_tokens=cfg.max_continue_tokens,
-                        )
-                    )
-                    document = retry_document
-                    density_violation = _density_floor_check(
-                        source_total_bytes=source_total,
-                        output_bytes=len(document.encode("utf-8")),
-                        source_count=n_readable,
-                    )
-                    density_passed = density_violation is None
-                    if density_passed:
-                        break
-        density_ratio = (
-            len(document.encode("utf-8")) / source_total if source_total else 1.0
-        )
-
-    # ── Map-reduce density assessment (post-merge) ────────────────────
-    # For the map-reduce path, the per-source forge already enforced
-    # preservation per source (Task 1). The global density_passed for the
-    # map-reduce path becomes ``density_failed_sources == []`` — honest
-    # per-source failures surface in the op result. We still compute the
-    # aggregate density_ratio against the merged document + total source
-    # bytes for telemetry (a failing aggregate ratio here is informational;
-    # the merge may have legitimately deduped), but it does NOT re-trigger
-    # a re-forge. The single-pass path keeps its own density floor (below).
-    if use_map_reduce and sources and source_total > 0:
-        density_floor_value = _density_floor_ratio(n_readable)
-        density_violation = _density_floor_check(
-            source_total_bytes=source_total,
-            output_bytes=len(document.encode("utf-8")),
-            source_count=n_readable,
-        )
-        density_passed = not density_failed_sources
-        density_ratio = (
-            len(document.encode("utf-8")) / source_total if source_total else 1.0
-        )
-        # Record per-source metadata for the OKF provenance ``Passes`` and
-        # ``Density`` columns (Task 2). Built here so it travels with the
-        # rest of the map-reduce state; the single-pass path leaves it None.
-        per_source_meta = [
-            {"passes": per_source_passes[i] if i < len(per_source_passes) else 0,
-             "density": per_source_density[i] if i < len(per_source_density) else "n/a"}
-            for i in range(n_readable)
-        ]
-    else:
-        per_source_meta = None
 
     # Lint/format the document so the persisted output is clean and consistent.
     document = _format_markdown(document)
 
-    # Char cap: source-aware consolidations get the raised cap so the
-    # preservation directive is physically enforceable. The single-doc path
-    # keeps the original 20K cap. Both are session-configurable via
-    # ``forge_max_document_chars`` / ``forge_max_document_chars_with_sources``.
-    max_chars = (
-        cfg.max_document_chars_with_sources if sources else cfg.max_document_chars
-    )
-    if len(document) > max_chars:
-        document = document[:max_chars] + "\n\n<!-- truncated -->\n"
-        # A char-budget truncation overrides the model-finish signal: the
-        # artifact is definitely truncated.
+    # Char cap.
+    if len(document) > cfg.max_document_chars:
+        document = document[:cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
         was_truncated = True
 
     # Annotate with the model that wrote it, unless the user opted out.
     annotate_model = bool(params.get("annotate_model", True))
     if annotate_model and not _user_asked_not_to_annotate(user_input):
-        if sources:
-            # Extended provenance footer for source-aware forges. The OKF
-            # concept (written below, after persistence) holds the full
-            # per-source record; the footer carries a summary + the OKF
-            # pointer. We write the footer first with a placeholder OKF
-            # path, then patch it once the concept path is known. To keep
-            # the patch simple, we compute the OKF path deterministically
-            # (it's derived from the document stem + bundle path) so the
-            # footer and the concept agree without a second pass.
-            okf_bundle_path = str(params.get("okf_bundle_path") or "").strip()
-            okf_concept_path = ""
-            if okf_bundle_path:
-                stem = _document_stem(document_path)
-                okf_concept_path = f"{okf_bundle_path}/{stem}.forge.md"
-            processing_summary = (
-                "1 primary pass"
-                + (f" + {continue_attempts} continuation" if continue_attempts else "")
-                + ("; density passed" if density_passed else "; density FAILED"
-                   if sources and source_total > 0 else "")
-                + ("; re-forged" if density_retried else "")
-                + f" · finish_reason: {final_finish_reason!r}"
-            )
-            density_line = ""
-            if sources and source_total > 0:
-                density_line = (
-                    f"{len(document.encode('utf-8'))}B / {source_total}B "
-                    f"({density_ratio:.0%})"
-                )
-            annotation = _build_extended_annotation(
-                model_def,
-                sources=sources,
-                processing_summary=processing_summary,
-                density_line=density_line,
-                okf_concept_path=okf_concept_path,
-                truncated=was_truncated,
-                final_finish_reason=final_finish_reason if was_truncated else None,
-                continue_attempts=continue_attempts if was_truncated else 0,
-            )
-        else:
-            annotation = _build_model_annotation(
-                model_def,
-                truncated=was_truncated,
-                final_finish_reason=final_finish_reason if was_truncated else None,
-                continue_attempts=continue_attempts if was_truncated else 0,
-            )
+        annotation = _build_model_annotation(
+            model_def,
+            truncated=was_truncated,
+            final_finish_reason=final_finish_reason if was_truncated else None,
+            continue_attempts=continue_attempts if was_truncated else 0,
+        )
         if annotation:
             document = document.rstrip() + "\n\n" + annotation + "\n"
 
@@ -2473,29 +604,6 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     stored_path = str(write_response.get("path") or document_path)
     byte_count = int(write_response.get("bytes") or len(document.encode("utf-8")))
 
-    # ── OKF provenance capture (best-effort, source-aware only) ───────
-    okf_concept_path_written: str | None = None
-    if sources and str(params.get("okf_bundle_path") or "").strip():
-        okf_concept_path_written = await _write_okf_provenance(
-            ctx,
-            okf_bundle_path=str(params["okf_bundle_path"]).strip(),
-            document_stem=_document_stem(document_path),
-            sources=sources,
-            stored_path=stored_path,
-            output_bytes=byte_count,
-            heading_count=heading_count,
-            model_def=model_def,
-            passes=1 + (1 if density_retried else 0),
-            continue_attempts=continue_attempts,
-            density_ratio=density_ratio,
-            density_floor=density_floor_value,
-            density_passed=density_passed,
-            first_finish_reason=first_finish_reason,
-            final_finish_reason=final_finish_reason,
-            truncated=was_truncated,
-            per_source_meta=per_source_meta,
-        )
-
     summary = (
         f"Document forged and stored at `{stored_path}` "
         f"({byte_count} bytes, {heading_count} headings)."
@@ -2506,21 +614,6 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             f"continuation attempt(s) (final finish_reason="
             f"{final_finish_reason!r}). See annotation in document."
         )
-    if sources and not density_passed:
-        summary += (
-            f" WARNING: density floor FAILED ({density_ratio:.0%} of "
-            f"{source_total}B source; floor {density_floor_value:.0%}). "
-            f"The persisted document may be a lossy abridgment — review it."
-        )
-    if density_failed_sources:
-        summary += (
-            f" WARNING: per-source density floor failed for "
-            f"{len(density_failed_sources)} source(s): "
-            f"{', '.join(density_failed_sources)}. See inline markers in "
-            f"the persisted document."
-        )
-    if okf_concept_path_written:
-        summary += f" Provenance: `{okf_concept_path_written}`"
     return OperationResult(
         output_text=summary,
         output_json={
@@ -2532,21 +625,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "continue_attempts": continue_attempts,
             "first_finish_reason": first_finish_reason,
             "final_finish_reason": final_finish_reason,
-            "source_count": n_readable,
-            "rolling_accumulation_used": rolling_used,
-            "source_total_bytes": source_total,
-            "density_ratio": density_ratio,
-            "density_passed": density_passed,
-            "density_retried": density_retried,
-            "density_failed_sources": density_failed_sources,
-            "okf_provenance_path": okf_concept_path_written,
         },
         extra={
             "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
             "document_path": stored_path,
             "truncated": was_truncated,
             "continue_attempts": continue_attempts,
-            "source_count": n_readable,
-            "density_passed": density_passed,
         },
     )
