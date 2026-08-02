@@ -5,6 +5,7 @@ start_stage_id: none
 mode_kind: chat
 routable: true
 priority: 6
+pre_turn_operation_ids: [okf_briefing]
 routing_intent_tags: [write]
 satisfies_intents: [write]
 routing_intent_keywords:
@@ -21,12 +22,15 @@ fast_path_patterns:
   - '\b(forge|draft|write|compose|create|generate|make|produce)\b.*\b(document|doc|markdown|runbook|post|note)\b'
   - '\b(document|doc|markdown|runbook|post|note)\b.*\b(forge|draft|write|compose|output|create|generate|make|produce)\b'
   - '\bmarkdown\b'
-allowed_operation_ids: []
+allowed_operation_ids:
+  - markdown_consolidate_sources
 required_capabilities: [reasoning, tools]
 allowed_tool_ids:
   - markdown_generate
   - write_file
   - read_file
+  - read_file_range
+  - append_file
   - list_files
   - memory.search
   - okf_emit_concept
@@ -57,6 +61,17 @@ Write a markdown document using this process:
    tool returns a JSON object with `ok`, `path`, and `bytes`.
 6. **Report** — tell the user the stored path, byte count, and heading count.
 
+## Pre-turn OKF working context
+
+This mode runs `okf_briefing` before each turn (see `pre_turn_operation_ids`).
+When the `<pre-turn-briefing>` block contains an **OKF working context**
+section, treat it as advisory background: each bullet names a concept in
+the working OKF bundle (`okf/working` by default) with a one-line summary
+and a cited path. If a bullet looks relevant to the document you are about
+to forge, call `read_file` on `{bundle_path}/{concept_path}` to pull the
+full text before writing. Do not treat the skim as a source of truth — it
+is a pointer, not the content.
+
 ## Iteration
 
 When the user asks to revise, expand, or tweak an existing document, read
@@ -64,11 +79,12 @@ it first with `read_file`, then revise it in your response and preserve prior
 structure and content unless the instruction asks to change or remove
 something.
 
-## Consolidation (source_paths)
+## Consolidation (multi-source)
 
 When the user wants to consolidate multiple existing documents into one
-coherent narrative, pass `source_paths` to `markdown_forge_document`. Each
-entry is a path (or glob) plus an optional NL `priority` note:
+coherent narrative, call the `markdown_consolidate_sources` operation with
+`source_paths`. Each entry is a path (or glob) plus an optional NL `priority`
+note:
 
 ```jsonc
 {
@@ -83,12 +99,15 @@ entry is a path (or glob) plus an optional NL `priority` note:
 }
 ```
 
-In consolidation mode the operation:
+Use `markdown_forge_document` for a single document; use
+`markdown_consolidate_sources` only when the user explicitly asks to combine
+two or more existing source documents. The consolidate operation:
 
 1. Expands globs via `list_files` and reads every source via `read_file`.
 2. Injects the sources with their per-source priority notes into a
    preserve-detail system prompt — the model is instructed to PRESERVE
-   DETAIL, not summarize.
+   DETAIL, not summarize. Small aggregates use a single pass; larger ones
+   use map-reduce (one bounded-context section per source, then a merge).
 3. Applies a density floor (output bytes vs source bytes, scaled by source
    count). A sub-floor output triggers one re-forge pass with a sharpened
    instruction; if it still fails, the artifact is persisted with a
