@@ -42,6 +42,8 @@ __all__ = [
     "expand_globs",
     "read_sources",
     "render_source_block",
+    "render_one_source_block",
+    "render_priorities_block",
     "total_source_bytes",
     "has_sources",
 ]
@@ -399,3 +401,46 @@ def readable_count(specs: list[SourceSpec]) -> int:
 def failed_specs(specs: list[SourceSpec]) -> list[SourceSpec]:
     """Return sources that were supplied but could not be read."""
     return [s for s in specs if s.read_error]
+
+
+def render_one_source_block(spec: SourceSpec) -> str:
+    """Render ONE source's text block for the per-source forge prompt.
+
+    Used by the map-reduce consolidation path (Phase 2): each source gets
+    its own bounded-context forge pass. Unlike :func:`render_source_block`,
+    this renders a single source's text in a fenced markdown block — the
+    wrapper header (index, path, priority) is the prompt template's job,
+    not this helper's.
+    """
+
+    if not spec.text:
+        return ""
+    lines: list[str] = []
+    if spec.truncated_to_fit:
+        lines.append(
+            "> NOTE: this source was truncated to fit the per-source"
+            " context cap; what follows is the leading portion only."
+        )
+        lines.append("")
+    lines.append("```markdown")
+    lines.append(spec.text.rstrip())
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def render_priorities_block(specs: list[SourceSpec]) -> str:
+    """Render a compact per-source priority list for the merge prompt.
+
+    Each readable source is one line: ``N. <path> — priority``. This
+    travels into the merge pass so the model respects the priority notes
+    when assembling the sections (e.g. "primary" sections anchor the
+    structure, "background" sections stay condensed).
+    """
+
+    readable = [s for s in specs if s.text]
+    if not readable:
+        return "(no sources)"
+    lines: list[str] = []
+    for idx, spec in enumerate(readable, start=1):
+        lines.append(f"{idx}. `{spec.path}` — {spec.priority}")
+    return "\n".join(lines)

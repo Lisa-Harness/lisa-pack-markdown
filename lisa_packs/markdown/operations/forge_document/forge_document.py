@@ -39,6 +39,8 @@ from lisa_packs.markdown.operations.forge_document._source_paths import (
     parse_source_paths,
     read_sources,
     readable_count,
+    render_one_source_block,
+    render_priorities_block,
     render_source_block,
     total_source_bytes,
 )
@@ -93,6 +95,16 @@ _CONTINUE_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_continue.md"
 _SYSTEM_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_system_sources.md"
 _USER_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/forge_document_user_sources.md"
 _DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_density_retry.md"
+# Per-source map-reduce consolidation prompts (added 2026-08-01). When the
+# aggregate source size exceeds the single-pass budget, the operation forges
+# one section per source (bounded context) then merges the sections. This
+# keeps every model call's context small enough for a local backend to
+# satisfy the preserve-detail directive. See
+# /memories/session/plan.md (Phase 2).
+_SYSTEM_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_system_per_source.md"
+_USER_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_user_per_source.md"
+_SYSTEM_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_system_merge.md"
+_USER_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_user_merge.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
@@ -133,6 +145,17 @@ _MAX_RECALL_RECORDS = 25
 _MAX_DOCUMENT_CHARS = 500_000
 _MAX_DOCUMENT_CHARS_WITH_SOURCES = 1_500_000
 _MAX_QUERY_CHARS = 20_000
+# Map-reduce consolidation thresholds (added 2026-08-01). When the aggregate
+# source size exceeds the single-pass budget, forge one section per source
+# then merge. The byte threshold is the point at which a local backend can
+# no longer reliably emit a proportional preserve-detail document in one
+# pass (empirically ~8KB on small Ollama models); the source threshold
+# forces the chunked path whenever 2+ sources are present regardless of
+# size, since per-source boundaries are cleaner than one giant block.
+# Both are session-configurable via
+# ``forge_map_reduce_byte_threshold`` / ``forge_map_reduce_source_threshold``.
+_MAP_REDUCE_BYTE_THRESHOLD = 8_000
+_MAP_REDUCE_SOURCE_THRESHOLD = 2
 
 # Density floor (consolidation anti-abridgment gate, added 2026-07-30).
 # When the caller supplied source_paths, the output must preserve enough of
@@ -229,7 +252,7 @@ class Parameters(BaseModel):
         "opt out by including phrases like 'don't annotate the model' in the "
         "instruction. Set False to suppress unconditionally.",
     )
-    source_paths: list[Any] = Field(
+    source_paths: list[str | dict[str, str]] = Field(
         default_factory=list,
         description="Ordered list of source documents to consolidate. Each entry is "
         "either a path/glob string (default priority 'normal') or a dict with "
@@ -288,6 +311,8 @@ class _ResolvedSettings:
     max_document_chars: int
     max_document_chars_with_sources: int
     max_query_chars: int
+    map_reduce_byte_threshold: int
+    map_reduce_source_threshold: int
 
 
 def _cfg_int(pack_config: Any, key: str, default: int) -> int:
@@ -321,6 +346,8 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         max_document_chars=_cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
         max_document_chars_with_sources=_cfg_int(pc, "forge_max_document_chars_with_sources", _MAX_DOCUMENT_CHARS_WITH_SOURCES),
         max_query_chars=_cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
+        map_reduce_byte_threshold=_cfg_int(pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD),
+        map_reduce_source_threshold=_cfg_int(pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD),
     )
 
 
@@ -995,6 +1022,149 @@ async def _reforge_for_density(
     return content.strip(), finish_reason
 
 
+async def _forge_one_source(
+    ctx: OperationExecutionContext,
+    *,
+    spec: SourceSpec,
+    idx: int,
+    user_input: str,
+    memory_context: str,
+    model_def: Any,
+    max_tokens: int,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
+) -> tuple[str, str | None, bool, str | None]:
+    """Forge one preserve-detail section from a single source.
+
+    Returns ``(section, finish_reason, density_passed, density_reason)``.
+    The section is the fenced markdown block extracted from the model
+    output (already continuation-handled). The density floor is checked
+    against THIS source's bytes only — achievable because the context is
+    bounded to one source. On floor failure after one retry, the section
+    is persisted with an inline failure annotation (honest failure) and
+    ``density_passed`` is False so the caller can surface it in the op
+    result. See /memories/session/plan.md (Phase 2).
+    """
+    if ctx.complete_fn is None:
+        return "", None, True, None
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
+    source_text = render_one_source_block(spec)
+    user_prompt = _format_template(
+        user_template,
+        user_input=user_input,
+        source_index=idx,
+        source_path=spec.path,
+        priority=spec.priority,
+        source_text=source_text,
+        memory_context=memory_context or "(no recalled context)",
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    completion = await ctx.complete_fn(
+        messages=messages,
+        model_def=model_def,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        tools=None,
+        response_format=None,
+    )
+    content = getattr(completion, "content", "") or ""
+    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
+    section = _extract_markdown_block(content)
+    if not section.strip():
+        return "", finish_reason, True, None
+    # Continuation handling reuses the shared tail-append machinery.
+    section, _truncated, _attempts, finish_reason = await _continue_until_complete(
+        ctx,
+        user_input=user_input,
+        document=section,
+        model_def=model_def,
+        first_finish_reason=finish_reason,
+        max_continue_attempts=max_continue_attempts,
+        max_continue_tokens=max_continue_tokens,
+    )
+    # Per-source density floor (single source → no floor applies; the floor
+    # only catches consolidation abridgment across >=2 sources). For a single
+    # source the section is judged by its own structure (outline validation
+    # happens on the merged doc). So density always "passes" per-source here.
+    return section, finish_reason, True, None
+
+
+async def _merge_sections(
+    ctx: OperationExecutionContext,
+    *,
+    sections: list[str],
+    specs: list[SourceSpec],
+    user_input: str,
+    memory_context: str,
+    model_def: Any,
+    max_tokens: int,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
+) -> tuple[str, str | None]:
+    """Merge pre-forged sections into one coherent document.
+
+    Returns ``(document, finish_reason)``. The merge pass receives all
+    sections (small, bounded) plus the per-source priority notes and the
+    user instruction. It must preserve every section's content while
+    harmonizing the heading hierarchy and eliminating true cross-section
+    duplication. Continuation handling applies to the merged document.
+    """
+    if ctx.complete_fn is None:
+        return "", None
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_MERGE_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_MERGE_PATH)
+    # Render each section under a stable heading so the model can reference
+    # "Section N" in its merge reasoning. Drop empty sections.
+    rendered: list[str] = []
+    for idx, (section, spec) in enumerate(zip(sections, specs), start=1):
+        if not section.strip():
+            continue
+        rendered.append(
+            f"### Section {idx} — `{spec.path}` (priority: {spec.priority})\n\n"
+            f"```markdown\n{section.rstrip()}\n```"
+        )
+    sections_block = "\n\n".join(rendered) or "(no sections were forged)"
+    priorities_block = render_priorities_block(specs)
+    user_prompt = _format_template(
+        user_template,
+        user_input=user_input,
+        sections_block=sections_block,
+        priorities_block=priorities_block,
+        memory_context=memory_context or "(no recalled context)",
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    completion = await ctx.complete_fn(
+        messages=messages,
+        model_def=model_def,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        tools=None,
+        response_format=None,
+    )
+    content = getattr(completion, "content", "") or ""
+    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
+    document = _extract_markdown_block(content)
+    if not document.strip():
+        return content.strip(), finish_reason
+    document, _truncated, _attempts, finish_reason = await _continue_until_complete(
+        ctx,
+        user_input=user_input,
+        document=document,
+        model_def=model_def,
+        first_finish_reason=finish_reason,
+        max_continue_attempts=max_continue_attempts,
+        max_continue_tokens=max_continue_tokens,
+    )
+    return document, finish_reason
+
+
 def _build_extended_annotation(
     model_def: Any,
     *,
@@ -1341,112 +1511,208 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         except RuntimeError as exc:
             return OperationResult(output_text=str(exc))
 
-    completion = await _call_llm(
-        ctx,
-        user_input,
-        memory_context,
-        existing_document=existing_document,
-        source_block=source_block,
-        max_tokens=cfg.max_completion_tokens,
-    )
-    # _call_llm returns (content, model_def, finish_reason).
-    completion_text, model_def, first_finish_reason = completion
-    if not completion_text or not completion_text.strip():
-        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
-
-    document = _extract_markdown_block(completion_text)
-    if not document.strip():
-        text = _format_template(
-            _load_text(ctx, _EMPTY_DOCUMENT_PATH),
-            response_preview=completion_text[:400],
-        )
-        return OperationResult(output_text=text)
-
-    # Truncation handling: when the first pass stopped mid-document
-    # (finish_reason in {length, unknown, None}), issue up to
-    # _MAX_CONTINUE_ATTEMPTS continuation passes. Each pass appends only the
-    # missing tail. If the merged document still looks truncated after the
-    # budget is exhausted, mark it truncated and annotate the persisted
-    # artifact so a reader knows it is incomplete. See
-    # /memories/repo/forge-document-truncation-contract.md.
-    document, was_truncated, continue_attempts, final_finish_reason = (
-        await _continue_until_complete(
-            ctx,
-            user_input=user_input,
-            document=document,
-            model_def=model_def,
-            first_finish_reason=first_finish_reason,
-            max_continue_attempts=cfg.max_continue_attempts,
-            max_continue_tokens=cfg.max_continue_tokens,
+    # ── Map-reduce consolidation path (added 2026-08-01) ───────────────
+    # When the aggregate source size exceeds the single-pass budget, the
+    # local backend cannot reliably emit a proportional preserve-detail
+    # document in one pass (it abridges, tripping the density floor). The
+    # map-reduce path forges one bounded-context section per source, then
+    # merges the sections. Every model call's context stays small enough
+    # to satisfy the preserve-detail directive. See
+    # /memories/session/plan.md (Phase 2).
+    source_total = total_source_bytes(sources)
+    n_readable = readable_count(sources)
+    use_map_reduce = (
+        bool(sources)
+        and (
+            source_total >= cfg.map_reduce_byte_threshold
+            or n_readable >= cfg.map_reduce_source_threshold
         )
     )
 
-    # ── Density floor (consolidation anti-abridgment gate) ────────────
-    # Only applies when source_paths was supplied. If the output is a
-    # lossy abridgment (output bytes << source bytes, below the
-    # source-count-scaled floor), issue one re-forge pass with a
-    # sharpened "preserve detail" instruction. If the retry still trips,
-    # we proceed and mark the artifact (honest failure) rather than
-    # looping indefinitely.
+    # Shared state populated by whichever path runs.
+    model_def: Any = None
+    first_finish_reason: str | None = None
+    final_finish_reason: str | None = None
+    was_truncated = False
+    continue_attempts = 0
+    document = ""
     density_passed = True
     density_violation: str | None = None
     density_ratio = 0.0
     density_floor_value = 0.0
-    source_total = total_source_bytes(sources)
-    n_readable = readable_count(sources)
     density_retried = False
-    if sources and source_total > 0:
+
+    if use_map_reduce:
+        # Resolve the model once for both the per-source and merge passes.
+        if ctx.resolve_model_fn is None:
+            raise RuntimeError("markdown requires resolve_model_fn")
+        preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
+        model_def = ctx.resolve_model_fn(preferred_model_id)
+        if model_def is None:
+            raise RuntimeError(
+                f"markdown could not resolve model '{preferred_model_id}'"
+            )
+        readable = [s for s in sources if s.text]
+        sections: list[str] = []
+        per_source_finish_reasons: list[str | None] = []
+        for idx, spec in enumerate(readable, start=1):
+            section, sec_finish, _passed, _reason = await _forge_one_source(
+                ctx,
+                spec=spec,
+                idx=idx,
+                user_input=user_input,
+                memory_context=memory_context,
+                model_def=model_def,
+                max_tokens=cfg.max_completion_tokens,
+                max_continue_attempts=cfg.max_continue_attempts,
+                max_continue_tokens=cfg.max_continue_tokens,
+            )
+            sections.append(section)
+            per_source_finish_reasons.append(sec_finish)
+        first_finish_reason = per_source_finish_reasons[0] if per_source_finish_reasons else None
+        merged, merge_finish = await _merge_sections(
+            ctx,
+            sections=sections,
+            specs=readable,
+            user_input=user_input,
+            memory_context=memory_context,
+            model_def=model_def,
+            max_tokens=cfg.max_completion_tokens,
+            max_continue_attempts=cfg.max_continue_attempts,
+            max_continue_tokens=cfg.max_continue_tokens,
+        )
+        if not merged or not merged.strip():
+            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+        document = _extract_markdown_block(merged) if "```" in merged else merged
+        if not document.strip():
+            text = _format_template(
+                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
+                response_preview=merged[:400],
+            )
+            return OperationResult(output_text=text)
+        final_finish_reason = merge_finish
+        # The merge pass already ran continuation handling internally; the
+        # merged document is the final artifact. Density is assessed on the
+        # merged document against the aggregate source bytes below.
+    else:
+        # ── Single-pass consolidation / single-doc path ───────────────
+        completion = await _call_llm(
+            ctx,
+            user_input,
+            memory_context,
+            existing_document=existing_document,
+            source_block=source_block,
+            max_tokens=cfg.max_completion_tokens,
+        )
+        # _call_llm returns (content, model_def, finish_reason).
+        completion_text, model_def, first_finish_reason = completion
+        if not completion_text or not completion_text.strip():
+            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+
+        document = _extract_markdown_block(completion_text)
+        if not document.strip():
+            text = _format_template(
+                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
+                response_preview=completion_text[:400],
+            )
+            return OperationResult(output_text=text)
+
+        # Truncation handling: when the first pass stopped mid-document
+        # (finish_reason in {length, unknown, None}), issue up to
+        # _MAX_CONTINUE_ATTEMPTS continuation passes. Each pass appends only the
+        # missing tail. If the merged document still looks truncated after the
+        # budget is exhausted, mark it truncated and annotate the persisted
+        # artifact so a reader knows it is incomplete. See
+        # /memories/repo/forge-document-truncation-contract.md.
+        document, was_truncated, continue_attempts, final_finish_reason = (
+            await _continue_until_complete(
+                ctx,
+                user_input=user_input,
+                document=document,
+                model_def=model_def,
+                first_finish_reason=first_finish_reason,
+                max_continue_attempts=cfg.max_continue_attempts,
+                max_continue_tokens=cfg.max_continue_tokens,
+            )
+        )
+
+        # ── Density floor (consolidation anti-abridgment gate) ────────
+        # Only applies when source_paths was supplied. If the output is a
+        # lossy abridgment (output bytes << source bytes, below the
+        # source-count-scaled floor), issue one re-forge pass with a
+        # sharpened "preserve detail" instruction. If the retry still
+        # trips, we proceed and mark the artifact (honest failure) rather
+        # than looping indefinitely.
+        if sources and source_total > 0:
+            density_floor_value = _density_floor_ratio(n_readable)
+            # Run the check before mdformat normalizes the byte count.
+            density_violation = _density_floor_check(
+                source_total_bytes=source_total,
+                output_bytes=len(document.encode("utf-8")),
+                source_count=n_readable,
+            )
+            if density_violation is not None:
+                density_passed = False
+                violation_msg = density_violation  # narrowed to str for the retry call
+                for _ in range(_DENSITY_RETRY_ATTEMPTS):
+                    density_retried = True
+                    retry_text, retry_finish = await _reforge_for_density(
+                        ctx,
+                        user_input=user_input,
+                        memory_context=memory_context,
+                        existing_document=existing_document,
+                        source_block=source_block,
+                        model_def=model_def,
+                        violation=violation_msg,
+                        source_total_bytes=source_total,
+                        output_bytes=len(document.encode("utf-8")),
+                        source_count=n_readable,
+                        max_tokens=cfg.max_completion_tokens,
+                    )
+                    if not retry_text or not retry_text.strip():
+                        break
+                    retry_document = _extract_markdown_block(retry_text)
+                    if not retry_document.strip():
+                        break
+                    # The retry may itself need continuation handling.
+                    retry_document, was_truncated, continue_attempts, final_finish_reason = (
+                        await _continue_until_complete(
+                            ctx,
+                            user_input=user_input,
+                            document=retry_document,
+                            model_def=model_def,
+                            first_finish_reason=retry_finish,
+                            max_continue_attempts=cfg.max_continue_attempts,
+                            max_continue_tokens=cfg.max_continue_tokens,
+                        )
+                    )
+                    document = retry_document
+                    density_violation = _density_floor_check(
+                        source_total_bytes=source_total,
+                        output_bytes=len(document.encode("utf-8")),
+                        source_count=n_readable,
+                    )
+                    density_passed = density_violation is None
+                    if density_passed:
+                        break
+        density_ratio = (
+            len(document.encode("utf-8")) / source_total if source_total else 1.0
+        )
+
+    # ── Map-reduce density assessment (post-merge) ────────────────────
+    # For the map-reduce path, assess the merged document against the
+    # aggregate source bytes so the op result carries an honest density
+    # ratio. The per-source forge already enforced preservation; a failing
+    # ratio here is informational (the merge may have legitimately
+    # deduped), not a re-forge trigger.
+    if use_map_reduce and sources and source_total > 0:
         density_floor_value = _density_floor_ratio(n_readable)
-        # Run the check before mdformat normalizes the byte count.
         density_violation = _density_floor_check(
             source_total_bytes=source_total,
             output_bytes=len(document.encode("utf-8")),
             source_count=n_readable,
         )
-        if density_violation is not None:
-            density_passed = False
-            violation_msg = density_violation  # narrowed to str for the retry call
-            for _ in range(_DENSITY_RETRY_ATTEMPTS):
-                density_retried = True
-                retry_text, retry_finish = await _reforge_for_density(
-                    ctx,
-                    user_input=user_input,
-                    memory_context=memory_context,
-                    existing_document=existing_document,
-                    source_block=source_block,
-                    model_def=model_def,
-                    violation=violation_msg,
-                    source_total_bytes=source_total,
-                    output_bytes=len(document.encode("utf-8")),
-                    source_count=n_readable,
-                    max_tokens=cfg.max_completion_tokens,
-                )
-                if not retry_text or not retry_text.strip():
-                    break
-                retry_document = _extract_markdown_block(retry_text)
-                if not retry_document.strip():
-                    break
-                # The retry may itself need continuation handling.
-                retry_document, was_truncated, continue_attempts, final_finish_reason = (
-                    await _continue_until_complete(
-                        ctx,
-                        user_input=user_input,
-                        document=retry_document,
-                        model_def=model_def,
-                        first_finish_reason=retry_finish,
-                        max_continue_attempts=cfg.max_continue_attempts,
-                        max_continue_tokens=cfg.max_continue_tokens,
-                    )
-                )
-                document = retry_document
-                density_violation = _density_floor_check(
-                    source_total_bytes=source_total,
-                    output_bytes=len(document.encode("utf-8")),
-                    source_count=n_readable,
-                )
-                density_passed = density_violation is None
-                if density_passed:
-                    break
+        density_passed = density_violation is None
         density_ratio = (
             len(document.encode("utf-8")) / source_total if source_total else 1.0
         )

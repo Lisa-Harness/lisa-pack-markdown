@@ -170,6 +170,7 @@ def _make_ctx(
     complete_fn: Any = None,
     resolve_model_fn: Any = None,
     execute_tool_fn: Any = None,
+    pack_config: dict[str, Any] | None = None,
 ) -> OperationExecutionContext:
     return OperationExecutionContext(
         workspace_id="test",
@@ -185,7 +186,31 @@ def _make_ctx(
         read_authored_text_fn=_make_loader(),
         execute_tool_fn=execute_tool_fn,
         params=params or {},
+        pack_config=pack_config or {},
     )
+
+
+def _single_pass_pack_config() -> dict[str, Any]:
+    """Pack config that forces the single-pass path (raises both thresholds).
+
+    Used by the density-floor tests so they exercise the single-pass
+    re-forge contract, which only runs when the map-reduce path is not
+    selected. With byte threshold far above the test source size and
+    source threshold above the test's source count, the op takes the
+    single-pass branch.
+    """
+    return {
+        "forge_map_reduce_byte_threshold": 10_000_000,
+        "forge_map_reduce_source_threshold": 100,
+    }
+
+
+def _map_reduce_pack_config() -> dict[str, Any]:
+    """Pack config that forces the map-reduce path (low thresholds)."""
+    return {
+        "forge_map_reduce_byte_threshold": 0,
+        "forge_map_reduce_source_threshold": 0,
+    }
 
 
 def _fake_resolve_model() -> Any:
@@ -256,6 +281,7 @@ async def test_source_paths_reads_each_source_and_injects_into_prompt() -> None:
                 {"path": "b.md", "priority": "secondary — dedupe, keep unique"},
             ],
         },
+        pack_config=_single_pass_pack_config(),
     )
     await execute(ctx)
     # Both sources must have been read.
@@ -381,6 +407,7 @@ async def test_density_floor_trips_on_abridged_output_and_reforges() -> None:
                 {"path": "b.md", "priority": "secondary"},
             ],
         },
+        pack_config=_single_pass_pack_config(),
     )
     result = await execute(ctx)
     # The retry must have happened (two completion calls).
@@ -412,6 +439,7 @@ async def test_density_floor_failure_persists_with_warning() -> None:
             "document_path": "n.md",
             "source_paths": ["a.md", "b.md"],
         },
+        pack_config=_single_pass_pack_config(),
     )
     result = await execute(ctx)
     # The retry happened but did not pass the floor.
@@ -436,6 +464,94 @@ async def test_density_floor_not_applied_without_source_paths() -> None:
     result = await execute(ctx)
     assert result.output_json.get("density_passed") is True
     assert result.output_json.get("source_count", 0) == 0
+
+
+# ── Map-reduce consolidation ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_map_reduce_forges_per_source_then_merges() -> None:
+    """When thresholds trip, one section is forged per source then merged.
+
+    Regression for the 2026-08-01 chunked-consolidation change (Phase 2):
+    a multi-source consolidation above the map-reduce threshold issues
+    N per-source completion calls + 1 merge call, rather than one giant
+    single-pass call. Each per-source call uses the per-source system
+    prompt; the merge uses the merge system prompt.
+    """
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+    call_log: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        # Per-source calls return a section; the merge returns the full doc.
+        if "Per-Source Consolidation Section" in system_content:
+            call_log.append({"phase": "per-source", "system": system_content})
+            return _FakeCompletion(
+                content="```markdown\n# Section\n\nforged detail for one source\n```"
+            )
+        if "Section Merge" in system_content:
+            call_log.append({"phase": "merge", "system": system_content})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        call_log.append({"phase": "unknown", "system": system_content})
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": [
+                {"path": "a.md", "priority": "primary"},
+                {"path": "b.md", "priority": "secondary"},
+            ],
+        },
+        pack_config=_map_reduce_pack_config(),
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # Two per-source calls + one merge call.
+    per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
+    merge_calls = [c for c in call_log if c["phase"] == "merge"]
+    assert len(per_source_calls) == 2
+    assert len(merge_calls) == 1
+    # Both sources were read.
+    assert "a.md" in captures["read_paths"]
+    assert "b.md" in captures["read_paths"]
+
+
+@pytest.mark.asyncio
+async def test_map_reduce_default_threshold_takes_chunked_path() -> None:
+    """With default config, 2+ sources take the map-reduce path (no single-pass re-forge)."""
+    tool_fn, _ = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+    call_count = {"n": 0}
+
+    async def _complete(**_kwargs: Any) -> _FakeCompletion:
+        call_count["n"] += 1
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": ["a.md", "b.md"],
+        },
+        # No pack_config → defaults → n_readable(2) >= source_threshold(2) → map-reduce.
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # Map-reduce issues 2 per-source + 1 merge = 3 calls (no single-pass re-forge).
+    assert call_count["n"] == 3
+    # The map-reduce path does not set density_retried (no single-pass re-forge).
+    assert result.output_json.get("density_retried", False) is False
 
 
 # ── OKF provenance + extended footer ───────────────────────────────────

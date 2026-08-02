@@ -13,18 +13,16 @@ routing_intent_keywords:
     - markdown
     - document
     - doc
-    - file
     - draft
     - compose
-    - output
     - forge
     - produce
 fast_path_patterns:
-  - '\b(forge|draft|write|compose|output|create|generate|make|produce)\b.*\b(document|doc|markdown|runbook|post|note)\b'
+  - '\b(forge|draft|write|compose|create|generate|make|produce)\b.*\b(document|doc|markdown|runbook|post|note)\b'
   - '\b(document|doc|markdown|runbook|post|note)\b.*\b(forge|draft|write|compose|output|create|generate|make|produce)\b'
   - '\bmarkdown\b'
 allowed_operation_ids: []
-required_capabilities: [tools]
+required_capabilities: [reasoning, tools]
 allowed_tool_ids:
   - markdown_generate
   - write_file
@@ -40,9 +38,7 @@ description: "Forge and iterate on a markdown document from user input + recalle
 
 # Markdown
 
-You are in MARKDOWN mode. The user is drafting or iterating on a markdown
-document. You have direct access to the tools needed to forge, validate, and
-store the document. Use them in this order:
+Write a markdown document using this process:
 
 1. **Recall context** — call `memory.search` with the user's instruction as
    the `query` to pull relevant long-term memory.
@@ -63,11 +59,10 @@ store the document. Use them in this order:
 
 ## Iteration
 
-- When the user asks to revise, expand, or tweak an existing document, read
-  it first with `read_file`, then revise it in your response. Preserve prior
-  structure and content unless the instruction asks to change or remove
-  something.
-- When the user starts a new document, skip the read step.
+When the user asks to revise, expand, or tweak an existing document, read
+it first with `read_file`, then revise it in your response and preserve prior
+structure and content unless the instruction asks to change or remove
+something.
 
 ## Consolidation (source_paths)
 
@@ -77,12 +72,12 @@ entry is a path (or glob) plus an optional NL `priority` note:
 
 ```jsonc
 {
-  "document_path": "lisa-framework-narrative.md",
+  "document_path": "some_doc.md",
   "source_paths": [
-    {"path": "artifacts/files/architecture_gap_swot.md", "priority": "primary — keep its section structure"},
-    {"path": "artifacts/files/agent_framework_swot.md", "priority": "secondary — dedupe against source 1, keep anything unique"},
-    {"path": "artifacts/files/lisa-runtime-state-reflection.md", "priority": "background — one paragraph max"},
-    {"path": "artifacts/files/*.md"}
+    {"path": "primary.md", "priority": "primary — keep its section structure"},
+    {"path": "secondary.md", "priority": "secondary — dedupe against source 1, keep anything unique"},
+    {"path": "reflection.md", "priority": "background — one paragraph max"},
+    {"path": "*.md"}
   ],
   "okf_bundle_path": "okf/forge-provenance"
 }
