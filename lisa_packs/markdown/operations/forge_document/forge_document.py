@@ -105,6 +105,11 @@ _SYSTEM_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_system_per_sourc
 _USER_PROMPT_PER_SOURCE_PATH = f"{_PROMPT_DIR}/forge_document_user_per_source.md"
 _SYSTEM_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_system_merge.md"
 _USER_PROMPT_MERGE_PATH = f"{_PROMPT_DIR}/forge_document_user_merge.md"
+# Per-source density retry prompt (map-reduce path, added 2026-08-02). When
+# a per-source section comes back implausibly tiny relative to its source,
+# this sharpened instruction re-sends the per-source prompt and names the
+# deficit explicitly. Mirrors the global _DENSITY_RETRY_PATH shape.
+_PER_SOURCE_DENSITY_RETRY_PATH = f"{_PROMPT_DIR}/forge_document_per_source_density_retry.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
@@ -171,6 +176,19 @@ _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD = 5
 # that names the deficit explicitly. If the retry still trips, we persist
 # with the truncated annotation (honest failure) rather than looping.
 _DENSITY_RETRY_ATTEMPTS = 1
+
+# Per-source density floor (map-reduce path, added 2026-08-02). A section
+# forged from a single source must preserve enough of THAT source's
+# substance to not be a lossy abridgment. Unlike the global density floor
+# (which needs >=2 sources to be meaningful), this applies per source in
+# the map-reduce path: a 100B section for a 20KB source is abridged even
+# though no cross-source consolidation is happening. The floor is a ratio
+# of section bytes to source bytes; a section below the ratio trips one
+# retry with a sharpened per-source instruction. If the retry still trips,
+# the section is kept but annotated with an inline HTML comment and the
+# source path is recorded in ``density_failed_sources`` for the op result.
+# Session-configurable via ``forge_per_source_min_ratio``.
+_PER_SOURCE_MIN_RATIO = 0.10
 
 # Minimum structural bar for a forged document: at least one heading.
 _MIN_HEADINGS = 1
@@ -313,6 +331,7 @@ class _ResolvedSettings:
     max_query_chars: int
     map_reduce_byte_threshold: int
     map_reduce_source_threshold: int
+    per_source_min_ratio: float
 
 
 def _cfg_int(pack_config: Any, key: str, default: int) -> int:
@@ -335,6 +354,25 @@ def _cfg_int(pack_config: Any, key: str, default: int) -> int:
         return default
 
 
+def _cfg_float(pack_config: Any, key: str, default: float) -> float:
+    """Read a float from ``ctx.pack_config`` with a module-constant fallback.
+
+    Same contract as :func:`_cfg_int` but for ratio/percentage thresholds.
+    Coerces non-float values to the default rather than raising; a malformed
+    session value falls back to the safe default instead of crashing mid-turn.
+    """
+    if pack_config is None:
+        return default
+    raw = pack_config.get(key)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("forge_document: pack_config[%r]=%r is not a float; using default %s", key, raw, default)
+        return default
+
+
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
     pc = ctx.pack_config
@@ -348,6 +386,7 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         max_query_chars=_cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
         map_reduce_byte_threshold=_cfg_int(pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD),
         map_reduce_source_threshold=_cfg_int(pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD),
+        per_source_min_ratio=_cfg_float(pc, "forge_per_source_min_ratio", _PER_SOURCE_MIN_RATIO),
     )
 
 
@@ -1033,20 +1072,30 @@ async def _forge_one_source(
     max_tokens: int,
     max_continue_attempts: int,
     max_continue_tokens: int,
-) -> tuple[str, str | None, bool, str | None]:
+    per_source_min_ratio: float,
+) -> tuple[str, str | None, bool, str | None, list[str], int, str]:
     """Forge one preserve-detail section from a single source.
 
-    Returns ``(section, finish_reason, density_passed, density_reason)``.
+    Returns ``(section, finish_reason, density_passed, density_reason,
+    failed_paths, passes, density_marker)``.
+
     The section is the fenced markdown block extracted from the model
-    output (already continuation-handled). The density floor is checked
-    against THIS source's bytes only — achievable because the context is
-    bounded to one source. On floor failure after one retry, the section
-    is persisted with an inline failure annotation (honest failure) and
-    ``density_passed`` is False so the caller can surface it in the op
-    result. See /memories/session/plan.md (Phase 2).
+    output (already continuation-handled). A per-source density floor
+    (added 2026-08-02) checks the section is not implausibly tiny relative
+    to ITS source: ``len(section_bytes) < per_source_min_ratio *
+    spec.bytes`` trips one retry with the sharpened per-source density
+    prompt. If the retry still trips, the section is kept, the source
+    path is appended to ``failed_paths`` so the caller surfaces it in the
+    op result (``density_failed_sources``), and a ``density_marker`` HTML
+    comment is returned for the caller to inject into the merged document
+    (the merge pass rewrites sections, so an inline section marker would
+    not survive; the caller prepends a consolidated marker block).
+    ``passes`` is the number of forge passes issued for this source
+    (1 + retry count) — used by the OKF provenance ``Passes`` column. See
+    /memories/session/plan.md (Phase 2 completion).
     """
     if ctx.complete_fn is None:
-        return "", None, True, None
+        return "", None, True, None, [], 1, ""
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
     source_text = render_one_source_block(spec)
@@ -1074,23 +1123,200 @@ async def _forge_one_source(
     content = getattr(completion, "content", "") or ""
     finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
     section = _extract_markdown_block(content)
-    if not section.strip():
-        return "", finish_reason, True, None
-    # Continuation handling reuses the shared tail-append machinery.
-    section, _truncated, _attempts, finish_reason = await _continue_until_complete(
-        ctx,
-        user_input=user_input,
-        document=section,
-        model_def=model_def,
-        first_finish_reason=finish_reason,
-        max_continue_attempts=max_continue_attempts,
-        max_continue_tokens=max_continue_tokens,
+    passes = 1
+    failed_paths: list[str] = []
+    if section.strip():
+        # Continuation handling reuses the shared tail-append machinery.
+        section, _truncated, _attempts, finish_reason = await _continue_until_complete(
+            ctx,
+            user_input=user_input,
+            document=section,
+            model_def=model_def,
+            first_finish_reason=finish_reason,
+            max_continue_attempts=max_continue_attempts,
+            max_continue_tokens=max_continue_tokens,
+        )
+
+    # Per-source density floor: a section under the ratio of its source is
+    # presumed abridged. Retry once with the sharpened per-source density
+    # prompt; if it still trips, keep the section and record the source path
+    # + a density marker (returned to the caller, which prepends a
+    # consolidated marker block to the merged document — the merge pass
+    # rewrites sections, so an inline section marker would not survive).
+    density_reason: str | None = None
+    density_passed = True
+    density_marker = ""
+    if section.strip() and per_source_min_ratio > 0.0 and spec.bytes > 0:
+        density_reason = _per_source_density_check(
+            section=section,
+            source_bytes=spec.bytes,
+            min_ratio=per_source_min_ratio,
+            priority=spec.priority,
+        )
+        if density_reason is not None:
+            retry_section, retry_finish = await _reforge_one_source_for_density(
+                ctx,
+                spec=spec,
+                idx=idx,
+                user_input=user_input,
+                memory_context=memory_context,
+                model_def=model_def,
+                violation=density_reason,
+                section_bytes=len(section.encode("utf-8")),
+                source_bytes=spec.bytes,
+                min_ratio=per_source_min_ratio,
+                max_tokens=max_tokens,
+                max_continue_attempts=max_continue_attempts,
+                max_continue_tokens=max_continue_tokens,
+            )
+            passes += 1
+            if retry_section.strip():
+                retry_section, _t, _a, retry_finish = await _continue_until_complete(
+                    ctx,
+                    user_input=user_input,
+                    document=retry_section,
+                    model_def=model_def,
+                    first_finish_reason=retry_finish,
+                    max_continue_attempts=max_continue_attempts,
+                    max_continue_tokens=max_continue_tokens,
+                )
+                retry_reason = _per_source_density_check(
+                    section=retry_section,
+                    source_bytes=spec.bytes,
+                    min_ratio=per_source_min_ratio,
+                    priority=spec.priority,
+                )
+                if retry_reason is None:
+                    # Retry recovered — use the retry section.
+                    section = retry_section
+                    finish_reason = retry_finish
+                    density_passed = True
+                    density_reason = None
+                else:
+                    # Retry still trips — keep whichever section is larger
+                    # (honest failure), record the path + marker.
+                    if len(retry_section.encode("utf-8")) > len(section.encode("utf-8")):
+                        section = retry_section
+                        finish_reason = retry_finish
+                    density_passed = False
+                    density_reason = retry_reason
+                    failed_paths.append(spec.path)
+                    density_marker = (
+                        f"<!-- section density floor failed: "
+                        f"`{spec.path}` — {len(section.encode('utf-8'))}B "
+                        f"vs {spec.bytes}B source -->"
+                    )
+            # If the retry returned nothing usable, keep the original
+            # section and record the failure (the floor still tripped).
+            else:
+                density_passed = False
+                failed_paths.append(spec.path)
+                density_marker = (
+                    f"<!-- section density floor failed: "
+                    f"`{spec.path}` — {len(section.encode('utf-8'))}B "
+                    f"vs {spec.bytes}B source -->"
+                )
+    return section, finish_reason, density_passed, density_reason, failed_paths, passes, density_marker
+
+
+def _per_source_density_check(
+    *,
+    section: str,
+    source_bytes: int,
+    min_ratio: float,
+    priority: str,
+) -> str | None:
+    """Return a violation message if a per-source section is abridged.
+
+    Returns ``None`` when the section passes the floor, when no floor
+    applies (zero source bytes), or when the priority note explicitly
+    grants condensation latitude ("background", "one paragraph",
+    "brief", "verbatim"). The priority latitude check keeps the floor
+    from forcing expansion of a source the user explicitly asked to
+    condense.
+    """
+    if source_bytes <= 0 or min_ratio <= 0.0:
+        return None
+    lowered = (priority or "").lower()
+    latitude_tokens = ("background", "one paragraph", "brief", "summary", "condense", "verbatim")
+    if any(tok in lowered for tok in latitude_tokens):
+        return None
+    section_bytes = len(section.encode("utf-8"))
+    ratio = section_bytes / source_bytes if source_bytes else 1.0
+    if ratio >= min_ratio:
+        return None
+    return (
+        f"Per-source section for is {section_bytes}B vs {source_bytes}B source "
+        f"({ratio:.0%}, floor {min_ratio:.0%}) — below the per-source "
+        f"preservation floor. The section summarized instead of preserving."
     )
-    # Per-source density floor (single source → no floor applies; the floor
-    # only catches consolidation abridgment across >=2 sources). For a single
-    # source the section is judged by its own structure (outline validation
-    # happens on the merged doc). So density always "passes" per-source here.
-    return section, finish_reason, True, None
+
+
+async def _reforge_one_source_for_density(
+    ctx: OperationExecutionContext,
+    *,
+    spec: SourceSpec,
+    idx: int,
+    user_input: str,
+    memory_context: str,
+    model_def: Any,
+    violation: str,
+    section_bytes: int,
+    source_bytes: int,
+    min_ratio: float,
+    max_tokens: int,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
+) -> tuple[str, str | None]:
+    """Issue one per-source density-retry forge pass with a sharpened instruction.
+
+    Returns ``(section, finish_reason)``. The retry re-sends the per-source
+    user prompt (so the model has the source + priority in context) followed
+    by the per-source density-retry instruction naming the deficit. The
+    caller extracts the fenced markdown block and re-runs the density check.
+    """
+    if ctx.complete_fn is None:
+        return "", None
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
+    source_text = render_one_source_block(spec)
+    base_user_prompt = _format_template(
+        user_template,
+        user_input=user_input,
+        source_index=idx,
+        source_path=spec.path,
+        priority=spec.priority,
+        source_text=source_text,
+        memory_context=memory_context or "(no recalled context)",
+    )
+    retry_template = _load_text(ctx, _PER_SOURCE_DENSITY_RETRY_PATH)
+    retry_instruction = _format_template(
+        retry_template,
+        source_path=spec.path,
+        priority=spec.priority,
+        section_bytes=section_bytes,
+        source_bytes=source_bytes,
+        ratio=(section_bytes / source_bytes) if source_bytes else 0.0,
+        min_ratio=min_ratio,
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": base_user_prompt},
+        {"role": "user", "content": retry_instruction},
+    ]
+    logger.warning("forge_document: per-source density floor violated — %s", violation)
+    completion = await ctx.complete_fn(
+        messages=messages,
+        model_def=model_def,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        tools=None,
+        response_format=None,
+    )
+    content = getattr(completion, "content", "") or ""
+    finish_reason = _coerce_finish_reason(getattr(completion, "finish_reason", None))
+    section = _extract_markdown_block(content)
+    return section.strip(), finish_reason
 
 
 async def _merge_sections(
@@ -1274,33 +1500,52 @@ def _build_okf_provenance_body(
     final_finish_reason: str | None,
     truncated: bool,
     forge_timestamp: str,
+    per_source_meta: list[dict[str, Any]] | None = None,
 ) -> str:
     """Render the markdown body for the OKF forge-provenance concept.
 
     This is the machine-legible full record: the per-source table (path,
-    priority, bytes, and a treatment column noting truncation/read errors),
-    the processing pass log, and the density check result. The plain
-    markdown footer carries only a summary; this is the complete audit
-    trail an OKF consumer (or a later Lisa turn) can validate/diff.
+    priority, bytes, passes, density, and a treatment column noting
+    truncation/read errors), the processing pass log, and the density
+    check result. The plain markdown footer carries only a summary; this
+    is the complete audit trail an OKF consumer (or a later Lisa turn)
+    can validate/diff.
+
+    ``per_source_meta`` (Task 2, added 2026-08-02) carries per-source
+    ``passes`` (1 + per-source density retries) and ``density`` ("pass" /
+    "FAILED" / "n/a") for the map-reduce path, indexed by readable source
+    order. When ``None`` (single-pass path), the ``Passes`` column emits
+    ``0`` and ``Density`` emits ``n/a`` so the table shape is stable
+    across both paths — the single-pass OKF concept is unchanged in
+    meaning.
     """
     lines: list[str] = ["# Forge Provenance", "", "## Sources", ""]
     readable = [s for s in sources if s.text]
     failed = failed_specs(sources)
+    # Per-source metadata is indexed by readable source order. When absent
+    # (single-pass path), emit 0 passes and "n/a" density so the table
+    # columns are stable. See Task 2 in PACK_AGENT_MARKDOWN_DEFERRED.md.
+    meta = per_source_meta or []
     if readable or failed:
-        lines.append("| # | Path | Priority | Bytes | Treatment |")
-        lines.append("| --- | --- | --- | --- | --- |")
+        lines.append("| # | Path | Priority | Bytes | Passes | Density | Treatment |")
+        lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for idx, spec in enumerate(readable, start=1):
             treatment = "preserved"
             if spec.truncated_to_fit:
                 treatment = "truncated to per-source cap"
             if spec.expanded_from_glob:
                 treatment += f"; glob-expanded from `{spec.origin_glob}`"
+            entry = meta[idx - 1] if idx - 1 < len(meta) else {}
+            src_passes = entry.get("passes", 0) if entry else 0
+            src_density = entry.get("density", "n/a") if entry else "n/a"
             lines.append(
-                f"| {idx} | `{spec.path}` | {spec.priority} | {spec.bytes} | {treatment} |"
+                f"| {idx} | `{spec.path}` | {spec.priority} | {spec.bytes} | "
+                f"{src_passes} | {src_density} | {treatment} |"
             )
         for spec in failed:
             lines.append(
-                f"| – | `{spec.path}` | {spec.priority} | 0 | UNREADABLE: {spec.read_error} |"
+                f"| – | `{spec.path}` | {spec.priority} | 0 | 0 | n/a | "
+                f"UNREADABLE: {spec.read_error} |"
             )
     else:
         lines.append("_(no sources supplied — single-doc/memory-only forge)_")
@@ -1344,6 +1589,7 @@ async def _write_okf_provenance(
     first_finish_reason: str | None,
     final_finish_reason: str | None,
     truncated: bool,
+    per_source_meta: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Write the OKF forge-provenance concept + append a log entry.
 
@@ -1376,6 +1622,7 @@ async def _write_okf_provenance(
         final_finish_reason=final_finish_reason,
         truncated=truncated,
         forge_timestamp=forge_timestamp,
+        per_source_meta=per_source_meta,
     )
     concept_rel = f"{document_stem}.forge.md"
     try:
@@ -1541,6 +1788,12 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     density_ratio = 0.0
     density_floor_value = 0.0
     density_retried = False
+    # Map-reduce per-source density state (Task 1). The single-pass path
+    # leaves these empty/None so the op result shape stays stable.
+    density_failed_sources: list[str] = []
+    per_source_passes: list[int] = []
+    per_source_density: list[str] = []  # "pass" | "FAILED" | "n/a"
+    per_source_meta: list[dict[str, Any]] | None = None
 
     if use_map_reduce:
         # Resolve the model once for both the per-source and merge passes.
@@ -1555,8 +1808,12 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         readable = [s for s in sources if s.text]
         sections: list[str] = []
         per_source_finish_reasons: list[str | None] = []
+        density_failed_sources = []
+        per_source_passes = []
+        per_source_density = []
+        density_markers: list[str] = []
         for idx, spec in enumerate(readable, start=1):
-            section, sec_finish, _passed, _reason = await _forge_one_source(
+            section, sec_finish, _passed, _reason, failed, passes, marker = await _forge_one_source(
                 ctx,
                 spec=spec,
                 idx=idx,
@@ -1566,9 +1823,18 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 max_tokens=cfg.max_completion_tokens,
                 max_continue_attempts=cfg.max_continue_attempts,
                 max_continue_tokens=cfg.max_continue_tokens,
+                per_source_min_ratio=cfg.per_source_min_ratio,
             )
             sections.append(section)
             per_source_finish_reasons.append(sec_finish)
+            per_source_passes.append(passes)
+            if failed:
+                density_failed_sources.extend(failed)
+                per_source_density.append("FAILED")
+                if marker:
+                    density_markers.append(marker)
+            else:
+                per_source_density.append("pass")
         first_finish_reason = per_source_finish_reasons[0] if per_source_finish_reasons else None
         merged, merge_finish = await _merge_sections(
             ctx,
@@ -1590,6 +1856,14 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 response_preview=merged[:400],
             )
             return OperationResult(output_text=text)
+        # Inject consolidated per-source density markers after the merge.
+        # The merge pass rewrites sections, so inline section markers would
+        # not survive; we prepend a single non-rendering HTML comment block
+        # listing every failed source so the persisted document carries the
+        # honest-failure audit trail.
+        if density_markers:
+            marker_block = "\n\n".join(density_markers)
+            document = marker_block + "\n\n" + document
         final_finish_reason = merge_finish
         # The merge pass already ran continuation handling internally; the
         # merged document is the final artifact. Density is assessed on the
@@ -1700,11 +1974,14 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
 
     # ── Map-reduce density assessment (post-merge) ────────────────────
-    # For the map-reduce path, assess the merged document against the
-    # aggregate source bytes so the op result carries an honest density
-    # ratio. The per-source forge already enforced preservation; a failing
-    # ratio here is informational (the merge may have legitimately
-    # deduped), not a re-forge trigger.
+    # For the map-reduce path, the per-source forge already enforced
+    # preservation per source (Task 1). The global density_passed for the
+    # map-reduce path becomes ``density_failed_sources == []`` — honest
+    # per-source failures surface in the op result. We still compute the
+    # aggregate density_ratio against the merged document + total source
+    # bytes for telemetry (a failing aggregate ratio here is informational;
+    # the merge may have legitimately deduped), but it does NOT re-trigger
+    # a re-forge. The single-pass path keeps its own density floor (below).
     if use_map_reduce and sources and source_total > 0:
         density_floor_value = _density_floor_ratio(n_readable)
         density_violation = _density_floor_check(
@@ -1712,10 +1989,20 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             output_bytes=len(document.encode("utf-8")),
             source_count=n_readable,
         )
-        density_passed = density_violation is None
+        density_passed = not density_failed_sources
         density_ratio = (
             len(document.encode("utf-8")) / source_total if source_total else 1.0
         )
+        # Record per-source metadata for the OKF provenance ``Passes`` and
+        # ``Density`` columns (Task 2). Built here so it travels with the
+        # rest of the map-reduce state; the single-pass path leaves it None.
+        per_source_meta = [
+            {"passes": per_source_passes[i] if i < len(per_source_passes) else 0,
+             "density": per_source_density[i] if i < len(per_source_density) else "n/a"}
+            for i in range(n_readable)
+        ]
+    else:
+        per_source_meta = None
 
     # Lint/format the document so the persisted output is clean and consistent.
     document = _format_markdown(document)
@@ -1837,6 +2124,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             first_finish_reason=first_finish_reason,
             final_finish_reason=final_finish_reason,
             truncated=was_truncated,
+            per_source_meta=per_source_meta,
         )
 
     summary = (
@@ -1854,6 +2142,13 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             f" WARNING: density floor FAILED ({density_ratio:.0%} of "
             f"{source_total}B source; floor {density_floor_value:.0%}). "
             f"The persisted document may be a lossy abridgment — review it."
+        )
+    if density_failed_sources:
+        summary += (
+            f" WARNING: per-source density floor failed for "
+            f"{len(density_failed_sources)} source(s): "
+            f"{', '.join(density_failed_sources)}. See inline markers in "
+            f"the persisted document."
         )
     if okf_concept_path_written:
         summary += f" Provenance: `{okf_concept_path_written}`"
@@ -1873,6 +2168,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "density_ratio": density_ratio,
             "density_passed": density_passed,
             "density_retried": density_retried,
+            "density_failed_sources": density_failed_sources,
             "okf_provenance_path": okf_concept_path_written,
         },
         extra={

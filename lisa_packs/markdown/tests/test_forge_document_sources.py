@@ -713,3 +713,210 @@ async def test_no_source_paths_uses_original_system_prompt() -> None:
     assert "PRESERVE DETAIL" not in system_msg["content"]
     user_msg = next(m for m in captured_messages if m["role"] == "user")
     assert "## Source Documents" not in user_msg["content"]
+
+
+# ── Per-source density floor (map-reduce path, Task 1) ────────────────
+# These pin the 2026-08-02 per-source density-floor contract: a section
+# implausibly tiny relative to ITS source trips one retry; if the retry
+# still trips, the section is kept but annotated inline and the source
+# path surfaces in ``density_failed_sources``. The single-pass density
+# floor tests above are NOT modified — they pin _single_pass_pack_config()
+# and must stay green.
+
+
+# A section deliberately tiny relative to _SOURCE_A (~300 bytes): a
+# one-line stub is well under the 10% per-source floor (the floor trips
+# when section_bytes < 0.10 * source_bytes; ~300B source → ~30B floor).
+_ABRIDGED_SECTION = "# S\n"
+
+# A section preserving _SOURCE_A's substance (comparable size).
+_FULL_SECTION_A = (
+    "# Source A: SWOT\n\n"
+    "## Strengths\n- MCP-native architecture\n- 6 first-party MCP servers\n"
+    "- Fork mechanism\n- IPSAR FSM\n- OpenTelemetry\n- Pack ecosystem\n\n"
+    "## Weaknesses\n- Steeper learning curve\n- No A2A protocol\n"
+    "- No code sandbox\n- No browser automation\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_map_reduce_per_source_density_failure_surfaces_failed_paths() -> None:
+    """One source returns a tiny section; retry stays tiny → failed path + inline marker."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+    call_log: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        if "Per-Source Consolidation Section" in system_content:
+            # Inspect the source index in the user prompt to decide which source.
+            user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+            call_log.append({"phase": "per-source", "user": user_content})
+            # Source 1 (a.md): always tiny (retry stays tiny too).
+            if "Source 1" in user_content:
+                return _FakeCompletion(
+                    content=f"```markdown\n{_ABRIDGED_SECTION}\n```",
+                    finish_reason="stop",
+                )
+            # Source 2 (b.md): full section.
+            return _FakeCompletion(
+                content=f"```markdown\n{_FULL_SECTION_A}\n```",
+                finish_reason="stop",
+            )
+        if "Section Merge" in system_content:
+            call_log.append({"phase": "merge", "system": system_content})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        call_log.append({"phase": "unknown", "system": system_content})
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": ["a.md", "b.md"],
+        },
+        pack_config=_map_reduce_pack_config(),
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # The abridged source must surface in density_failed_sources.
+    failed = result.output_json.get("density_failed_sources") or []
+    assert "a.md" in failed
+    assert "b.md" not in failed
+    # The persisted document must carry the inline section density marker.
+    persisted = captures["writes"][0]["content"]
+    assert "section density floor failed" in persisted
+    # Source 1 must have been forged twice (initial + density retry); the
+    # retry used the per-source density-retry instruction.
+    per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
+    source_one_calls = [c for c in per_source_calls if "Source 1" in c["user"]]
+    assert len(source_one_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_map_reduce_per_source_density_retry_recovers() -> None:
+    """First per-source call tiny, retry full → density_failed_sources is empty."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+    call_log: list[dict[str, Any]] = []
+    # Track call index per source to flip the response on retry.
+    source_one_index = {"n": 0}
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        if "Per-Source Consolidation Section" in system_content:
+            user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+            call_log.append({"phase": "per-source", "user": user_content})
+            if "Source 1" in user_content:
+                source_one_index["n"] += 1
+                # First call tiny; retry (second call) full.
+                doc = _ABRIDGED_SECTION if source_one_index["n"] == 1 else _FULL_SECTION_A
+                return _FakeCompletion(
+                    content=f"```markdown\n{doc}\n```",
+                    finish_reason="stop",
+                )
+            return _FakeCompletion(
+                content=f"```markdown\n{_FULL_SECTION_A}\n```",
+                finish_reason="stop",
+            )
+        if "Section Merge" in system_content:
+            call_log.append({"phase": "merge", "system": system_content})
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        call_log.append({"phase": "unknown", "system": system_content})
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "n.md",
+            "source_paths": ["a.md", "b.md"],
+        },
+        pack_config=_map_reduce_pack_config(),
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    # The retry recovered → no failed sources and no inline marker.
+    failed = result.output_json.get("density_failed_sources") or []
+    assert failed == []
+    persisted = captures["writes"][0]["content"]
+    assert "section density floor failed" not in persisted
+    # Source 1 must have been forged twice (initial tiny + retry full).
+    per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
+    source_one_calls = [c for c in per_source_calls if "Source 1" in c["user"]]
+    assert len(source_one_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_okf_provenance_map_reduce_carries_passes_and_density_columns() -> None:
+    """The map-reduce OKF concept body carries the Passes and Density columns."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        messages = kwargs.get("messages", [])
+        system_content = next((m["content"] for m in messages if m["role"] == "system"), "")
+        if "Per-Source Consolidation Section" in system_content:
+            return _FakeCompletion(
+                content=f"```markdown\n{_FULL_SECTION_A}\n```",
+                finish_reason="stop",
+            )
+        if "Section Merge" in system_content:
+            return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+        return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "narrative.md",
+            "source_paths": ["a.md", "b.md"],
+            "okf_bundle_path": "okf/forge-provenance",
+        },
+        pack_config=_map_reduce_pack_config(),
+    )
+    await execute(ctx)
+    assert len(captures["okf_emits"]) == 1
+    body = captures["okf_emits"][0]["body"]
+    # The header must carry the two new columns.
+    assert "| # | Path | Priority | Bytes | Passes | Density | Treatment |" in body
+    # Each readable row must carry per-source pass/density values (1 pass,
+    # "pass" density — no retry needed when the section is full-size).
+    assert "| 1 | `a.md` |" in body
+    assert "| pass |" in body
+    assert "| 2 | `b.md` |" in body
+
+
+@pytest.mark.asyncio
+async def test_okf_provenance_single_pass_emits_na_density_columns() -> None:
+    """The single-pass OKF concept emits 0 passes and n/a density (stable table shape)."""
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A, "b.md": _SOURCE_B},
+    )
+    ctx = _make_ctx(
+        complete_fn=_fake_complete_returning(_FULL_OUTPUT),
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "narrative.md",
+            "source_paths": ["a.md", "b.md"],
+            "okf_bundle_path": "okf/forge-provenance",
+        },
+        pack_config=_single_pass_pack_config(),
+    )
+    await execute(ctx)
+    body = captures["okf_emits"][0]["body"]
+    # The header must carry the new columns even on the single-pass path.
+    assert "| # | Path | Priority | Bytes | Passes | Density | Treatment |" in body
+    # Single-pass path emits 0 passes and n/a density per source.
+    assert "| 0 | n/a |" in body
+    assert "| pass |" not in body
