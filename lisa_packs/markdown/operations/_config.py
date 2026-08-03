@@ -13,7 +13,25 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["cfg_int", "cfg_float", "cfg_bool"]
+__all__ = ["cfg_int", "cfg_float", "cfg_bool", "cfg_str"]
+
+
+def cfg_str(pack_config: Any, key: str, default: str) -> str:
+    """Read a string from ``ctx.pack_config`` with a module-constant fallback.
+
+    Same contract as :func:`cfg_int` but for free-form string values (e.g.
+    a CSV of lint rule identifiers). Coerces non-str values to their str()
+    form; ``None``/``""`` → default.
+    """
+    if pack_config is None:
+        return default
+    raw = pack_config.get(key)
+    if raw is None:
+        return default
+    text = str(raw)
+    if not text.strip():
+        return default
+    return text
 
 
 def cfg_int(pack_config: Any, key: str, default: int) -> int:

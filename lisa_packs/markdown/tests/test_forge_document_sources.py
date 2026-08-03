@@ -1011,6 +1011,18 @@ async def test_rolling_accumulation_extends_running_doc() -> None:
         if "Per-Source Consolidation Section" in system_content:
             call_log.append({"phase": "per-source"})
             return _FakeCompletion(content="```markdown\n# Section\n\nforged.\n```")
+        # Phase A: lint repair pass — the user prompt contains the lint
+        # issues block. Return the document with an H1 prepended so the
+        # MD041 violation is resolved and the chunk content survives.
+        user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
+        if "Structural lint issues to fix" in user_content:
+            call_log.append({"phase": "lint-repair"})
+            return _FakeCompletion(
+                content="```markdown\n# Consolidated Document\n\n"
+                + "## Chunk 1 section\n\ndetail from chunk 1.\n"
+                + "## Chunk 2 section\n\ndetail from chunk 2.\n```",
+                finish_reason="stop",
+            )
         call_log.append({"phase": "unknown"})
         return _FakeCompletion(content=f"```markdown\n{_FULL_OUTPUT}\n```")
 
@@ -1080,3 +1092,47 @@ async def test_rolling_accumulation_default_off_uses_map_reduce() -> None:
     assert captures["read_file_ranges"] == []
     # The op result must report rolling_accumulation_used=False.
     assert result.output_json.get("rolling_accumulation_used") is False
+
+
+# ── Phase A: advisory lint gate (consolidate) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_consolidate_lint_advisory_annotation() -> None:
+    """Consolidate persists a lint advisory comment when issues remain after repair is disabled."""
+    # A merged document that starts with an H2 (no H1) trips MD041.
+    no_h1_doc = (
+        "## Strengths\n"
+        "- MCP-native architecture\n"
+        "\n"
+        "## Weaknesses\n"
+        "- Steeper learning curve\n"
+    )
+    tool_fn, captures = _make_tool_executor(
+        stored_sources={"a.md": _SOURCE_A},
+    )
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        return _FakeCompletion(content=f"```markdown\n{no_h1_doc}\n```", finish_reason="stop")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={
+            "document_path": "narrative.md",
+            "source_paths": ["a.md"],
+        },
+        # Force single-pass and disable the lint repair pass so the advisory
+        # comment is the expected outcome.
+        pack_config={
+            **_single_pass_pack_config(),
+            "forge_lint_repair": False,
+        },
+    )
+    result = await execute(ctx)
+    assert "Document consolidated and stored" in result.output_text
+    assert result.output_json["lint_warnings"] >= 1
+    assert result.output_json["lint_repair_used"] is False
+    persisted = captures["writes"][0]["content"]
+    assert "lint warnings" in persisted

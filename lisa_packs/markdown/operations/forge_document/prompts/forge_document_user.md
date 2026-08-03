@@ -16,4 +16,5 @@ Existing document (revise this; start fresh if the placeholder says so):
 {existing_document}
 ```
 
+{target_length_guidance}
 Return the forged markdown document as a single fenced ```markdown block.

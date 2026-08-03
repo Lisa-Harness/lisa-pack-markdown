@@ -162,6 +162,7 @@ def _make_ctx(
     complete_fn: Any = None,
     resolve_model_fn: Any = None,
     execute_tool_fn: Any = None,
+    pack_config: dict[str, Any] | None = None,
 ) -> OperationExecutionContext:
     return OperationExecutionContext(
         workspace_id="test",
@@ -177,6 +178,7 @@ def _make_ctx(
         read_authored_text_fn=_make_loader(),
         execute_tool_fn=execute_tool_fn,
         params=params or {},
+        pack_config=pack_config,
     )
 
 
@@ -821,3 +823,270 @@ async def test_continuation_duplicate_tail_gives_up_and_marks_truncated() -> Non
     assert "truncated by model" in persisted
     # The duplicate tail must not have been merged — Opportunities still absent.
     assert "Opportunities" not in persisted
+
+# ── Phase A: advisory lint gate tests ──────────────────────────────────
+
+
+def _fake_complete_spy() -> tuple[Any, list[dict[str, Any]]]:
+    """Return a ``complete_fn`` that records every call's kwargs and returns a valid doc."""
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        calls.append(kwargs)
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    return _complete, calls
+
+
+@pytest.mark.asyncio
+async def test_clean_document_passes_lint_no_annotation() -> None:
+    """A clean document produces no lint comment in the persisted artifact."""
+    tool_fn, captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_fake_complete_returning(_VALID_DOCUMENT),
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert "Document forged" in result.output_text
+    persisted = captures["writes"][0]["content"]
+    assert "lint warnings" not in persisted
+    assert result.output_json["lint_warnings"] == 0
+    assert result.output_json["lint_repair_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_lint_issues_trigger_repair_pass() -> None:
+    """A document with a skipped heading level triggers one lint repair call."""
+    malformed = (
+        "# Title\n"
+        "\n"
+        "#### Skipped\n"  # MD001: h1 -> h4 skips levels
+        "\n"
+        "Body.\n"
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        calls.append(kwargs)
+        # First call returns the malformed doc; the repair call returns a fixed doc.
+        if len(calls) == 1:
+            return _FakeCompletion(content=f"```markdown\n{malformed}\n```", finish_reason="stop")
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```", finish_reason="stop")
+
+    tool_fn, captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert result.output_json["lint_repair_used"] is True
+    # Two complete_fn calls: initial forge + one lint repair.
+    assert len(calls) == 2
+    # The repair call's user prompt contains the lint issues block.
+    repair_user = calls[1]["messages"][1]["content"]
+    assert "Structural lint issues to fix" in repair_user
+
+
+@pytest.mark.asyncio
+async def test_lint_repair_disabled_by_config() -> None:
+    """When ``forge_lint_repair`` is False, issues persist as an advisory comment, no repair call."""
+    malformed = "# Title\n\n#### Skipped\n\nBody.\n"
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        calls.append(kwargs)
+        return _FakeCompletion(content=f"```markdown\n{malformed}\n```", finish_reason="stop")
+
+    tool_fn, captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        pack_config={"forge_lint_repair": False},
+    )
+    result = await execute(ctx)
+    assert result.output_json["lint_repair_used"] is False
+    assert result.output_json["lint_warnings"] >= 1
+    # Only the initial forge call — no repair pass.
+    assert len(calls) == 1
+    persisted = captures["writes"][0]["content"]
+    assert "lint warnings" in persisted
+
+
+@pytest.mark.asyncio
+async def test_pymarkdownlnt_missing_silently_skips() -> None:
+    """When the linter is unavailable, the op still succeeds (soft dependency)."""
+    malformed = "# Title\n\n#### Skipped\n\nBody.\n"
+    tool_fn, captures = _make_tool_executor()
+    import lisa_packs.markdown.operations.forge_document.forge_document as fd_mod
+
+    real_lint = fd_mod.lint_markdown
+
+    def _empty_lint(document: str, *, rules_csv: str | None = None) -> list:
+        return []
+
+    fd_mod.lint_markdown = _empty_lint  # type: ignore[assignment]
+    try:
+        ctx = _make_ctx(
+            complete_fn=_fake_complete_returning(malformed),
+            resolve_model_fn=_fake_resolve_model(),
+            execute_tool_fn=tool_fn,
+        )
+        result = await execute(ctx)
+    finally:
+        fd_mod.lint_markdown = real_lint  # type: ignore[assignment]
+    assert "Document forged" in result.output_text
+    assert result.output_json["lint_warnings"] == 0
+    persisted = captures["writes"][0]["content"]
+    assert "lint warnings" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_lint_repair_introduces_no_new_truncation() -> None:
+    """A repair pass that returns finish_reason=stop does not trigger continuation."""
+    malformed = "# Title\n\n#### Skipped\n\nBody.\n"
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return _FakeCompletion(content=f"```markdown\n{malformed}\n```", finish_reason="stop")
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```", finish_reason="stop")
+
+    tool_fn, captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert result.output_json["lint_repair_used"] is True
+    assert result.output_json["truncated"] is False
+    assert result.output_json["continue_attempts"] == 0
+
+
+# ── Phase B: target-length-driven budgeting tests ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_target_length_scales_max_tokens() -> None:
+    """A target_length derives max_tokens from the word target, not the flat 50k."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"target_length": 500},
+    )
+    await execute(ctx)
+    import math
+    expected = min(50_000, max(512, math.ceil(500 * 1.3)))
+    assert calls[0]["max_tokens"] == expected
+
+
+@pytest.mark.asyncio
+async def test_target_length_none_preserves_flat_budget() -> None:
+    """No target_length keeps the legacy flat 50k max_tokens (no regression)."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    await execute(ctx)
+    assert calls[0]["max_tokens"] == 50_000
+
+
+@pytest.mark.asyncio
+async def test_target_length_zero_coerced_to_default() -> None:
+    """target_length=0 coerces to the configured default target word count."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"target_length": 0},
+    )
+    await execute(ctx)
+    import math
+    from lisa_packs.markdown.operations.forge_document.forge_document import _DEFAULT_TARGET_WORDS
+
+    expected = min(50_000, max(512, math.ceil(_DEFAULT_TARGET_WORDS * 1.3)))
+    assert calls[0]["max_tokens"] == expected
+
+
+@pytest.mark.asyncio
+async def test_target_length_exceeds_char_cap_is_clamped() -> None:
+    """A target whose char equivalent exceeds max_document_chars is clamped down."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    # 10000 words * ~5 chars = 50000 chars, well over the 20000 default char cap.
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"target_length": 10_000},
+    )
+    await execute(ctx)
+    # Clamped to 20000 // 5 = 4000 words -> ceil(4000 * 1.3) = 5200 tokens.
+    import math
+    expected = min(50_000, max(512, math.ceil(4000 * 1.3)))
+    assert calls[0]["max_tokens"] == expected
+
+
+@pytest.mark.asyncio
+async def test_target_length_guidance_in_prompt() -> None:
+    """The target length guidance line appears in the user prompt only when set."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"target_length": 800},
+    )
+    await execute(ctx)
+    user_prompt = calls[0]["messages"][1]["content"]
+    assert "Target length: approximately 800 words" in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_target_length_none_omits_guidance_in_prompt() -> None:
+    """No target_length means no guidance line in the prompt (byte-identical to legacy)."""
+    _complete, calls = _fake_complete_spy()
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    await execute(ctx)
+    user_prompt = calls[0]["messages"][1]["content"]
+    assert "Target length" not in user_prompt
+
+
+@pytest.mark.asyncio
+async def test_target_length_scales_continue_budget() -> None:
+    """A truncating first pass uses a continuation budget scaled to the target."""
+    partial = "# Title\n\n## Section\n- item\n"  # will be detected as truncated via finish_reason
+    full = _VALID_DOCUMENT
+    complete_fn = _fake_complete_sequence(
+        documents=[partial, full],
+        finish_reasons=["length", "stop"],
+    )
+    tool_fn, _captures = _make_tool_executor()
+    ctx = _make_ctx(
+        complete_fn=complete_fn,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+        params={"target_length": 500},
+    )
+    result = await execute(ctx)
+    # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.3) = 650.
+    assert result.output_json["truncated"] is False
+    assert result.output_json["continue_attempts"] == 1

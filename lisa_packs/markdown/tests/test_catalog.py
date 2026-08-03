@@ -61,6 +61,22 @@ def test_outline_markdown_tool_discovered() -> None:
     assert tool["pack_id"] == "lisa-pack-markdown"
 
 
+def test_outline_markdown_tool_mode_allowlist_includes_okf() -> None:
+    """markdown_generate is available to the okf mode (opt-in primitive, Phase C).
+
+    The tool remains in the markdown pack; broadening ``mode_allowlist`` to
+    include ``okf`` enables the okf mode to opt in by listing it in its
+    ``allowed_tool_ids``. Promotion to a shared/core location is deferred
+    until >=3 modes consume it.
+    """
+    root = markdown.get_content_root() / "tools"
+    catalog = json.loads(build_tool_catalog_json([root]))
+    tool = catalog["markdown_generate"]
+    allowlist = set(tool["mode_allowlist"])
+    assert "markdown" in allowlist
+    assert "okf" in allowlist
+
+
 def test_markdown_mode_exposes_tools_directly() -> None:
     """The mode exposes storage/memory/outline tools directly plus the consolidate op."""
     root = markdown.get_content_root() / "modes"

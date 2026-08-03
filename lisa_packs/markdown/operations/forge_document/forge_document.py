@@ -38,12 +38,19 @@ from pydantic import BaseModel, Field
 
 from kernel.models import OperationExecutionContext, OperationResult, ToolExecutionContext
 
-from lisa_packs.markdown.operations._config import cfg_int
+from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
 from lisa_packs.markdown.operations._continuation import (
     coerce_finish_reason,
     continue_until_complete,
     extract_markdown_block,
 )
+from lisa_packs.markdown.operations._lint import (
+    LintIssue,
+    format_lint_issues,
+    lint_markdown,
+    lint_summary_comment,
+)
+from lisa_packs.markdown.operations._budget import target_words_to_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +85,7 @@ _EMPTY_DOCUMENT_PATH = f"{_PROMPT_DIR}/forge_document_empty_document.md"
 _NO_OUTLINE_PATH = f"{_PROMPT_DIR}/forge_document_no_outline.md"
 _STORAGE_FAILED_PATH = f"{_PROMPT_DIR}/forge_document_storage_failed.md"
 _CONTINUE_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_continue.md"
+_LINT_REPAIR_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_lint_repair.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
@@ -91,6 +99,22 @@ _MAX_CONTINUE_ATTEMPTS = 4
 _MAX_RECALL_RECORDS = 25
 _MAX_DOCUMENT_CHARS = 20_000
 _MAX_QUERY_CHARS = 20_000
+
+# Phase B: target-length-driven budgeting defaults. When ``target_length`` is
+# supplied, the first-pass ``max_tokens`` is derived from the word target
+# instead of the flat 50k ceiling, so the model knows how long the document
+# should be and truncation becomes rare. ``None`` (the default) preserves the
+# legacy flat budget exactly — no behavior change on the default path.
+_DEFAULT_TARGET_WORDS = 1200
+_DEFAULT_TOKENS_PER_WORD = 1.3
+_MIN_TARGET_WORDS = 100
+
+# Phase A: advisory lint gate defaults. ``forge_lint_rules`` overrides the
+# curated :data:`STRUCTURAL_RULES` subset; ``forge_lint_repair`` gates the
+# single repair pass. Lint is advisory — the outline gate stays the only
+# hard reject.
+_DEFAULT_LINT_RULES = ""
+_DEFAULT_LINT_REPAIR = True
 
 # Minimum structural bar for a forged document: at least one heading.
 _MIN_HEADINGS = 1
@@ -167,6 +191,15 @@ class Parameters(BaseModel):
         "opt out by including phrases like 'don't annotate the model' in the "
         "instruction. Set False to suppress unconditionally.",
     )
+    target_length: int | None = Field(
+        default=None,
+        ge=0,
+        description="Optional target word count for the forged document. When set, "
+        "the operation derives the first-pass max_tokens from this target "
+        "(target_words * tokens_per_word) and tells the model the approximate "
+        "length, so truncation becomes rare. 0 coerces to the default target. "
+        "None (the default) preserves the legacy flat 50k-token budget exactly.",
+    )
 
 
 def _extract_document_path(params: dict[str, Any]) -> str:
@@ -190,6 +223,11 @@ class _ResolvedSettings:
     max_recall_records: int
     max_document_chars: int
     max_query_chars: int
+    # Phase A: advisory lint gate
+    lint_rules: str
+    lint_repair: bool
+    # Phase B: target-length-driven budgeting
+    tokens_per_word: float
 
 
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
@@ -202,6 +240,9 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         max_recall_records=cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
         max_document_chars=cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
         max_query_chars=cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
+        lint_rules=cfg_str(pc, "forge_lint_rules", _DEFAULT_LINT_RULES),
+        lint_repair=cfg_bool(pc, "forge_lint_repair", _DEFAULT_LINT_REPAIR),
+        tokens_per_word=cfg_float(pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD),
     )
 
 
@@ -326,12 +367,17 @@ async def _call_llm(
     existing_document: str = "",
     *,
     max_tokens: int,
+    target_length_guidance: str = "",
 ) -> tuple[str, Any, str | None]:
     """Call the host's completion function with the forging prompt.
 
     Returns a ``(content, model_def, finish_reason)`` triple so the caller
     can annotate the document with the resolved model and detect
     mid-document truncation.
+
+    ``target_length_guidance`` is injected into the user prompt so the model
+    knows the approximate document length. Empty string (the default) leaves
+    the rendered prompt byte-identical to the legacy behavior.
     """
     if ctx.complete_fn is None or ctx.resolve_model_fn is None:
         raise RuntimeError("markdown requires complete_fn and resolve_model_fn")
@@ -348,6 +394,7 @@ async def _call_llm(
         user_input=user_input,
         memory_context=memory_context or "(no recalled context)",
         existing_document=existing_document or "(no existing document — start fresh)",
+        target_length_guidance=target_length_guidance,
     )
 
     messages = [
@@ -402,6 +449,110 @@ def _build_model_annotation(
         return ""
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d")
     return f"<!-- generated by lisa · {' · '.join(parts)} · {timestamp} -->"
+
+
+def _resolve_target_length(
+    params: dict[str, Any],
+    *,
+    max_document_chars: int,
+    tokens_per_word: float,
+) -> tuple[int | None, str, int]:
+    """Resolve the optional ``target_length`` into ``(words, guidance, max_tokens)``.
+
+    Returns ``(None, "", cfg.max_completion_tokens-equivalent)`` when no
+    target is supplied — the legacy flat-budget path. When a target is
+    supplied, returns the resolved word count, a prompt guidance line, and
+    a derived ``max_tokens`` budget (clamped to the document char cap so a
+    huge target cannot exceed what the char-cap would clip anyway).
+    """
+    raw = params.get("target_length")
+    if raw is None:
+        return None, "", 0  # 0 is a sentinel: caller uses the flat budget
+    try:
+        words = int(raw)
+    except (TypeError, ValueError):
+        return None, "", 0
+    if words == 0:
+        words = _DEFAULT_TARGET_WORDS
+    if words < _MIN_TARGET_WORDS:
+        words = _MIN_TARGET_WORDS
+
+    # Coherence: a target whose char equivalent exceeds the document char
+    # cap would be silently clipped post-merge. Clamp it down.
+    approx_chars = int(words * 5)  # ~5 chars/word English heuristic
+    if approx_chars > max_document_chars:
+        clamped = max(_MIN_TARGET_WORDS, max_document_chars // 5)
+        logger.warning(
+            "markdown: target_length=%d words (~%d chars) exceeds max_document_chars=%d; "
+            "clamping to %d words",
+            words,
+            approx_chars,
+            max_document_chars,
+            clamped,
+        )
+        words = clamped
+
+    max_tokens = target_words_to_max_tokens(words, tokens_per_word=tokens_per_word)
+    guidance = (
+        f"Target length: approximately {words} words "
+        f"({max(2, words // 200)} sections suggested)."
+    )
+    return words, guidance, max_tokens
+
+
+async def _lint_repair_pass(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    document: str,
+    model_def: Any,
+    issues: list[LintIssue],
+    max_tokens: int,
+) -> str:
+    """Issue one repair pass feeding the lint issues back to the model.
+
+    Returns the repaired document text (extracted from the fenced
+    markdown block), or the original ``document`` on any failure. Never
+    raises; lint is advisory.
+    """
+    if not issues:
+        return document
+    if ctx.complete_fn is None:
+        return document
+    try:
+        repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
+    except RuntimeError as exc:
+        logger.warning("markdown: lint repair prompt unavailable: %s", exc)
+        return document
+    user_prompt = _format_template(
+        repair_prompt,
+        user_input=user_input,
+        lint_issues=format_lint_issues(issues),
+        document_so_far=document,
+    )
+    messages = [
+        {"role": "system", "content": _load_text(ctx, _SYSTEM_PROMPT_PATH)},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        completion = await ctx.complete_fn(
+            messages=messages,
+            model_def=model_def,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            tools=None,
+            response_format=None,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("markdown: lint repair pass raised: %s", exc)
+        return document
+    content = (getattr(completion, "content", "") or "").strip()
+    if not content:
+        return document
+    repaired = extract_markdown_block(content)
+    if not repaired.strip():
+        return document
+    return repaired
 
 
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
@@ -516,12 +667,32 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         except RuntimeError as exc:
             return OperationResult(output_text=str(exc))
 
+    # Phase B: resolve optional target_length into a derived max_tokens and
+    # prompt guidance. ``target_words is None`` preserves the legacy flat
+    # 50k-token budget exactly — no behavior change on the default path.
+    target_words, target_guidance, derived_max_tokens = _resolve_target_length(
+        params,
+        max_document_chars=cfg.max_document_chars,
+        tokens_per_word=cfg.tokens_per_word,
+    )
+    first_pass_max_tokens = (
+        derived_max_tokens if target_words is not None else cfg.max_completion_tokens
+    )
+    # Scale the continuation budget with the target so a small target does
+    # not retain the 50k continuation ceiling (which would re-truncate).
+    first_pass_continue_tokens = (
+        min(cfg.max_continue_tokens, first_pass_max_tokens * 2)
+        if target_words is not None
+        else cfg.max_continue_tokens
+    )
+
     completion_text, model_def, first_finish_reason = await _call_llm(
         ctx,
         user_input,
         memory_context,
         existing_document=existing_document,
-        max_tokens=cfg.max_completion_tokens,
+        max_tokens=first_pass_max_tokens,
+        target_length_guidance=target_guidance,
     )
     if not completion_text or not completion_text.strip():
         return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
@@ -546,7 +717,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             model_def=model_def,
             first_finish_reason=first_finish_reason,
             max_continue_attempts=cfg.max_continue_attempts,
-            max_continue_tokens=cfg.max_continue_tokens,
+            max_continue_tokens=first_pass_continue_tokens,
             continue_prompt_path=_CONTINUE_PROMPT_PATH,
         )
     )
@@ -584,6 +755,44 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         return OperationResult(output_text=text)
 
+    # Phase A: advisory lint gate. Lint is never a hard reject — the outline
+    # gate above is the only hard gate. When issues are found and
+    # ``forge_lint_repair`` is set, issue one repair pass feeding the lint
+    # issues back to the model; re-format and re-validate. Any issues that
+    # remain (or when repair is disabled) are persisted as a non-rendering
+    # HTML comment so the user knows the artifact has warnings.
+    lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    lint_repair_used = False
+    if lint_issues and cfg.lint_repair:
+        repaired = await _lint_repair_pass(
+            ctx,
+            user_input=user_input,
+            document=document,
+            model_def=model_def,
+            issues=lint_issues,
+            max_tokens=first_pass_max_tokens,
+        )
+        if repaired != document:
+            lint_repair_used = True
+            document = _format_markdown(repaired)
+            # Re-validate the repaired document's outline.
+            try:
+                outline = await _validate_outline(ctx, document)
+            except RuntimeError as exc:
+                return OperationResult(output_text=str(exc))
+            heading_count = int(outline.get("heading_count", 0) or 0)
+            if heading_count < _MIN_HEADINGS:
+                text = _format_template(
+                    _load_text(ctx, _NO_OUTLINE_PATH),
+                    heading_count=heading_count,
+                )
+                return OperationResult(output_text=text)
+            lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    if lint_issues:
+        comment = lint_summary_comment(lint_issues)
+        if comment:
+            document = document.rstrip() + "\n\n" + comment + "\n"
+
     try:
         write_response = await _persist_document(ctx, document, document_path)
     except RuntimeError as exc:
@@ -614,6 +823,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             f"continuation attempt(s) (final finish_reason="
             f"{final_finish_reason!r}). See annotation in document."
         )
+    if lint_issues:
+        summary += (
+            f" Note: {len(lint_issues)} structural lint warning(s) remain "
+            f"after {'a' if lint_repair_used else 'no'} repair pass; see lint comment in document."
+        )
     return OperationResult(
         output_text=summary,
         output_json={
@@ -625,11 +839,16 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "continue_attempts": continue_attempts,
             "first_finish_reason": first_finish_reason,
             "final_finish_reason": final_finish_reason,
+            "lint_warnings": len(lint_issues),
+            "lint_repair_used": lint_repair_used,
+            "target_words": target_words,
         },
         extra={
             "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
             "document_path": stored_path,
             "truncated": was_truncated,
             "continue_attempts": continue_attempts,
+            "lint_warnings": len(lint_issues),
+            "target_words": target_words,
         },
     )

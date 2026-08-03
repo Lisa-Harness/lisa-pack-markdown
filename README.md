@@ -1,0 +1,68 @@
+# lisa-pack-markdown
+
+Lisa markdown pack — memory-grounded markdown document forging with `markdown-it-py`.
+
+The pack turns a user instruction into a markdown document that is (a) grounded in recalled long-term memory, (b) structurally validated, and (c) persisted to the `lisa-storage` MCP server. It never touches the local filesystem directly — all reads (memory) and writes (storage) go through `ctx.execute_tool_fn`.
+
+## What it provides
+
+| Layer | Path | Role |
+| --- | --- | --- |
+| Mode | `modes/markdown/_mode.md` | A routable chat mode (`markdown`) matching write/forge intents. |
+| Operations | `operations/forge_document/`, `operations/consolidate/` | The two workhorses (single-doc and multi-source). |
+| Tool | `tools/markdown_generate/` | An in-process, read-only structural validator backed by `markdown-it-py`. |
+
+### Operations
+
+- **`markdown_forge_document`** — combine user input with recalled memory context (and optionally an existing document), synthesize or revise a markdown document via an LLM, validate its structure, and persist it to `lisa-storage`.
+- **`markdown_consolidate_sources`** — consolidate multiple source documents into one coherent markdown document, preserving per-source detail (anti-abridgment). Reads every source via `lisa-storage`, injects them with per-source NL priority notes, applies map-reduce when the aggregate is large, enforces a density floor against lossy summarization, and captures OKF provenance.
+
+### The `markdown_generate` tool
+
+A pure read-effect tool that parses a markdown string with `markdown-it-py` and returns a normalized structural outline. It never touches the filesystem. It accepts the markdown text on `parameters["markdown"]` (or `ctx.query` as a fallback) and returns the outline on `output_json` plus a one-line summary on `output_text`.
+
+**`output_json` shape:**
+
+```json
+{
+  "heading_count": 3,
+  "headings": [{"level": 1, "text": "Title"}, {"level": 2, "text": "Section"}],
+  "lists": {"ordered": 1, "unordered": 2, "max_depth": 2},
+  "code": {"fenced_blocks": 1, "inline_spans": 4},
+  "has_content": true
+}
+```
+
+## Reusing `markdown_generate` from other packs (opt-in)
+
+`markdown_generate` is a stateless, read-only primitive — other packs can deliberately adopt it. The tool is **not** blanket-enabled; reuse is opt-in and gated by two declarations that must agree:
+
+1. The tool's own `mode_allowlist` (in `tools/markdown_generate/markdown_generate.tool.yml`) lists the modes that may load it. It currently includes `markdown` and `okf`.
+2. A consuming mode adds `markdown_generate` to its `allowed_tool_ids` (in its `_mode.md`).
+
+Both must agree for the tool to be usable in a mode. The pack `lisa-pack-markdown` must be installed in the host environment.
+
+### Promotion rule
+
+`markdown_generate` remains in the markdown pack until **three or more** modes consume it. Promotion to a shared/core tool location is a separate, deliberate decision deferred until the consumer count proves the need. Adding `okf` to the `mode_allowlist` enables the possibility; it does not make `okf` consume the tool (that is `okf`'s opt-in decision when it has a concrete use case).
+
+## Configuration
+
+Budgets and behavior are resolved from `ctx.pack_config` (the session manifest's `resources.packs.configuration.markdown.<key>` block) with module-constant fallbacks. Notable keys:
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `forge_max_completion_tokens` | 50000 | First-pass LLM token budget. |
+| `forge_max_continue_attempts` | 4 | Max continuation passes on truncation. |
+| `forge_max_document_chars` | 20000 | Hard char cap on the persisted doc. |
+| `forge_lint_rules` | (curated subset) | CSV of `pymarkdownlnt` rule IDs; overrides the structural default. |
+| `forge_lint_repair` | true | Gate the single lint repair pass; false persists an advisory comment. |
+| `forge_tokens_per_word` | 1.3 | Words→tokens translation factor for `target_length`-driven budgeting. |
+
+## Installation
+
+```powershell
+pip install -e ./markdown
+```
+
+The canonical interpreter is the framework venv at `../lisa/.venv` (see the repo README). Do not create a venv in the pack.

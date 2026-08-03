@@ -25,6 +25,7 @@ dependencies = [
     "lisa-sdk",
     "markdown-it-py>=3.0.0",
     "mdformat>=0.7.0",
+    "pymarkdownlnt>=0.9",
 ]
 
 [project.optional-dependencies]

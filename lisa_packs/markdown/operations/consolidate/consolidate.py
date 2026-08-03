@@ -41,7 +41,13 @@ from pydantic import BaseModel, Field
 
 from kernel.models import OperationExecutionContext, OperationResult, ToolExecutionContext
 
-from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int
+from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
+from lisa_packs.markdown.operations._lint import (
+    LintIssue,
+    format_lint_issues,
+    lint_markdown,
+    lint_summary_comment,
+)
 from lisa_packs.markdown.operations._continuation import (
     coerce_finish_reason,
     continue_until_complete,
@@ -94,6 +100,7 @@ _EMPTY_RESPONSE_PATH = f"{_PROMPT_DIR}/consolidate_empty_response.md"
 _EMPTY_DOCUMENT_PATH = f"{_PROMPT_DIR}/consolidate_empty_document.md"
 _NO_OUTLINE_PATH = f"{_PROMPT_DIR}/consolidate_no_outline.md"
 _STORAGE_FAILED_PATH = f"{_PROMPT_DIR}/consolidate_storage_failed.md"
+_LINT_REPAIR_PROMPT_PATH = f"{_PROMPT_DIR}/consolidate_lint_repair.md"
 
 # User-instruction phrases that opt out of model attribution.
 _NO_ANNOTATE_PHRASES = (
@@ -132,6 +139,9 @@ _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD = 5
 _DENSITY_RETRY_ATTEMPTS = 2
 # Per-source density floor (map-reduce path).
 _PER_SOURCE_MIN_RATIO = 0.10
+# Phase A: advisory lint gate defaults (mirrors forge_document).
+_DEFAULT_LINT_RULES = ""
+_DEFAULT_LINT_REPAIR = True
 
 # Minimum structural bar for a forged document: at least one heading.
 _MIN_HEADINGS = 1
@@ -224,6 +234,9 @@ class _ResolvedSettings:
     forge_rolling_accumulation: bool
     forge_rolling_incremental_persist: bool
     density_retry_attempts: int
+    # Phase A: advisory lint gate
+    lint_rules: str
+    lint_repair: bool
 
 
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
@@ -243,6 +256,8 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         forge_rolling_accumulation=cfg_bool(pc, "forge_rolling_accumulation", False),
         forge_rolling_incremental_persist=cfg_bool(pc, "forge_rolling_incremental_persist", False),
         density_retry_attempts=cfg_int(pc, "forge_density_retry_attempts", _DENSITY_RETRY_ATTEMPTS),
+        lint_rules=cfg_str(pc, "forge_lint_rules", _DEFAULT_LINT_RULES),
+        lint_repair=cfg_bool(pc, "forge_lint_repair", _DEFAULT_LINT_REPAIR),
     )
 
 
@@ -373,6 +388,62 @@ def _user_asked_not_to_annotate(user_input: str) -> bool:
     """Return True when the user instruction explicitly opts out of attribution."""
     lowered = user_input.lower()
     return any(phrase in lowered for phrase in _NO_ANNOTATE_PHRASES)
+
+
+async def _lint_repair_pass(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    document: str,
+    model_def: Any,
+    issues: list[LintIssue],
+    max_tokens: int,
+) -> str:
+    """Issue one advisory lint repair pass feeding issues back to the model.
+
+    Uses the consolidate source-aware system prompt so the repair respects
+    the preserve-detail directive. Returns the repaired document text or
+    the original ``document`` on any failure. Never raises; lint is advisory.
+    """
+    if not issues:
+        return document
+    if ctx.complete_fn is None:
+        return document
+    try:
+        repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
+        system_prompt = _load_text(ctx, _SYSTEM_PROMPT_SOURCES_PATH)
+    except RuntimeError as exc:
+        logger.warning("consolidate: lint repair prompt unavailable: %s", exc)
+        return document
+    user_prompt = _format_template(
+        repair_prompt,
+        user_input=user_input,
+        lint_issues=format_lint_issues(issues),
+        document_so_far=document,
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    try:
+        completion = await ctx.complete_fn(
+            messages=messages,
+            model_def=model_def,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            tools=None,
+            response_format=None,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("consolidate: lint repair pass raised: %s", exc)
+        return document
+    content = (getattr(completion, "content", "") or "").strip()
+    if not content:
+        return document
+    repaired = extract_markdown_block(content)
+    if not repaired.strip():
+        return document
+    return repaired
 
 
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
@@ -1547,6 +1618,43 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         return OperationResult(output_text=text)
 
+    # Phase A: advisory lint gate (mirrors forge_document). Lint is never a
+    # hard reject; the outline gate above is the only hard gate. One repair
+    # pass when ``forge_lint_repair`` is set; residual issues are persisted
+    # as a non-rendering HTML comment so the user knows the artifact has
+    # warnings. The repair pass uses the source-aware system prompt so the
+    # preserve-detail directive still applies.
+    lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    lint_repair_used = False
+    if lint_issues and cfg.lint_repair:
+        repaired = await _lint_repair_pass(
+            ctx,
+            user_input=user_input,
+            document=document,
+            model_def=model_def,
+            issues=lint_issues,
+            max_tokens=cfg.max_completion_tokens,
+        )
+        if repaired != document:
+            lint_repair_used = True
+            document = _format_markdown(repaired)
+            try:
+                outline = await _validate_outline(ctx, document)
+            except RuntimeError as exc:
+                return OperationResult(output_text=str(exc))
+            heading_count = int(outline.get("heading_count", 0) or 0)
+            if heading_count < _MIN_HEADINGS:
+                text = _format_template(
+                    _load_text(ctx, _NO_OUTLINE_PATH),
+                    heading_count=heading_count,
+                )
+                return OperationResult(output_text=text)
+            lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    if lint_issues:
+        comment = lint_summary_comment(lint_issues)
+        if comment:
+            document = document.rstrip() + "\n\n" + comment + "\n"
+
     try:
         write_response = await _persist_document(ctx, document, document_path)
     except RuntimeError as exc:
@@ -1614,6 +1722,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
     if okf_concept_path_written:
         summary += f" Provenance: `{okf_concept_path_written}`"
+    if lint_issues:
+        summary += (
+            f" Note: {len(lint_issues)} structural lint warning(s) remain "
+            f"after {'a' if lint_repair_used else 'no'} repair pass; see lint comment in document."
+        )
     return OperationResult(
         output_text=summary,
         output_json={
@@ -1633,6 +1746,8 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "density_retried": density_retried,
             "density_failed_sources": density_failed_sources,
             "okf_provenance_path": okf_concept_path_written,
+            "lint_warnings": len(lint_issues),
+            "lint_repair_used": lint_repair_used,
         },
         extra={
             "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
@@ -1641,5 +1756,6 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "continue_attempts": continue_attempts,
             "source_count": n_readable,
             "density_passed": density_passed,
+            "lint_warnings": len(lint_issues),
         },
     )
