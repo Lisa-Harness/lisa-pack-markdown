@@ -61,6 +61,7 @@ class _FakeCompletion:
     tool_calls: list[Any] | None = None
     usage: Any = None
     finish_reason: str | None = "stop"
+    truncated: bool | None = False
 
 
 def _make_tool_executor(
@@ -232,6 +233,14 @@ def _make_ctx(
     execute_tool_fn: Any = None,
     pack_config: dict[str, Any] | None = None,
 ) -> OperationExecutionContext:
+    from kernel.seams.host_adapter import _CallableHost
+
+    host = _CallableHost(
+        complete_fn=complete_fn,
+        resolve_model_fn=resolve_model_fn,
+        read_authored_text_fn=_make_loader(),
+        execute_tool_fn=execute_tool_fn,
+    )
     return OperationExecutionContext(
         workspace_id="test",
         user_id="test-user",
@@ -241,10 +250,7 @@ def _make_ctx(
         memory_scope="personal",
         mode_id="markdown",
         query=query,
-        complete_fn=complete_fn,
-        resolve_model_fn=resolve_model_fn,
-        read_authored_text_fn=_make_loader(),
-        execute_tool_fn=execute_tool_fn,
+        host=host,
         params=params or {},
         pack_config=pack_config or {},
     )

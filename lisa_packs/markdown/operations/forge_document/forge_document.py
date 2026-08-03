@@ -40,7 +40,6 @@ from kernel.models import OperationExecutionContext, OperationResult, ToolExecut
 
 from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
 from lisa_packs.markdown.operations._continuation import (
-    coerce_finish_reason,
     continue_until_complete,
     extract_markdown_block,
 )
@@ -126,14 +125,15 @@ def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     Fails loudly when the loader is not wired, returns empty/None, or raises.
     Per the pack-content rule: no fallbacks to missing content.
     """
-    if not callable(ctx.read_authored_text_fn):
+    host = ctx.host
+    if host is None:
         raise RuntimeError(
-            f"read_authored_text_fn is not wired; cannot load authored content at {path}"
+            f"OperationHost is not wired; cannot load authored content at {path}"
         )
     try:
-        loaded = str(ctx.read_authored_text_fn(path) or "").strip()
+        loaded = host.read_authored_text(path).strip()
     except Exception as exc:  # pylint: disable=broad-except
-        raise RuntimeError(f"read_authored_text_fn failed for {path}: {exc}") from exc
+        raise RuntimeError(f"read_authored_text failed for {path}: {exc}") from exc
     if not loaded:
         raise RuntimeError(f"Authored text at {path} is empty or missing")
     return loaded
@@ -264,7 +264,7 @@ async def _read_existing_document(
     exist yet (a normal condition for a first forge). Raises ``RuntimeError``
     on any other tool failure.
     """
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _READ_TOOL_ID,
         ToolExecutionContext(
             tool_id=_READ_TOOL_ID,
@@ -304,11 +304,11 @@ async def _recall_memory(
     Returns a newline-formatted context block (possibly empty). Raises
     ``RuntimeError`` only when the tool executor itself is missing.
     """
-    if not callable(ctx.execute_tool_fn):
-        raise RuntimeError("markdown requires execute_tool_fn to call memory/storage tools")
+    if ctx.host is None:
+        raise RuntimeError("markdown requires OperationHost to call memory/storage tools")
 
     recall_limit = max(1, min(int(limit), 20))
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _MEMORY_SEARCH_TOOL_ID,
         ToolExecutionContext(
             tool_id=_MEMORY_SEARCH_TOOL_ID,
@@ -368,22 +368,24 @@ async def _call_llm(
     *,
     max_tokens: int,
     target_length_guidance: str = "",
-) -> tuple[str, Any, str | None]:
+) -> tuple[str, Any, bool | None, str | None]:
     """Call the host's completion function with the forging prompt.
 
-    Returns a ``(content, model_def, finish_reason)`` triple so the caller
-    can annotate the document with the resolved model and detect
-    mid-document truncation.
+    Returns a ``(content, model_def, truncated, finish_reason)`` quadruple
+    so the caller can annotate the document with the resolved model and
+    detect mid-document truncation via the provider-owned ``truncated``
+    signal. ``finish_reason`` is kept for telemetry only.
 
     ``target_length_guidance`` is injected into the user prompt so the model
     knows the approximate document length. Empty string (the default) leaves
     the rendered prompt byte-identical to the legacy behavior.
     """
-    if ctx.complete_fn is None or ctx.resolve_model_fn is None:
-        raise RuntimeError("markdown requires complete_fn and resolve_model_fn")
+    host = ctx.host
+    if host is None:
+        raise RuntimeError("markdown requires OperationHost.complete and OperationHost.resolve_model")
 
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
-    model_def = ctx.resolve_model_fn(preferred_model_id)
+    model_def = host.resolve_model(preferred_model_id)
     if model_def is None:
         raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
 
@@ -401,7 +403,7 @@ async def _call_llm(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    completion = await ctx.complete_fn(
+    completion = await host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -410,8 +412,9 @@ async def _call_llm(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
-    return content.strip(), model_def, finish_reason
+    truncated = getattr(completion, "truncated", None)
+    finish_reason = getattr(completion, "finish_reason", None)
+    return content.strip(), model_def, truncated, finish_reason
 
 
 def _user_asked_not_to_annotate(user_input: str) -> bool:
@@ -513,11 +516,11 @@ async def _lint_repair_pass(
 
     Returns the repaired document text (extracted from the fenced
     markdown block), or the original ``document`` on any failure. Never
-    raises; lint is advisory.
+    raises; advisory.
     """
     if not issues:
         return document
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return document
     try:
         repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
@@ -535,7 +538,7 @@ async def _lint_repair_pass(
         {"role": "user", "content": user_prompt},
     ]
     try:
-        completion = await ctx.complete_fn(
+        completion = await ctx.host.complete(
             messages=messages,
             model_def=model_def,
             max_tokens=max_tokens,
@@ -556,11 +559,11 @@ async def _lint_repair_pass(
 
 
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
-    """Run the ``markdown_generate`` tool and return its outline dict.
+    """Run the ``markdown_gehost.execute_toolnd return its outline dict.
 
     Raises ``RuntimeError`` if the tool returns an error.
     """
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _OUTLINE_TOOL_ID,
         ToolExecutionContext(
             tool_id=_OUTLINE_TOOL_ID,
@@ -593,11 +596,11 @@ async def _persist_document(
     path: str,
 ) -> dict[str, Any]:
     """Write the document to lisa-storage via the ``write_file`` tool.
-
+host.execute_tool
     Returns the parsed JSON response (with ``ok``/``path``/``bytes``).
     Raises ``RuntimeError`` on any tool failure.
     """
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _WRITE_TOOL_ID,
         ToolExecutionContext(
             tool_id=_WRITE_TOOL_ID,
@@ -651,7 +654,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     except RuntimeError as exc:
         return OperationResult(output_text=str(exc))
 
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         return OperationResult(output_text=_load_text(ctx, _USAGE_PATH))
 
     recall_limit = int(params.get("limit") or cfg.max_recall_records)
@@ -685,8 +688,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         if target_words is not None
         else cfg.max_continue_tokens
     )
-
-    completion_text, model_def, first_finish_reason = await _call_llm(
+    completion_text, model_def, first_truncated, first_finish_reason = await _call_llm(
         ctx,
         user_input,
         memory_context,
@@ -705,16 +707,17 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         return OperationResult(output_text=text)
 
-    # Truncation handling: when the first pass stopped mid-document
-    # (finish_reason in {length, unknown, None}), issue up to
-    # cfg.max_continue_attempts continuation passes. See
-    # /memories/repo/forge-document-truncation-contract.md.
+    # Truncation handling: the provider-owned ``truncated`` signal drives
+    # the decision. ``True`` → continue up to the budget; ``False`` → no
+    # continuation (unless a dangling-heading structural override fires);
+    # ``None`` → one safety-net pass, then stop.
     document, was_truncated, continue_attempts, final_finish_reason = (
         await continue_until_complete(
             ctx,
             user_input=user_input,
             document=document,
             model_def=model_def,
+            first_truncated=first_truncated,
             first_finish_reason=first_finish_reason,
             max_continue_attempts=cfg.max_continue_attempts,
             max_continue_tokens=first_pass_continue_tokens,

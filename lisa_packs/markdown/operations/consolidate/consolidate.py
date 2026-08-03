@@ -10,7 +10,7 @@ Pipeline:
 
 1. Parse + expand + read every source via ``lisa-storage`` tools
    (``list_files`` for globs, ``read_file`` for content) through
-   ``ctx.execute_tool_fn``.
+   ``ctx.host.execute_tool``.
 2. Recall memory context via the ``memory.search`` MCP alias.
 3. Forge the consolidated document. For small aggregates a single
    preserve-detail pass suffices; for aggregates at/above the map-reduce
@@ -22,8 +22,8 @@ Pipeline:
 5. Persist via ``write_file`` and capture full OKF provenance.
 
 The operation never touches the filesystem directly — all reads (sources,
-memory) and writes (document, provenance) go through ``ctx.execute_tool_fn``.
-Authored prompts are loaded via ``ctx.read_authored_text_fn``; per the
+memory) and writes (document, provenance) go through ``ctx.host.execute_tool``.
+Authored prompts are loaded via ``ctx.host.read_authored_text``; per the
 pack-content rule, a missing/empty loader raises rather than silently
 falling back.
 """
@@ -49,7 +49,6 @@ from lisa_packs.markdown.operations._lint import (
     lint_summary_comment,
 )
 from lisa_packs.markdown.operations._continuation import (
-    coerce_finish_reason,
     continue_until_complete,
     extract_markdown_block,
 )
@@ -74,7 +73,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["Parameters", "execute"]
 
 # Tool ids — declared in the operation YAML ``tool_ids`` and routed through
-# ``ctx.execute_tool_fn``.
+# ``ctx.host.execute_tool``.
 _OUTLINE_TOOL_ID = "markdown_generate"
 _WRITE_TOOL_ID = "write_file"
 _READ_TOOL_ID = "read_file"
@@ -83,7 +82,7 @@ _MEMORY_SEARCH_TOOL_ID = "memory.search"
 _OKF_EMIT_TOOL_ID = "okf_emit_concept"
 _OKF_LOG_TOOL_ID = "okf_log"
 
-# Authored-text paths — loaded via ctx.read_authored_text_fn (SDK loader).
+# Authored-text paths — loaded via ctx.host.read_authored_text (SDK loader).
 _PROMPT_DIR = "operations/consolidate/prompts"
 _SYSTEM_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/consolidate_system_sources.md"
 _USER_PROMPT_SOURCES_PATH = f"{_PROMPT_DIR}/consolidate_user_sources.md"
@@ -149,12 +148,12 @@ _MIN_HEADINGS = 1
 
 def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     """Load authored markdown via the SDK content-registry loader."""
-    if not callable(ctx.read_authored_text_fn):
+    if ctx.host is None:
         raise RuntimeError(
             f"read_authored_text_fn is not wired; cannot load authored content at {path}"
         )
     try:
-        loaded = str(ctx.read_authored_text_fn(path) or "").strip()
+        loaded = str(ctx.host.read_authored_text(path) or "").strip()
     except Exception as exc:  # pylint: disable=broad-except
         raise RuntimeError(f"read_authored_text_fn failed for {path}: {exc}") from exc
     if not loaded:
@@ -285,11 +284,11 @@ async def _recall_memory(
     limit: int,
 ) -> str:
     """Recall relevant memories via the ``memory.search`` MCP alias."""
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         raise RuntimeError("markdown requires execute_tool_fn to call memory/storage tools")
 
     recall_limit = max(1, min(int(limit), 20))
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _MEMORY_SEARCH_TOOL_ID,
         ToolExecutionContext(
             tool_id=_MEMORY_SEARCH_TOOL_ID,
@@ -350,11 +349,11 @@ async def _call_llm(
     max_tokens: int,
 ) -> tuple[str, Any, str | None]:
     """Call the host's completion function with the source-aware consolidate prompt."""
-    if ctx.complete_fn is None or ctx.resolve_model_fn is None:
+    if ctx.host is None:
         raise RuntimeError("markdown requires complete_fn and resolve_model_fn")
 
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
-    model_def = ctx.resolve_model_fn(preferred_model_id)
+    model_def = ctx.host.resolve_model(preferred_model_id)
     if model_def is None:
         raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
 
@@ -371,7 +370,7 @@ async def _call_llm(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    completion = await ctx.complete_fn(
+    completion = await ctx.host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -381,7 +380,8 @@ async def _call_llm(
     )
     content = getattr(completion, "content", "") or ""
     finish_reason = getattr(completion, "finish_reason", None)
-    return content.strip(), model_def, coerce_finish_reason(finish_reason)
+    truncated = getattr(completion, "truncated", None)
+    return content.strip(), model_def, truncated, finish_reason
 
 
 def _user_asked_not_to_annotate(user_input: str) -> bool:
@@ -407,7 +407,7 @@ async def _lint_repair_pass(
     """
     if not issues:
         return document
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return document
     try:
         repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
@@ -426,7 +426,7 @@ async def _lint_repair_pass(
         {"role": "user", "content": user_prompt},
     ]
     try:
-        completion = await ctx.complete_fn(
+        completion = await ctx.host.complete(
             messages=messages,
             model_def=model_def,
             max_tokens=max_tokens,
@@ -448,7 +448,7 @@ async def _lint_repair_pass(
 
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
     """Run the ``markdown_generate`` tool and return its outline dict."""
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _OUTLINE_TOOL_ID,
         ToolExecutionContext(
             tool_id=_OUTLINE_TOOL_ID,
@@ -481,7 +481,7 @@ async def _persist_document(
     path: str,
 ) -> dict[str, Any]:
     """Write the document to lisa-storage via the ``write_file`` tool."""
-    tool_result = await ctx.execute_tool_fn(
+    tool_result = await ctx.host.execute_tool(
         _WRITE_TOOL_ID,
         ToolExecutionContext(
             tool_id=_WRITE_TOOL_ID,
@@ -578,7 +578,7 @@ async def _reforge_for_density(
     max_tokens: int,
 ) -> tuple[str, str | None]:
     """Issue one density-retry forge pass with a sharpened instruction."""
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return "", None
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_SOURCES_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_SOURCES_PATH)
@@ -608,7 +608,7 @@ async def _reforge_for_density(
         {"role": "user", "content": retry_instruction},
     ]
     logger.warning("consolidate: density floor violated — %s", violation)
-    completion = await ctx.complete_fn(
+    completion = await ctx.host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -617,7 +617,7 @@ async def _reforge_for_density(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
+    finish_reason = getattr(completion, "finish_reason", None)
     return content.strip(), finish_reason
 
 
@@ -643,7 +643,7 @@ async def _reforge_one_source_for_density(
     signature symmetry with the other forge helpers but are not used here —
     continuation handling for the retry section is the caller's job.
     """
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return "", None
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
@@ -677,7 +677,7 @@ async def _reforge_one_source_for_density(
         {"role": "user", "content": retry_instruction},
     ]
     logger.warning("consolidate: per-source density floor violated — %s", violation)
-    completion = await ctx.complete_fn(
+    completion = await ctx.host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -686,7 +686,7 @@ async def _reforge_one_source_for_density(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
+    finish_reason = getattr(completion, "finish_reason", None)
     section = extract_markdown_block(content)
     return section.strip(), finish_reason
 
@@ -710,7 +710,7 @@ async def _forge_one_source(
     Returns ``(section, finish_reason, density_passed, density_reason,
     failed_paths, passes, density_marker)``.
     """
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return "", None, True, None, [], 1, ""
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PER_SOURCE_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_PER_SOURCE_PATH)
@@ -728,7 +728,7 @@ async def _forge_one_source(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    completion = await ctx.complete_fn(
+    completion = await ctx.host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -737,7 +737,8 @@ async def _forge_one_source(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
+    finish_reason = getattr(completion, "finish_reason", None)
+    _truncated = getattr(completion, "truncated", None)
     section = extract_markdown_block(content)
     passes = 1
     failed_paths: list[str] = []
@@ -747,6 +748,7 @@ async def _forge_one_source(
             user_input=user_input,
             document=section,
             model_def=model_def,
+            first_truncated=_truncated,
             first_finish_reason=finish_reason,
             max_continue_attempts=max_continue_attempts,
             max_continue_tokens=max_continue_tokens,
@@ -787,6 +789,7 @@ async def _forge_one_source(
                     user_input=user_input,
                     document=retry_section,
                     model_def=model_def,
+                    first_truncated=False,
                     first_finish_reason=retry_finish,
                     max_continue_attempts=max_continue_attempts,
                     max_continue_tokens=max_continue_tokens,
@@ -866,7 +869,7 @@ async def _forge_rolling(
     incremental_persist: bool,
 ) -> tuple[str, list[str | None]]:
     """Forge a running document chunk-by-chunk (rolling accumulation)."""
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return "", []
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_ROLLING_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_ROLLING_PATH)
@@ -893,7 +896,7 @@ async def _forge_rolling(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        completion = await ctx.complete_fn(
+        completion = await ctx.host.complete(
             messages=messages,
             model_def=model_def,
             max_tokens=max_tokens,
@@ -902,7 +905,8 @@ async def _forge_rolling(
             response_format=None,
         )
         content = getattr(completion, "content", "") or ""
-        finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
+        finish_reason = getattr(completion, "finish_reason", None)
+        _truncated = getattr(completion, "truncated", None)
         extension = extract_markdown_block(content)
         if extension.strip():
             extension, _truncated, _attempts, finish_reason = await continue_until_complete(
@@ -910,6 +914,7 @@ async def _forge_rolling(
                 user_input=user_input,
                 document=extension,
                 model_def=model_def,
+                first_truncated=_truncated,
                 first_finish_reason=finish_reason,
                 max_continue_attempts=max_continue_attempts,
                 max_continue_tokens=max_continue_tokens,
@@ -920,9 +925,9 @@ async def _forge_rolling(
                 document = document.rstrip() + "\n\n" + extension.rstrip() + "\n"
             else:
                 document = extension.rstrip() + "\n"
-            if incremental_persist and callable(ctx.execute_tool_fn):
+            if incremental_persist and ctx.host is not None:
                 try:
-                    await ctx.execute_tool_fn(
+                    await ctx.host.execute_tool(
                         _APPEND_TOOL_ID,
                         ToolExecutionContext(
                             tool_id=_APPEND_TOOL_ID,
@@ -958,7 +963,7 @@ async def _merge_sections(
     continue_prompt_path: str,
 ) -> tuple[str, str | None]:
     """Merge pre-forged sections into one coherent document."""
-    if ctx.complete_fn is None:
+    if ctx.host is None:
         return "", None
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_MERGE_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_MERGE_PATH)
@@ -983,7 +988,7 @@ async def _merge_sections(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    completion = await ctx.complete_fn(
+    completion = await ctx.host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -992,7 +997,8 @@ async def _merge_sections(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
+    finish_reason = getattr(completion, "finish_reason", None)
+    _truncated = getattr(completion, "truncated", None)
     document = extract_markdown_block(content)
     if not document.strip():
         return content.strip(), finish_reason
@@ -1001,6 +1007,7 @@ async def _merge_sections(
         user_input=user_input,
         document=document,
         model_def=model_def,
+        first_truncated=_truncated,
         first_finish_reason=finish_reason,
         max_continue_attempts=max_continue_attempts,
         max_continue_tokens=max_continue_tokens,
@@ -1174,7 +1181,7 @@ async def _write_okf_provenance(
     """Write the OKF forge-provenance concept + append a log entry."""
     if not okf_bundle_path:
         return None
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         return None
     provider = str(getattr(model_def, "provider", "") or "").strip()
     model_id = str(getattr(model_def, "model_id", "") or "").strip()
@@ -1199,7 +1206,7 @@ async def _write_okf_provenance(
     )
     concept_rel = f"{document_stem}.forge.md"
     try:
-        emit_result = await ctx.execute_tool_fn(
+        emit_result = await ctx.host.execute_tool(
             _OKF_EMIT_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_OKF_EMIT_TOOL_ID,
@@ -1236,7 +1243,7 @@ async def _write_okf_provenance(
         return None
     full_path = f"{okf_bundle_path}/{concept_rel}"
     try:
-        await ctx.execute_tool_fn(
+        await ctx.host.execute_tool(
             _OKF_LOG_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_OKF_LOG_TOOL_ID,
@@ -1290,7 +1297,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     except RuntimeError as exc:
         return OperationResult(output_text=str(exc))
 
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         raise RuntimeError("markdown_consolidate_sources requires execute_tool_fn")
 
     # ── Source ingestion ───────────────────────────────────────────────
@@ -1357,10 +1364,10 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     rolling_used = False
 
     # Resolve the model once for all passes.
-    if ctx.resolve_model_fn is None:
+    if ctx.host is None:
         raise RuntimeError("markdown requires resolve_model_fn")
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
-    model_def = ctx.resolve_model_fn(preferred_model_id)
+    model_def = ctx.host.resolve_model(preferred_model_id)
     if model_def is None:
         raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
 
@@ -1459,7 +1466,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         final_finish_reason = merge_finish
     else:
         # ── Single-pass consolidation ─────────────────────────────────
-        completion_text, model_def, first_finish_reason = await _call_llm(
+        completion_text, model_def, first_truncated, first_finish_reason = await _call_llm(
             ctx,
             user_input,
             memory_context,
@@ -1481,6 +1488,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 user_input=user_input,
                 document=document,
                 model_def=model_def,
+                first_truncated=first_truncated,
                 first_finish_reason=first_finish_reason,
                 max_continue_attempts=cfg.max_continue_attempts,
                 max_continue_tokens=cfg.max_continue_tokens,
@@ -1523,6 +1531,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                             user_input=user_input,
                             document=retry_document,
                             model_def=model_def,
+                            first_truncated=False,
                             first_finish_reason=retry_finish,
                             max_continue_attempts=cfg.max_continue_attempts,
                             max_continue_tokens=cfg.max_continue_tokens,

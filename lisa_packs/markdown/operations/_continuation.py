@@ -6,22 +6,25 @@ markdown documents and must handle the case where the model stops
 mid-stream because it hit its token budget. This module owns that logic so
 it is not duplicated across the two operations' per-path call sites.
 
-The continuation contract (see
-``/memories/repo/forge-document-truncation-contract.md``):
+The continuation contract (provider-owned ``truncated`` signal):
 
-- Only truncate-flagged first passes (``finish_reason`` in
-  ``{"length", "unknown", None}``) trigger continuation; a clean ``stop``
-  returns the document as-is unless a structural-incompleteness override
-  applies.
-- A continuation that returns empty or duplicates the existing tail is
-  treated as "model has nothing more to add" — stop and mark truncated.
-- A merged document that ends on a clean boundary (``_looks_complete``)
-  AND whose continuation reported a non-truncating ``finish_reason`` is
-  considered complete; otherwise we keep going up to the budget.
+- ``truncated is True``  → the provider authoritative­ly says the model
+  stopped before completing (hit max_tokens / incomplete status). Issue
+  continuation passes up to the budget.
+- ``truncated is False`` → a clean stop. Return the document as-is unless
+  a structural-incompleteness override applies (``_ends_on_dangling_heading``).
+- ``truncated is None``  → the adapter genuinely cannot tell. Issue ONE
+  safety-net continuation pass, then stop (do not loop).
+
+A continuation that returns empty or duplicates the existing tail is
+treated as "model has nothing more to add" — stop and mark truncated.
+A merged document that ends on a clean boundary (``_looks_complete``)
+AND whose continuation reported ``truncated is False`` is considered
+complete; otherwise we keep going up to the budget.
 
 ``_load_text`` lives here because every continuation pass loads an authored
-continue prompt via ``ctx.read_authored_text_fn``; the caller supplies the
-exact ``continue_prompt_path`` so each operation can use its own prompt.
+continue prompt via ``ctx.host.read_authored_text``; the caller supplies
+the exact ``continue_prompt_path`` so each operation can use its own prompt.
 """
 
 from __future__ import annotations
@@ -37,16 +40,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "continue_until_complete",
     "extract_markdown_block",
-    "is_truncating_finish",
-    "coerce_finish_reason",
 ]
-
-# Finish-reason values that signal the model stopped before completing
-# the document. ``"length"`` is the OpenAI-standard "hit max_tokens"
-# signal. ``"unknown"`` / ``None`` cover local backends (Ollama) that do
-# not populate ``finish_reason`` — empirically these stop mid-stream on
-# long documents. ``"stop"`` and ``"tool_calls"`` are NOT truncation.
-_TRUNCATING_FINISH_REASONS = frozenset({"length", "unknown", None})
 
 
 def _load_text(ctx: OperationExecutionContext, path: str) -> str:
@@ -55,37 +49,18 @@ def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     Fails loudly when the loader is not wired, returns empty/None, or raises.
     Per the pack-content rule: no fallbacks to missing content.
     """
-    if not callable(ctx.read_authored_text_fn):
+    host = ctx.host
+    if host is None:
         raise RuntimeError(
-            f"read_authored_text_fn is not wired; cannot load authored content at {path}"
+            f"OperationHost is not wired; cannot load authored content at {path}"
         )
     try:
-        loaded = str(ctx.read_authored_text_fn(path) or "").strip()
+        loaded = host.read_authored_text(path).strip()
     except Exception as exc:  # pylint: disable=broad-except
-        raise RuntimeError(f"read_authored_text_fn failed for {path}: {exc}") from exc
+        raise RuntimeError(f"read_authored_text failed for {path}: {exc}") from exc
     if not loaded:
         raise RuntimeError(f"Authored text at {path} is empty or missing")
     return loaded
-
-
-def coerce_finish_reason(raw: Any) -> str | None:
-    """Normalize a provider finish_reason into a comparable string or None.
-
-    Providers occasionally return ``""`` or whitespace for "no signal"; coerce
-    those to ``None`` so they fall into the truncation set (a missing signal
-    on a long document is empirically a truncation, not a clean stop).
-    """
-    if raw is None:
-        return None
-    text = str(raw).strip().lower()
-    if not text:
-        return None
-    return text
-
-
-def is_truncating_finish(finish_reason: str | None) -> bool:
-    """Return True when the finish reason signals mid-stream truncation."""
-    return finish_reason in _TRUNCATING_FINISH_REASONS
 
 
 def extract_markdown_block(text: str) -> str:
@@ -205,15 +180,18 @@ async def _continue_llm(
     *,
     max_tokens: int,
     continue_prompt_path: str,
-) -> tuple[str, str | None]:
+) -> tuple[str, bool | None, str | None]:
     """Issue one continuation pass to finish a truncated document.
 
     Appends a continuation instruction to the original message list (so the
     model has full context) and asks for ONLY the remaining tail. Returns
-    ``(continuation_content, finish_reason)``.
+    ``(continuation_content, truncated, finish_reason)`` — ``truncated`` is
+    the provider-owned authoritative signal; ``finish_reason`` is kept for
+    telemetry only.
     """
-    if ctx.complete_fn is None:
-        raise RuntimeError("markdown requires complete_fn to continue a truncated document")
+    host = ctx.host
+    if host is None:
+        raise RuntimeError("markdown requires OperationHost.complete to continue a truncated document")
 
     continue_template = _load_text(ctx, continue_prompt_path)
     continue_prompt = continue_template.replace("{user_input}", user_input).replace(
@@ -222,7 +200,7 @@ async def _continue_llm(
     messages = [
         {"role": "user", "content": continue_prompt},
     ]
-    completion = await ctx.complete_fn(
+    completion = await host.complete(
         messages=messages,
         model_def=model_def,
         max_tokens=max_tokens,
@@ -231,8 +209,9 @@ async def _continue_llm(
         response_format=None,
     )
     content = getattr(completion, "content", "") or ""
-    finish_reason = coerce_finish_reason(getattr(completion, "finish_reason", None))
-    return content.strip(), finish_reason
+    truncated = getattr(completion, "truncated", None)
+    finish_reason = getattr(completion, "finish_reason", None)
+    return content.strip(), truncated, finish_reason
 
 
 async def continue_until_complete(
@@ -241,6 +220,7 @@ async def continue_until_complete(
     user_input: str,
     document: str,
     model_def: Any,
+    first_truncated: bool | None,
     first_finish_reason: str | None,
     max_continue_attempts: int,
     max_continue_tokens: int,
@@ -251,6 +231,12 @@ async def continue_until_complete(
 
     Returns ``(document, was_truncated, attempts, final_finish_reason)``.
 
+    Decision logic uses the provider-owned ``truncated`` signal:
+    - ``True``  → continue up to ``max_continue_attempts``.
+    - ``False`` → no continuation (unless ``structural_override`` detects
+      a dangling heading).
+    - ``None``  → ONE safety-net continuation, then stop.
+
     ``structural_override`` defaults to True (final single-pass / merge
     documents benefit from it). Per-source sections set it False: their
     completeness is governed by the per-source density floor, and a
@@ -259,26 +245,35 @@ async def continue_until_complete(
     budget duplicating a heading-only tail before the density retry runs).
     """
     structurally_incomplete = _ends_on_dangling_heading(document) if structural_override else False
-    if not is_truncating_finish(first_finish_reason) and not structurally_incomplete:
+
+    # Decide whether to continue at all.
+    if first_truncated is False and not structurally_incomplete:
         return document, False, 0, first_finish_reason
-    if structurally_incomplete and not is_truncating_finish(first_finish_reason):
+    if first_truncated is None and not structurally_incomplete:
+        # Unknown: one safety-net pass, then stop regardless.
+        max_attempts = 1
+    else:
+        max_attempts = max_continue_attempts
+
+    if structurally_incomplete and first_truncated is False:
         logger.warning(
-            "forge_document: first pass finish_reason=%r but document ends "
+            "forge_document: first pass truncated=%r but document ends "
             "on a dangling heading (section opened with no body); attempting "
             "continuation despite clean stop",
-            first_finish_reason,
+            first_truncated,
+        )
+    else:
+        logger.warning(
+            "forge_document: first pass truncated=%r; attempting continuation",
+            first_truncated,
         )
 
-    logger.warning(
-        "forge_document: first pass finish_reason=%r; attempting continuation",
-        first_finish_reason,
-    )
     attempts = 0
     final_finish_reason = first_finish_reason
     current = document
-    for attempt in range(1, max_continue_attempts + 1):
+    for attempt in range(1, max_attempts + 1):
         attempts = attempt
-        continuation_text, cont_finish_reason = await _continue_llm(
+        continuation_text, cont_truncated, cont_finish_reason = await _continue_llm(
             ctx,
             user_input=user_input,
             document_so_far=current,
@@ -311,7 +306,7 @@ async def continue_until_complete(
             )
             break
         current = _merge_continuation(current, tail)
-        if _looks_complete(current) and not is_truncating_finish(cont_finish_reason):
+        if _looks_complete(current) and cont_truncated is False:
             logger.info(
                 "forge_document: continuation pass %d completed the document", attempt,
             )

@@ -56,10 +56,11 @@ class _FakeCompletion:
     request_id: str = "test"
     tool_calls: list[Any] | None = None
     usage: Any = None
-    # Default to a clean "stop" so existing tests do not trip the new
-    # truncation/continuation path. Tests that exercise truncation pass
-    # ``finish_reason="length"`` or ``"unknown"`` explicitly.
+    # Default to a clean stop (not truncated) so existing tests do not trip
+    # the continuation path. Tests that exercise truncation pass
+    # ``truncated=True`` explicitly. ``finish_reason`` is kept for telemetry.
     finish_reason: str | None = "stop"
+    truncated: bool | None = False
 
 
 _VALID_DOCUMENT = (
@@ -164,6 +165,14 @@ def _make_ctx(
     execute_tool_fn: Any = None,
     pack_config: dict[str, Any] | None = None,
 ) -> OperationExecutionContext:
+    from kernel.seams.host_adapter import _CallableHost
+
+    host = _CallableHost(
+        complete_fn=complete_fn,
+        resolve_model_fn=resolve_model_fn,
+        read_authored_text_fn=_make_loader(),
+        execute_tool_fn=execute_tool_fn,
+    )
     return OperationExecutionContext(
         workspace_id="test",
         user_id="test-user",
@@ -173,10 +182,7 @@ def _make_ctx(
         memory_scope="personal",
         mode_id="markdown",
         query=query,
-        complete_fn=complete_fn,
-        resolve_model_fn=resolve_model_fn,
-        read_authored_text_fn=_make_loader(),
-        execute_tool_fn=execute_tool_fn,
+        host=host,
         params=params or {},
         pack_config=pack_config,
     )
@@ -533,13 +539,25 @@ async def test_document_formatted_by_mdformat() -> None:
 # NO truncated annotation.
 
 
-def _fake_complete_sequence(documents: list[str], finish_reasons: list[str | None]) -> Any:
+def _fake_complete_sequence(
+    documents: list[str],
+    finish_reasons: list[str | None],
+    truncated: list[bool | None] | None = None,
+) -> Any:
     """Return a ``complete_fn`` that returns each document/finish_reason in order.
 
     The first call returns (documents[0], finish_reasons[0]); the second call
     returns (documents[1], finish_reasons[1]); and so on. Used to simulate a
     truncated first pass followed by a continuation pass.
+
+    ``truncated`` is the provider-owned signal that drives continuation
+    decisions. When omitted, it defaults to ``[True, False, ...]`` — the
+    first pass is truncated, subsequent passes are clean. Pass explicitly
+    to override (e.g. ``[None, False]`` for the unknown-signal safety-net
+    case).
     """
+    if truncated is None:
+        truncated = [True, False] + [False] * max(0, len(documents) - 2)
     state = {"index": 0}
 
     async def _complete(**_kwargs: Any) -> _FakeCompletion:
@@ -547,9 +565,11 @@ def _fake_complete_sequence(documents: list[str], finish_reasons: list[str | Non
         state["index"] += 1
         doc = documents[idx] if idx < len(documents) else ""
         finish = finish_reasons[idx] if idx < len(finish_reasons) else "stop"
+        trunc = truncated[idx] if idx < len(truncated) else False
         return _FakeCompletion(
             content=f"```markdown\n{doc}\n```",
             finish_reason=finish,
+            truncated=trunc,
         )
 
     return _complete
@@ -578,11 +598,12 @@ _FULL_SWOT = _PARTIAL_SWOT + "\n" + _SWOT_TAIL
 
 @pytest.mark.asyncio
 async def test_truncated_first_pass_continues_and_completes() -> None:
-    """finish_reason='length' triggers a continuation pass that completes the doc."""
+    """truncated=True triggers a continuation pass that completes the doc."""
     tool_fn, captures = _make_tool_executor()
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, _SWOT_TAIL],
         finish_reasons=["length", "stop"],
+        truncated=[True, False],
     )
     ctx = _make_ctx(
         query="forge a SWOT analysis",
@@ -608,11 +629,12 @@ async def test_truncated_first_pass_continues_and_completes() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_finish_reason_triggers_continuation() -> None:
-    """finish_reason='unknown' (Ollama-style) is treated as truncation."""
+    """truncated=None (Ollama-style unknown) triggers one safety-net continuation."""
     tool_fn, captures = _make_tool_executor()
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, _SWOT_TAIL],
         finish_reasons=["unknown", "stop"],
+        truncated=[None, False],
     )
     ctx = _make_ctx(
         query="forge a SWOT analysis",
@@ -630,11 +652,12 @@ async def test_unknown_finish_reason_triggers_continuation() -> None:
 
 @pytest.mark.asyncio
 async def test_none_finish_reason_triggers_continuation() -> None:
-    """A missing finish_reason (None) is treated as truncation on a long doc."""
+    """A missing signal (truncated=None) triggers one safety-net continuation."""
     tool_fn, captures = _make_tool_executor()
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, _SWOT_TAIL],
         finish_reasons=[None, "stop"],
+        truncated=[None, False],
     )
     ctx = _make_ctx(
         query="forge a SWOT analysis",
@@ -651,7 +674,7 @@ async def test_none_finish_reason_triggers_continuation() -> None:
 async def test_continuation_also_truncates_persists_with_truncated_annotation() -> None:
     """When the continuation also truncates, the artifact is marked truncated.
 
-    Both passes return finish_reason='length'; the budget is exhausted; the
+    Both passes return truncated=True; the budget is exhausted; the
     persisted document must carry a 'truncated by model' annotation and the
     OperationResult must surface the truncation in output_json + the summary.
     """
@@ -664,13 +687,15 @@ async def test_continuation_also_truncates_persists_with_truncated_annotation() 
             return _FakeCompletion(
                 content=f"```markdown\n{_PARTIAL_SWOT}\n```",
                 finish_reason="length",
+                truncated=True,
             )
         # Continuation passes: always return a tail that ends mid-sentence
-        # AND reports 'length', so the merge never looks complete and the
-        # continuation budget is exhausted.
+        # AND reports truncated=True, so the merge never looks complete and
+        # the continuation budget is exhausted.
         return _FakeCompletion(
             content="```markdown\n## Opportunities\n- Enterprise adoption and the\n```",
             finish_reason="length",
+            truncated=True,
         )
 
     ctx = _make_ctx(
@@ -693,7 +718,7 @@ async def test_continuation_also_truncates_persists_with_truncated_annotation() 
 
 @pytest.mark.asyncio
 async def test_clean_stop_does_not_trigger_continuation() -> None:
-    """finish_reason='stop' returns the document as-is with no continuation."""
+    """truncated=False returns the document as-is with no continuation."""
     tool_fn, captures = _make_tool_executor()
     call_count = {"n": 0}
 
@@ -702,6 +727,7 @@ async def test_clean_stop_does_not_trigger_continuation() -> None:
         return _FakeCompletion(
             content=f"```markdown\n{_VALID_DOCUMENT}\n```",
             finish_reason="stop",
+            truncated=False,
         )
 
     ctx = _make_ctx(
@@ -720,14 +746,14 @@ async def test_clean_stop_does_not_trigger_continuation() -> None:
 
 @pytest.mark.asyncio
 async def test_clean_stop_on_trailing_heading_triggers_continuation() -> None:
-    """A clean ``stop`` ending on a dangling heading is structurally incomplete.
+    """A clean stop ending on a dangling heading is structurally incomplete.
 
     Regression for the 2026-08-02 "short doc ending on a heading" incident:
     the model emitted a section heading ("### 5.1 Hook on ...") with no
-    body and returned ``finish_reason="stop"``. The old heuristic treated
+    body and returned truncated=False. The old heuristic treated
     a trailing heading as complete, so no continuation ran and the
     half-written section was persisted. The fix: a trailing heading with
-    no body is a truncation signal regardless of finish_reason; the op
+    no body is a truncation signal regardless of the provider signal; the op
     attempts a continuation that supplies the missing body.
     """
     tool_fn, captures = _make_tool_executor()
@@ -748,6 +774,7 @@ async def test_clean_stop_on_trailing_heading_triggers_continuation() -> None:
     complete_fn = _fake_complete_sequence(
         documents=[heading_only_doc, continuation_body],
         finish_reasons=["stop", "stop"],
+        truncated=[False, False],
     )
     ctx = _make_ctx(
         query="forge a delegate design spec",
@@ -779,9 +806,10 @@ async def test_continuation_empty_gives_up_and_marks_truncated() -> None:
             return _FakeCompletion(
                 content=f"```markdown\n{_PARTIAL_SWOT}\n```",
                 finish_reason="length",
+                truncated=True,
             )
         # Continuation pass: truly empty content (not fenced).
-        return _FakeCompletion(content="", finish_reason="stop")
+        return _FakeCompletion(content="", finish_reason="stop", truncated=False)
 
     ctx = _make_ctx(
         query="forge a SWOT analysis",
@@ -809,6 +837,7 @@ async def test_continuation_duplicate_tail_gives_up_and_marks_truncated() -> Non
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, _PARTIAL_SWOT],
         finish_reasons=["length", "stop"],
+        truncated=[True, False],
     )
     ctx = _make_ctx(
         query="forge a SWOT analysis",

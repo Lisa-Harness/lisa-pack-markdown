@@ -193,7 +193,7 @@ async def expand_globs(
     as a spec with ``read_error`` set so provenance can flag it.
     """
 
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         raise RuntimeError("source_paths requires execute_tool_fn to call list_files/read_file")
 
     resolved: list[SourceSpec] = []
@@ -242,7 +242,7 @@ async def _list_files(
     import json
 
     try:
-        result = await ctx.execute_tool_fn(
+        result = await ctx.host.execute_tool(
             _LIST_FILES_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_LIST_FILES_TOOL_ID,
@@ -297,7 +297,7 @@ async def read_sources(
     one pass; the map-reduce path (future work) handles the oversize case.
     """
 
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         raise RuntimeError("source_paths requires execute_tool_fn to call read_file")
 
     running_total = 0
@@ -328,7 +328,7 @@ async def _read_one(
     """Read one file via ``read_file``. Returns ``(text, error_or_None)``."""
 
     try:
-        result: ToolResult = await ctx.execute_tool_fn(
+        result: ToolResult = await ctx.host.execute_tool(
             _READ_FILE_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_READ_FILE_TOOL_ID,
@@ -487,7 +487,7 @@ async def read_source_chunks(
     (mirroring :func:`read_sources`'s per-source failure contract) so the
     caller can surface it rather than aborting the forge.
     """
-    if not callable(ctx.execute_tool_fn):
+    if ctx.host is None:
         raise RuntimeError(
             "read_source_chunks requires execute_tool_fn to call "
             "stat_file/read_file_range"
@@ -594,7 +594,7 @@ async def _stat_file_chars(
     import json
 
     try:
-        result = await ctx.execute_tool_fn(
+        result = await ctx.host.execute_tool(
             _STAT_FILE_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_STAT_FILE_TOOL_ID,
@@ -662,7 +662,7 @@ async def _read_file_range(
     import json
 
     try:
-        result = await ctx.execute_tool_fn(
+        result = await ctx.host.execute_tool(
             _READ_FILE_RANGE_TOOL_ID,
             ToolExecutionContext(
                 tool_id=_READ_FILE_RANGE_TOOL_ID,
