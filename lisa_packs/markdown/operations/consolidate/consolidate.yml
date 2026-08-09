@@ -1,6 +1,5 @@
 operation_id: markdown_consolidate_sources
 description: Consolidate multiple source documents into one coherent markdown document, preserving per-source detail (anti-abridgment). Reads every source via lisa-storage, injects them with per-source NL priority notes into a preserve-detail prompt, applies map-reduce when the aggregate is large, enforces a density floor against lossy summarization, and captures OKF provenance.
-mode_allowlist: [markdown]
 # Source ingestion uses list_files (glob expansion) + read_file; the
 # map-reduce path uses read_file_range (chunking an oversize single source)
 # and append_file (opt-in incremental persistence). okf_emit_concept /
@@ -12,3 +11,4 @@ tool_ids: [markdown_generate, write_file, read_file, read_file_range, append_fil
 # headroom. (Per-call sub-deadlines would be a kernel change — deferred.)
 timeout_seconds: 600
 preferred_model_id: default
+exportable: true
