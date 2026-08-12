@@ -66,12 +66,50 @@ def _load_text(ctx: OperationExecutionContext, path: str) -> str:
 def extract_markdown_block(text: str) -> str:
     """Extract the first fenced ```markdown ...``` block, else return text.
 
-    Accepts fenced blocks tagged ``markdown`` or untagged. Falls back to the
-    raw text when no fence is present so the outline tool can still assess it.
+    Accepts fenced blocks tagged ``markdown``, ``md``, or untagged. Falls
+    back to the raw text when no fence is present so the outline tool can
+    still assess it.
+
+    Uses a line-by-line fence-depth counter rather than a single non-greedy
+    regex so nested fences (a fenced code block *inside* the markdown block)
+    do not prematurely close the outer block. The old regex
+    ``r"```(?:markdown|md)?\\s*\\n(.*?)```"`` grabbed the FIRST closing
+    fence, which broke on models that wrapped the whole document in a
+    `````markdown` fence and then used inner fences for code samples — the
+    inner fence closed the block and the rest of the document was discarded,
+    producing "continuation pass N yielded no markdown tail" even though
+    the model had emitted valid content.
+
+    If the fenced block extracts to empty but the raw text has non-empty
+    content, fall back to the raw text: the model emitted prose outside the
+    fence (or an empty fence), and the outline tool can still assess it.
     """
-    match = re.search(r"```(?:markdown|md)?\s*\n(.*?)```", text, flags=re.DOTALL)
-    if match:
-        return match.group(1).strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    fence_re = re.compile(r"^(\s*)(```+)(.*)$")
+    in_block = False
+    collected: list[str] = []
+    for line in lines:
+        m = fence_re.match(line)
+        if m and not in_block:
+            # Opening fence: accept tagged (markdown/md) or untagged.
+            tag = m.group(3).strip().lower()
+            if tag in ("", "markdown", "md"):
+                in_block = True
+                continue
+        if in_block:
+            # A line that is just a fence (possibly indented) closes the block.
+            if re.match(r"^\s*```+\s*$", line):
+                break
+            collected.append(line)
+    if in_block and collected:
+        body = "\n".join(collected).strip()
+        if body:
+            return body
+    # No usable fenced block — fall back to the raw text so the outline tool
+    # can still assess it. This is the recovery path for models that emit
+    # prose outside fences or use non-standard fencing.
     return text.strip()
 
 

@@ -565,6 +565,78 @@ async def _lint_repair_pass(
     return repaired
 
 
+async def _persist_no_outline_document(
+    ctx: OperationExecutionContext,
+    document: str,
+    document_path: str,
+    heading_count: int,
+    was_truncated: bool,
+    continue_attempts: int,
+    first_finish_reason: str | None,
+    final_finish_reason: str | None,
+) -> OperationResult:
+    """Persist a zero-heading document with a warning comment instead of discarding it.
+
+    The outline gate used to be a hard reject: a document with 0 headings was
+    discarded and the operation returned only an error message, leaving no
+    durable artifact. When the expounder loop re-called the operation, each
+    iteration burned budget on a reject that produced nothing. Now the
+    document is persisted with a non-rendering ``<!-- forge: N headings
+    detected -->`` comment so the content survives and the user can refine.
+    """
+    warning = f"<!-- forge: {heading_count} headings detected -->"
+    annotated = document.rstrip() + "\n\n" + warning + "\n"
+    try:
+        write_response = await _persist_document(ctx, annotated, document_path)
+    except RuntimeError as exc:
+        text = _format_template(
+            _load_text(ctx, _STORAGE_FAILED_PATH),
+            error=str(exc),
+        )
+        return OperationResult(output_text=text)
+    ok = bool(write_response.get("ok", False))
+    if not ok:
+        text = _format_template(
+            _load_text(ctx, _STORAGE_FAILED_PATH),
+            error=write_response.get("raw", "unknown storage error"),
+        )
+        return OperationResult(output_text=text)
+    stored_path = str(write_response.get("path") or document_path)
+    byte_count = int(write_response.get("bytes") or len(annotated.encode("utf-8")))
+    warning_text = _format_template(
+        _load_text(ctx, _NO_OUTLINE_PATH),
+        heading_count=heading_count,
+    )
+    summary = (
+        f"Document forged at `{stored_path}` ({byte_count} bytes, "
+        f"{heading_count} headings). WARNING: no headings detected; "
+        f"persisted with a warning comment. {warning_text}"
+    )
+    return OperationResult(
+        output_text=summary,
+        output_json={
+            "path": stored_path,
+            "bytes": byte_count,
+            "heading_count": heading_count,
+            "outline": {},
+            "truncated": was_truncated,
+            "continue_attempts": continue_attempts,
+            "first_finish_reason": first_finish_reason,
+            "final_finish_reason": final_finish_reason,
+            "lint_warnings": 0,
+            "lint_repair_used": False,
+            "target_words": None,
+            "no_outline": True,
+        },
+        extra={
+            "document_path": stored_path,
+            "truncated": was_truncated,
+            "continue_attempts": continue_attempts,
+            "no_outline": True,
+        },
+    )
+
+
 async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
     """Run the ``markdown_gehost.execute_toolnd return its outline dict.
 
@@ -759,11 +831,20 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
 
     heading_count = int(outline.get("heading_count", 0) or 0)
     if heading_count < _MIN_HEADINGS:
-        text = _format_template(
-            _load_text(ctx, _NO_OUTLINE_PATH),
+        # Diagnostic gate: persist the document with a warning comment
+        # instead of discarding it. The content survives so the user can
+        # refine; the expounder loop no longer burns iterations on a hard
+        # reject that leaves no durable artifact.
+        return await _persist_no_outline_document(
+            ctx,
+            document,
+            document_path,
             heading_count=heading_count,
+            was_truncated=was_truncated,
+            continue_attempts=continue_attempts,
+            first_finish_reason=first_finish_reason,
+            final_finish_reason=final_finish_reason,
         )
-        return OperationResult(output_text=text)
 
     # Phase A: advisory lint gate. Lint is never a hard reject — the outline
     # gate above is the only hard gate. When issues are found and
@@ -792,11 +873,16 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 return OperationResult(output_text=str(exc))
             heading_count = int(outline.get("heading_count", 0) or 0)
             if heading_count < _MIN_HEADINGS:
-                text = _format_template(
-                    _load_text(ctx, _NO_OUTLINE_PATH),
+                return await _persist_no_outline_document(
+                    ctx,
+                    document,
+                    document_path,
                     heading_count=heading_count,
+                    was_truncated=was_truncated,
+                    continue_attempts=continue_attempts,
+                    first_finish_reason=first_finish_reason,
+                    final_finish_reason=final_finish_reason,
                 )
-                return OperationResult(output_text=text)
             lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
     if lint_issues:
         comment = lint_summary_comment(lint_issues)

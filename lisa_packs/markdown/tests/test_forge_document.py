@@ -309,8 +309,16 @@ async def test_empty_llm_response_returns_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_document_with_no_headings_returns_no_outline_error() -> None:
-    tool_fn, _ = _make_tool_executor()
+async def test_document_with_no_headings_is_persisted_with_warning() -> None:
+    """A zero-heading document is persisted with a warning comment, not discarded.
+
+    The outline gate used to be a hard reject: the document was discarded and
+    the operation returned only an error message. Now the document is persisted
+    with a ``<!-- forge: 0 headings detected -->`` comment so the content
+    survives and the expounder loop no longer burns iterations producing
+    nothing.
+    """
+    tool_fn, captures = _make_tool_executor()
     no_headings_doc = "Just a paragraph. No headings here.\n"
     ctx = _make_ctx(
         complete_fn=_fake_complete_returning(no_headings_doc),
@@ -319,6 +327,12 @@ async def test_document_with_no_headings_returns_no_outline_error() -> None:
     )
     result = await execute(ctx)
     assert "no headings" in result.output_text.lower()
+    assert result.output_json.get("no_outline") is True
+    # The document must have been persisted (not discarded).
+    assert len(captures["writes"]) == 1
+    persisted = captures["writes"][0]["content"]
+    assert "Just a paragraph" in persisted
+    assert "0 headings detected" in persisted
 
 
 @pytest.mark.asyncio
@@ -335,8 +349,9 @@ async def test_storage_failure_returns_storage_failed_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_outlines_injected_fixture_with_zero_headings_fails() -> None:
-    tool_fn, _ = _make_tool_executor(outline={"heading_count": 0, "headings": []})
+async def test_outlines_injected_fixture_with_zero_headings_persists_with_warning() -> None:
+    """Injected outline fixture with 0 headings: document persisted with warning."""
+    tool_fn, captures = _make_tool_executor(outline={"heading_count": 0, "headings": []})
     ctx = _make_ctx(
         complete_fn=_fake_complete_returning(_VALID_DOCUMENT),
         resolve_model_fn=_fake_resolve_model(),
@@ -344,6 +359,9 @@ async def test_outlines_injected_fixture_with_zero_headings_fails() -> None:
     )
     result = await execute(ctx)
     assert "no headings" in result.output_text.lower()
+    assert result.output_json.get("no_outline") is True
+    assert len(captures["writes"]) == 1
+    assert "0 headings detected" in captures["writes"][0]["content"]
 
 
 @pytest.mark.asyncio
@@ -918,6 +936,134 @@ async def test_continuation_duplicate_tail_gives_up_and_marks_truncated() -> Non
     assert "truncated by model" in persisted
     # The duplicate tail must not have been merged — Opportunities still absent.
     assert "Opportunities" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_nested_fences_in_continuation_are_extracted() -> None:
+    """A continuation pass with nested fences must not be discarded.
+
+    Regression for the 2026-08-12 "continuation pass N yielded no markdown
+    tail" incident: the model wrapped the tail in a `````markdown` fence and
+    used an inner fence for a code sample. The old non-greedy regex grabbed
+    the first closing fence (the inner one), extracting an empty or partial
+    block, so the continuation was discarded. The depth-counting parser
+    must extract the full tail.
+    """
+    tool_fn, captures = _make_tool_executor()
+    tail_with_nested_fence = (
+        "## Opportunities\\n"
+        "- Enterprise adoption.\\n"
+        "\\n"
+        "```python\\n"
+        "print('hello')\\n"
+        "```\\n"
+        "\\n"
+        "## Threats\\n"
+        "- Integrated IDE dominance.\\n"
+    )
+    complete_fn = _fake_complete_sequence(
+        documents=[_PARTIAL_SWOT, tail_with_nested_fence],
+        finish_reasons=["length", "stop"],
+        truncated=[True, False],
+    )
+    ctx = _make_ctx(
+        query="forge a SWOT analysis",
+        complete_fn=complete_fn,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    persisted = captures["writes"][0]["content"]
+    # The nested-fence tail must have been extracted and merged.
+    assert "Opportunities" in persisted
+    assert "Threats" in persisted
+    assert result.output_json["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_continuation_prose_outside_fence_falls_back_to_raw() -> None:
+    """A continuation pass with prose outside a fence falls back to raw text.
+
+    When the model emits prose with no fence at all (or an empty fence), the
+    parser must fall back to the raw text so the outline tool can assess it,
+    rather than discarding the continuation as "no markdown tail".
+    """
+    tool_fn, captures = _make_tool_executor()
+    tail_as_prose = (
+        "## Opportunities\\n"
+        "- Enterprise adoption.\\n"
+        "\\n"
+        "## Threats\\n"
+        "- Integrated IDE dominance.\\n"
+    )
+    complete_fn = _fake_complete_sequence(
+        documents=[_PARTIAL_SWOT, tail_as_prose],
+        finish_reasons=["length", "stop"],
+        truncated=[True, False],
+    )
+    ctx = _make_ctx(
+        query="forge a SWOT analysis",
+        complete_fn=complete_fn,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    persisted = captures["writes"][0]["content"]
+    assert "Opportunities" in persisted
+    assert "Threats" in persisted
+
+
+# ── extract_markdown_block unit tests ──────────────────────────────────
+
+
+def test_extract_markdown_block_nested_fences() -> None:
+    """Nested fences inside a markdown block must not close the outer block."""
+    from lisa_packs.markdown.operations._continuation import extract_markdown_block
+
+    text = (
+        "```markdown\\n"
+        "# Title\\n"
+        "\\n"
+        "```python\\n"
+        "print('hello')\\n"
+        "```\\n"
+        "\\n"
+        "Body.\\n"
+        "```"
+    )
+    result = extract_markdown_block(text)
+    assert "# Title" in result
+    assert "print('hello')" in result
+    assert "Body." in result
+
+
+def test_extract_markdown_block_no_fence_returns_raw() -> None:
+    """No fence present: return the raw text so the outline tool can assess it."""
+    from lisa_packs.markdown.operations._continuation import extract_markdown_block
+
+    text = "# Title\\n\\nParagraph.\\n"
+    result = extract_markdown_block(text)
+    assert result == text.strip()
+
+
+def test_extract_markdown_block_empty_text() -> None:
+    """Empty input returns empty string."""
+    from lisa_packs.markdown.operations._continuation import extract_markdown_block
+
+    assert extract_markdown_block("") == ""
+
+
+def test_extract_markdown_block_untagged_fence() -> None:
+    """Untagged fences (just `````) are accepted."""
+    from lisa_packs.markdown.operations._continuation import extract_markdown_block
+
+    text = "```\\n# Title\\n\\nBody.\\n```"
+    result = extract_markdown_block(text)
+    assert "# Title" in result
+    assert "Body." in result
+
 
 # ── Phase A: advisory lint gate tests ──────────────────────────────────
 
