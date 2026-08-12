@@ -315,7 +315,7 @@ async def test_document_with_no_headings_is_persisted_with_warning() -> None:
     The outline gate used to be a hard reject: the document was discarded and
     the operation returned only an error message. Now the document is persisted
     with a ``<!-- forge: 0 headings detected -->`` comment so the content
-    survives and the expounder loop no longer burns iterations producing
+    survives and the explainer loop no longer burns iterations producing
     nothing.
     """
     tool_fn, captures = _make_tool_executor()

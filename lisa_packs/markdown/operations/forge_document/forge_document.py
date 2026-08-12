@@ -579,7 +579,7 @@ async def _persist_no_outline_document(
 
     The outline gate used to be a hard reject: a document with 0 headings was
     discarded and the operation returned only an error message, leaving no
-    durable artifact. When the expounder loop re-called the operation, each
+    durable artifact. When the explainer loop re-called the operation, each
     iteration burned budget on a reject that produced nothing. Now the
     document is persisted with a non-rendering ``<!-- forge: N headings
     detected -->`` comment so the content survives and the user can refine.
@@ -833,7 +833,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     if heading_count < _MIN_HEADINGS:
         # Diagnostic gate: persist the document with a warning comment
         # instead of discarding it. The content survives so the user can
-        # refine; the expounder loop no longer burns iterations on a hard
+        # refine; the explainer loop no longer burns iterations on a hard
         # reject that leaves no durable artifact.
         return await _persist_no_outline_document(
             ctx,
