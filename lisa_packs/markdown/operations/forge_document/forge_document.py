@@ -280,6 +280,13 @@ async def _read_existing_document(
     )
     error_text = getattr(tool_result, "error", "") or ""
     if error_text:
+        # A "not found" from the storage MCP server is a normal first-forge
+        # condition (the document does not exist yet). The error arrives via
+        # ``tool_result.error`` when the MCP server wraps the not-found
+        # condition as a tool-level error rather than a JSON payload. Treat
+        # it the same as the JSON-path "not found" below: return empty string.
+        if "not found" in error_text:
+            return ""
         raise RuntimeError(f"{_READ_TOOL_ID} failed: {error_text}")
     output_text = getattr(tool_result, "output_text", "") or ""
     try:

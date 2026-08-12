@@ -456,6 +456,72 @@ async def test_no_existing_document_starts_fresh() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_existing_document_starts_fresh_when_error_in_tool_error() -> None:
+    """When ``read_file`` returns "not found" via ``tool_result.error`` (the
+    real MCP-server path), the operation treats it as a first forge.
+
+    The lisa-storage MCP server wraps not-found conditions as a tool-level
+    ``error`` attribute, not as a JSON payload in ``output_text``. The
+    ``_read_existing_document`` helper must recognize "not found" in either
+    path and return an empty string so the forge proceeds.
+    """
+    tool_fn, captures = _make_tool_executor()
+
+    # Override read_file to return the error via tool_result.error
+    # (matching the real MCP server behavior).
+    async def execute_tool_fn(tool_id: str, ctx: Any) -> ToolResult:
+        if tool_id == "read_file":
+            path = str(ctx.parameters.get("path") or "")
+            captures["read_paths"].append(path)
+            return ToolResult(
+                tool_id=tool_id,
+                error=f"Error executing tool read_file: file not found: {path}",
+            )
+        return await tool_fn(tool_id, ctx)
+
+    async def _complete(**_kwargs: Any) -> _FakeCompletion:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=execute_tool_fn,
+    )
+    result = await execute(ctx)
+    assert "Document forged and stored" in result.output_text
+    assert "docs/forge.md" in captures["read_paths"]
+
+
+@pytest.mark.asyncio
+async def test_read_error_other_than_not_found_still_raises() -> None:
+    """A non-not-found ``tool_result.error`` still raises (not swallowed)."""
+    tool_fn, captures = _make_tool_executor()
+
+    async def execute_tool_fn(tool_id: str, ctx: Any) -> ToolResult:
+        if tool_id == "read_file":
+            path = str(ctx.parameters.get("path") or "")
+            captures["read_paths"].append(path)
+            return ToolResult(
+                tool_id=tool_id,
+                error="Error executing tool read_file: permission denied",
+            )
+        return await tool_fn(tool_id, ctx)
+
+    async def _complete(**_kwargs: Any) -> _FakeCompletion:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=execute_tool_fn,
+    )
+    result = await execute(ctx)
+    # The operation should surface the error, not forge a document.
+    assert "Document forged and stored" not in result.output_text
+    assert "permission denied" in result.output_text.lower()
+
+
+@pytest.mark.asyncio
 async def test_document_annotated_with_model_by_default() -> None:
     """The forged document includes a non-rendering model annotation by default."""
     tool_fn, captures = _make_tool_executor()
