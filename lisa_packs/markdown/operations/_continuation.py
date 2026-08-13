@@ -42,6 +42,19 @@ __all__ = [
     "extract_markdown_block",
 ]
 
+# The structured stop reason for a continuation run, surfaced in
+# ``OperationResult.extra["continuation"]["stop_reason"]`` so the kernel
+# (and the user via the cap-pause diagnostic) can see *why* the
+# continuation stopped. Mirrors the per-pass warning log messages so the
+# structured record matches the human-readable one.
+# - ``"completed"``      — a continuation pass completed the document.
+# - ``"exhausted"``      — all attempts used; document still truncated.
+# - ``"empty"``          — a continuation pass returned empty content.
+# - ``"no_markdown_tail"`` — fenced extraction yielded no usable tail.
+# - ``"duplicate_tail"`` — continuation re-emitted the existing tail.
+# - ``"not_needed"``     — first pass was clean (no continuation run).
+# - ``"safety_net_stopped"`` — unknown-truncated safety-net pass ran, then stopped.
+
 
 def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     """Load authored markdown via the SDK content-registry loader.
@@ -264,10 +277,18 @@ async def continue_until_complete(
     max_continue_tokens: int,
     continue_prompt_path: str,
     structural_override: bool = True,
-) -> tuple[str, bool, int, str | None]:
+) -> tuple[str, bool, int, str | None, str]:
     """Run continuation passes until the document looks complete or budget is hit.
 
-    Returns ``(document, was_truncated, attempts, final_finish_reason)``.
+    Returns ``(document, was_truncated, attempts, final_finish_reason, stop_reason)``.
+
+    ``stop_reason`` is the structured outcome string (see the module-level
+    constants) so the caller can build a typed
+    ``OperationResult.extra["continuation"]`` block. The per-pass warning
+    logs remain; the structured ``logger.info`` event at the end carries
+    the full outcome (attempts, stop_reason, finish_reason, document
+    length) so the continuation path is diagnosable from the host log
+    alone — not just the warning strings.
 
     Decision logic uses the provider-owned ``truncated`` signal:
     - ``True``  → continue up to ``max_continue_attempts``.
@@ -286,7 +307,13 @@ async def continue_until_complete(
 
     # Decide whether to continue at all.
     if first_truncated is False and not structurally_incomplete:
-        return document, False, 0, first_finish_reason
+        logger.info(
+            "forge.continuation_result: stop_reason=not_needed attempts=0 "
+            "finish_reason=%r document_chars=%d",
+            first_finish_reason,
+            len(document),
+        )
+        return document, False, 0, first_finish_reason, "not_needed"
     if first_truncated is None and not structurally_incomplete:
         # Unknown: one safety-net pass, then stop regardless.
         max_attempts = 1
@@ -309,6 +336,7 @@ async def continue_until_complete(
     attempts = 0
     final_finish_reason = first_finish_reason
     current = document
+    stop_reason = "exhausted"
     for attempt in range(1, max_attempts + 1):
         attempts = attempt
         continuation_text, cont_truncated, cont_finish_reason = await _continue_llm(
@@ -325,6 +353,7 @@ async def continue_until_complete(
                 "forge_document: continuation pass %d returned empty; giving up",
                 attempt,
             )
+            stop_reason = "empty"
             break
         tail = extract_markdown_block(continuation_text)
         # If the fenced block extracted was empty but the raw continuation
@@ -336,23 +365,51 @@ async def continue_until_complete(
                 "forge_document: continuation pass %d yielded no markdown tail; giving up",
                 attempt,
             )
+            stop_reason = "no_markdown_tail"
             break
         if _tail_is_duplicate(current, tail):
             logger.warning(
                 "forge_document: continuation pass %d duplicated existing tail; giving up",
                 attempt,
             )
+            stop_reason = "duplicate_tail"
             break
         current = _merge_continuation(current, tail)
         if _looks_complete(current) and cont_truncated is False:
             logger.info(
                 "forge_document: continuation pass %d completed the document", attempt,
             )
-            return current, False, attempts, cont_finish_reason
+            stop_reason = "completed"
+            logger.info(
+                "forge.continuation_result: stop_reason=completed attempts=%d "
+                "finish_reason=%r document_chars=%d",
+                attempts,
+                cont_finish_reason,
+                len(current),
+            )
+            return current, False, attempts, cont_finish_reason, stop_reason
         if attempt >= max_continue_attempts:
             logger.warning(
                 "forge_document: exhausted %d continuation attempts; "
                 "persisting with truncated annotation (final finish_reason=%r)",
                 attempt, cont_finish_reason,
             )
-    return current, True, attempts, final_finish_reason
+            stop_reason = "exhausted"
+    if first_truncated is None and not structurally_incomplete and stop_reason == "exhausted":
+        # The unknown-truncated safety-net pass ran and did not complete
+        # the document. ``stop_reason`` stays as set by the break path
+        # (``"empty"`` / ``"no_markdown_tail"`` / ``"duplicate_tail"``) or
+        # ``"exhausted"`` when the single safety-net pass merged a tail but
+        # the document did not look complete. Label the latter so the
+        # caller can distinguish "we tried once and stopped" from "we
+        # exhausted the full budget".
+        stop_reason = "safety_net_stopped"
+    logger.info(
+        "forge.continuation_result: stop_reason=%s attempts=%d "
+        "finish_reason=%r document_chars=%d",
+        stop_reason,
+        attempts,
+        final_finish_reason,
+        len(current),
+    )
+    return current, True, attempts, final_finish_reason, stop_reason

@@ -574,6 +574,7 @@ async def _persist_no_outline_document(
     continue_attempts: int,
     first_finish_reason: str | None,
     final_finish_reason: str | None,
+    continuation_stop_reason: str,
 ) -> OperationResult:
     """Persist a zero-heading document with a warning comment instead of discarding it.
 
@@ -628,11 +629,28 @@ async def _persist_no_outline_document(
             "target_words": None,
             "no_outline": True,
         },
+        status="degraded",
+        error_detail=(
+            f"no headings detected (heading_count={heading_count})"
+            + (
+                f"; continuation {continuation_stop_reason}: "
+                f"{continue_attempts} attempt(s), finish_reason={final_finish_reason!r}"
+                if was_truncated
+                else ""
+            )
+        ),
         extra={
             "document_path": stored_path,
             "truncated": was_truncated,
             "continue_attempts": continue_attempts,
             "no_outline": True,
+            "continuation": {
+                "was_truncated": was_truncated,
+                "attempts": continue_attempts,
+                "stop_reason": continuation_stop_reason,
+                "first_finish_reason": first_finish_reason,
+                "final_finish_reason": final_finish_reason,
+            },
         },
     )
 
@@ -789,8 +807,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     # Truncation handling: the provider-owned ``truncated`` signal drives
     # the decision. ``True`` → continue up to the budget; ``False`` → no
     # continuation (unless a dangling-heading structural override fires);
-    # ``None`` → one safety-net pass, then stop.
-    document, was_truncated, continue_attempts, final_finish_reason = (
+    # ``None`` → one safety-net pass, then stop. The 5th return element
+    # (``stop_reason``) is the structured outcome surfaced in
+    # ``OperationResult.extra["continuation"]`` so the kernel and the
+    # cap-pause diagnostic can see *why* the continuation stopped.
+    document, was_truncated, continue_attempts, final_finish_reason, continuation_stop_reason = (
         await continue_until_complete(
             ctx,
             user_input=user_input,
@@ -811,6 +832,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     if len(document) > cfg.max_document_chars:
         document = document[:cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
         was_truncated = True
+        continuation_stop_reason = "char_cap"
 
     # Annotate with the model that wrote it, unless the user opted out.
     annotate_model = bool(params.get("annotate_model", True))
@@ -844,6 +866,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             continue_attempts=continue_attempts,
             first_finish_reason=first_finish_reason,
             final_finish_reason=final_finish_reason,
+            continuation_stop_reason=continuation_stop_reason,
         )
 
     # Phase A: advisory lint gate. Lint is never a hard reject — the outline
@@ -882,6 +905,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                     continue_attempts=continue_attempts,
                     first_finish_reason=first_finish_reason,
                     final_finish_reason=final_finish_reason,
+                    continuation_stop_reason=continuation_stop_reason,
                 )
             lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
     if lint_issues:
@@ -939,6 +963,13 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "lint_repair_used": lint_repair_used,
             "target_words": target_words,
         },
+        status="degraded" if was_truncated else "success",
+        error_detail=(
+            f"continuation {continuation_stop_reason}: "
+            f"{continue_attempts} attempt(s), finish_reason={final_finish_reason!r}"
+            if was_truncated
+            else None
+        ),
         extra={
             "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
             "document_path": stored_path,
@@ -946,5 +977,12 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "continue_attempts": continue_attempts,
             "lint_warnings": len(lint_issues),
             "target_words": target_words,
+            "continuation": {
+                "was_truncated": was_truncated,
+                "attempts": continue_attempts,
+                "stop_reason": continuation_stop_reason,
+                "first_finish_reason": first_finish_reason,
+                "final_finish_reason": final_finish_reason,
+            },
         },
     )

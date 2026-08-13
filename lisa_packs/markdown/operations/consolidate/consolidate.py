@@ -743,7 +743,7 @@ async def _forge_one_source(
     passes = 1
     failed_paths: list[str] = []
     if section.strip():
-        section, _truncated, _attempts, finish_reason = await continue_until_complete(
+        section, _truncated, _attempts, finish_reason, _stop = await continue_until_complete(
             ctx,
             user_input=user_input,
             document=section,
@@ -784,7 +784,7 @@ async def _forge_one_source(
             )
             passes += 1
             if retry_section.strip():
-                retry_section, _t, _a, retry_finish = await continue_until_complete(
+                retry_section, _t, _a, retry_finish, _stop = await continue_until_complete(
                     ctx,
                     user_input=user_input,
                     document=retry_section,
@@ -909,7 +909,7 @@ async def _forge_rolling(
         _truncated = getattr(completion, "truncated", None)
         extension = extract_markdown_block(content)
         if extension.strip():
-            extension, _truncated, _attempts, finish_reason = await continue_until_complete(
+            extension, _truncated, _attempts, finish_reason, _stop = await continue_until_complete(
                 ctx,
                 user_input=user_input,
                 document=extension,
@@ -1002,7 +1002,7 @@ async def _merge_sections(
     document = extract_markdown_block(content)
     if not document.strip():
         return content.strip(), finish_reason
-    document, _truncated, _attempts, finish_reason = await continue_until_complete(
+    document, _truncated, _attempts, finish_reason, _stop = await continue_until_complete(
         ctx,
         user_input=user_input,
         document=document,
@@ -1482,7 +1482,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                 response_preview=completion_text[:400],
             )
             return OperationResult(output_text=text)
-        document, was_truncated, continue_attempts, final_finish_reason = (
+        document, was_truncated, continue_attempts, final_finish_reason, _stop = (
             await continue_until_complete(
                 ctx,
                 user_input=user_input,
@@ -1525,7 +1525,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                     retry_document = extract_markdown_block(retry_text)
                     if not retry_document.strip():
                         break
-                    retry_document, was_truncated, continue_attempts, final_finish_reason = (
+                    retry_document, was_truncated, continue_attempts, final_finish_reason, _stop = (
                         await continue_until_complete(
                             ctx,
                             user_input=user_input,

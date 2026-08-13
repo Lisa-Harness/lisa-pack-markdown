@@ -1331,3 +1331,4 @@ async def test_target_length_scales_continue_budget() -> None:
     # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.3) = 650.
     assert result.output_json["truncated"] is False
     assert result.output_json["continue_attempts"] == 1
+
