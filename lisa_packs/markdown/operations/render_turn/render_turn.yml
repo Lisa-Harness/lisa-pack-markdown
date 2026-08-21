@@ -1,0 +1,17 @@
+operation_id: markdown_render_turn
+description: >
+  Render a single prior turn (or an inclusive range of turns) from the
+  lossless thread store as a self-contained Markdown block — user query,
+  Lisa's full response, and metadata (mode, timestamp, handoff, write
+  receipts). No LLM calls, no memory recall, no storage writes. Use the
+  thread manifest in the system prompt to find the turn number, then call
+  this to get a clean Markdown rendering of that exchange. The turn index
+  is the global 0-based ordinal the model sees in its "Turn N" briefing
+  annotation.
+# No tools needed — the operation reads sdk.thread.ThreadStore directly
+# (in-process, read-only) and renders Markdown. It does not call any MCP
+# tools or pack-contributed tools.
+tool_ids: []
+timeout_seconds: 10
+preferred_model_id: default
+exportable: true

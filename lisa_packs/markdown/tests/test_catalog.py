@@ -61,6 +61,14 @@ def test_outline_markdown_tool_discovered() -> None:
     assert tool["pack_id"] == "lisa-pack-markdown"
 
 
+def test_render_turn_discovered() -> None:
+    root = markdown.get_content_root() / "operations"
+    catalog = json.loads(build_operation_catalog_json([root]))
+    assert "markdown_render_turn" in catalog
+    op = catalog["markdown_render_turn"]
+    assert op["description"]
+
+
 def test_outline_markdown_tool_mode_allowlist_includes_okf() -> None:
     """markdown_generate is available to the okf mode (opt-in primitive, Phase C).
 
