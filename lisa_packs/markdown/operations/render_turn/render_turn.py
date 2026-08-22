@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from kernel.models import OperationExecutionContext, OperationResult
+from pydantic import BaseModel, Field
 from sdk.thread import ThreadStore
 
 logger = logging.getLogger(__name__)
@@ -34,20 +35,26 @@ logger = logging.getLogger(__name__)
 __all__ = ["Parameters", "execute"]
 
 
-class Parameters:
+class Parameters(BaseModel):
     """Parameter surface for callers invoking the operation.
 
-    The operation reads ``ctx.params`` directly; this class documents the
-    accepted inputs.
+    The operation reads ``ctx.params`` directly; this model documents and
+    validates the accepted inputs. Declared as a ``BaseModel`` so the SDK
+    catalog builder can assign it to ``OperationDefinition.parameters_schema``
+    (which requires a ``type[BaseModel]``).
     """
 
-    turn: int
-    """The global (0-based) turn index to render."""
-
-    end_turn: int | None
-    """Optional inclusive upper bound. When set, the operation renders the
-    inclusive range ``[turn, end_turn]`` as one Markdown document. ``None``
-    (the default) renders a single turn."""
+    turn: int = Field(
+        ge=0,
+        description="The global (0-based) turn index to render.",
+    )
+    end_turn: int | None = Field(
+        default=None,
+        ge=0,
+        description="Optional inclusive upper bound. When set, the operation renders the "
+        "inclusive range [turn, end_turn] as one Markdown document. None (the "
+        "default) renders a single turn.",
+    )
 
 
 def _thread_store(ctx: OperationExecutionContext) -> ThreadStore:
