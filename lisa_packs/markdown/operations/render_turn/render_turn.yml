@@ -1,4 +1,5 @@
 operation_id: markdown_render_turn
+effect: read
 description: >
   Render a single prior turn (or an inclusive range of turns) from the
   lossless thread store as a self-contained Markdown block — user query,
