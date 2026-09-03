@@ -11,8 +11,7 @@ read-and-render: the thread log is the ground truth, and this operation
 makes any turn in it addressable as a clean Markdown document.
 
 The model can call this after consulting the thread manifest (injected in
-the system prompt each turn) to find a turn number worth rendering. The
-user can invoke it via the ``/markdown`` pack-registered slash command.
+system prompt each turn) to find a turn number worth rendering.
 
 Dependency direction: ``render_turn`` → ``sdk.thread`` (read-only),
 ``kernel.models`` (``OperationExecutionContext`` / ``OperationResult``).

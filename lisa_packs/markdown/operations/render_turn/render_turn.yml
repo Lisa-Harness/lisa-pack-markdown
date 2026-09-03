@@ -13,6 +13,7 @@ description: >
 # (in-process, read-only) and renders Markdown. It does not call any MCP
 # tools or pack-contributed tools.
 tool_ids: []
+module_path: lisa_packs.markdown.operations.render_turn.render_turn
 timeout_seconds: 10
 preferred_model_id: default
 exportable: true

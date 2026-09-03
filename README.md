@@ -8,7 +8,6 @@ The pack turns a user instruction into a markdown document that is (a) grounded 
 
 | Layer | Path | Role |
 | --- | --- | --- |
-| Mode | `modes/markdown/_mode.md` | A routable chat mode (`markdown`) matching write/forge intents. |
 | Operations | `operations/forge_document/`, `operations/consolidate/` | The two workhorses (single-doc and multi-source). |
 | Tool | `tools/markdown_generate/` | An in-process, read-only structural validator backed by `markdown-it-py`. |
 
@@ -45,16 +44,16 @@ A pure read-effect tool that parses a markdown string with `markdown-it-py` and 
 
 ## Reusing `markdown_generate` from other packs (opt-in)
 
-`markdown_generate` is a stateless, read-only primitive — other packs can deliberately adopt it. The tool is **not** blanket-enabled; reuse is opt-in and gated by two declarations that must agree:
+`markdown_generate` is a stateless, read-only primitive — other packs can deliberately adopt it. The tool yml declares **no** `mode_allowlist`, so there is no tool-level mode restriction; reuse is opt-in purely at the consumer side:
 
-1. The tool's own `mode_allowlist` (in `tools/markdown_generate/markdown_generate.tool.yml`) lists the modes that may load it. It currently includes `markdown` and `okf`.
-2. A consuming mode adds `markdown_generate` to its `allowed_tool_ids` (in its `_mode.md`).
+1. A consuming mode adds `markdown_generate` to its `allowed_tool_ids` (in its `_mode.md`), or
+2. a consuming operation lists it in its own `tool_ids` (as `forge_document` and `consolidate` do).
 
-Both must agree for the tool to be usable in a mode. The pack `lisa-pack-markdown` must be installed in the host environment.
+The pack `lisa-pack-markdown` must be installed in the host environment.
 
 ### Promotion rule
 
-`markdown_generate` remains in the markdown pack until **three or more** modes consume it. Promotion to a shared/core tool location is a separate, deliberate decision deferred until the consumer count proves the need. Adding `okf` to the `mode_allowlist` enables the possibility; it does not make `okf` consume the tool (that is `okf`'s opt-in decision when it has a concrete use case).
+`markdown_generate` remains in the markdown pack until **three or more** consumers outside this pack (modes or operations) adopt it. Promotion to a shared/core tool location is a separate, deliberate decision deferred until the consumer count proves the need.
 
 ## Configuration
 

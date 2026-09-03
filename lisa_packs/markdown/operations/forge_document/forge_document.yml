@@ -1,6 +1,7 @@
 operation_id: markdown_forge_document
 description: Combine user input with recalled memory context (and optionally an existing document), synthesize or revise a markdown document via an LLM, validate its structure with the markdown-it-py outline tool, and persist it to lisa-storage. For multi-source consolidation (preserve-detail, density floor, OKF provenance), use markdown_consolidate_sources instead.
 effect: write
+module_path: lisa_packs.markdown.operations.forge_document.forge_document
 tool_ids: [markdown_generate, write_file, read_file, memory.search]
 timeout_seconds: 300
 preferred_model_id: default

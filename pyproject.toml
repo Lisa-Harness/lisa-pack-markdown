@@ -8,7 +8,6 @@ include = ["lisa_packs*", "lisa_packs.markdown*"]
 
 [tool.setuptools.package-data]
 "lisa_packs.markdown" = [
-    "modes/**/*.md",
     "operations/**/*.md",
     "operations/**/*.yml",
     "operations/**/prompts/*.md",

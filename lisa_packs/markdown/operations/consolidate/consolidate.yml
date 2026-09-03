@@ -1,5 +1,6 @@
 operation_id: markdown_consolidate_sources
 effect: write
+module_path: lisa_packs.markdown.operations.consolidate.consolidate
 description: Consolidate multiple source documents into one coherent markdown document, preserving per-source detail (anti-abridgment). Reads every source via lisa-storage, injects them with per-source NL priority notes into a preserve-detail prompt, applies map-reduce when the aggregate is large, enforces a density floor against lossy summarization, and captures OKF provenance.
 # Source ingestion uses list_files (glob expansion) + read_file; the
 # map-reduce path uses read_file_range (chunking an oversize single source)
