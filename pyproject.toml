@@ -20,8 +20,8 @@ version = "0.1.0"
 description = "Lisa markdown pack - memory-grounded markdown document forging with markdown-it-py"
 requires-python = ">=3.11"
 dependencies = [
-    "lisa-kernel",
-    "lisa-sdk",
+    "lisa-harness-kernel",
+    "lisa-harness-sdk",
     "markdown-it-py>=3.0.0",
     "mdformat>=0.7.0",
     "pymarkdownlnt>=0.9",
