@@ -36,7 +36,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from kernel.models import OperationExecutionContext, OperationResult, ToolExecutionContext
+from kernel import model_budgets
+from kernel.models import (
+    OperationExecutionContext,
+    OperationResult,
+    ToolExecutionContext,
+)
 
 from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
 from lisa_packs.markdown.operations._continuation import (
@@ -115,7 +120,13 @@ _MIN_TARGET_WORDS = 100
 _DEFAULT_LINT_RULES = ""
 _DEFAULT_LINT_REPAIR = True
 
-# Minimum structural bar for a forged document: at least one heading.
+# Reasoning-burnout rescue default. ``forge_burnout_rescue`` gates the
+# empty-first-pass retry (see ``_burnout_retry_budget``); enabled by
+# default because the failure it repairs is a budget-shape failure no
+# caller refinement can fix.
+_DEFAULT_BURNOUT_RESCUE = True
+
+#: Minimum structural bar for a forged document: at least one heading.
 _MIN_HEADINGS = 1
 
 
@@ -228,25 +239,38 @@ class _ResolvedSettings:
     lint_repair: bool
     # Phase B: target-length-driven budgeting
     tokens_per_word: float
+    # Reasoning-burnout rescue: whether the empty-first-pass retry fires.
+    burnout_rescue: bool
 
 
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
     pc = ctx.pack_config
     return _ResolvedSettings(
-        max_completion_tokens=cfg_int(pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS),
-        max_continue_tokens=cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
-        max_continue_attempts=cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
+        max_completion_tokens=cfg_int(
+            pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS
+        ),
+        max_continue_tokens=cfg_int(
+            pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS
+        ),
+        max_continue_attempts=cfg_int(
+            pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS
+        ),
         max_recall_records=cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
         max_document_chars=cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
         max_query_chars=cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
         lint_rules=cfg_str(pc, "forge_lint_rules", _DEFAULT_LINT_RULES),
         lint_repair=cfg_bool(pc, "forge_lint_repair", _DEFAULT_LINT_REPAIR),
-        tokens_per_word=cfg_float(pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD),
+        tokens_per_word=cfg_float(
+            pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD
+        ),
+        burnout_rescue=cfg_bool(pc, "forge_burnout_rescue", _DEFAULT_BURNOUT_RESCUE),
     )
 
 
-def _extract_query(ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int) -> str:
+def _extract_query(
+    ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int
+) -> str:
     """Return the user-supplied instruction, bounded in length."""
     raw = str(params.get("query") or ctx.query or "").strip()
     if len(raw) > max_query_chars:
@@ -312,7 +336,9 @@ async def _recall_memory(
     ``RuntimeError`` only when the tool executor itself is missing.
     """
     if ctx.host is None:
-        raise RuntimeError("markdown requires OperationHost to call memory/storage tools")
+        raise RuntimeError(
+            "markdown requires OperationHost to call memory/storage tools"
+        )
 
     recall_limit = max(1, min(int(limit), 20))
     tool_result = await ctx.host.execute_tool(
@@ -356,7 +382,11 @@ async def _recall_memory(
             elif isinstance(item, str) and item.strip():
                 lines.append(f"- {item.strip()}")
         return "\n".join(lines)
-    if isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
+    if (
+        isinstance(data, dict)
+        and "results" in data
+        and isinstance(data["results"], list)
+    ):
         lines = []
         for item in data["results"]:
             if isinstance(item, dict):
@@ -389,7 +419,9 @@ async def _call_llm(
     """
     host = ctx.host
     if host is None:
-        raise RuntimeError("markdown requires OperationHost.complete and OperationHost.resolve_model")
+        raise RuntimeError(
+            "markdown requires OperationHost.complete and OperationHost.resolve_model"
+        )
 
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
     model_def = host.resolve_model(preferred_model_id)
@@ -422,6 +454,208 @@ async def _call_llm(
     truncated = getattr(completion, "truncated", None)
     finish_reason = getattr(completion, "finish_reason", None)
     return content.strip(), model_def, truncated, finish_reason
+
+
+def _empty_response_diagnostics(finish_reason: Any, max_tokens: int) -> str:
+    """Render the ``{diagnostics}`` placeholder of the empty-response prompt.
+
+    The 2026-10-14 forge incident returned a bare "Empty Response" four turns
+    in a row and the failure was misread as environmental. Surfacing the
+    finish reason and the budget makes a reasoning-budget exhaustion — the
+    budget-shape failure the rescue above repairs — distinguishable from a
+    genuine provider-empty response in the tool result itself (the
+    ``_empty_content_detail`` contract the declarative operations already
+    follow).
+    """
+    parts: list[str] = []
+    if finish_reason is not None:
+        parts.append(f"finish_reason={finish_reason}")
+    parts.append(f"max_tokens={max_tokens}")
+    if str(finish_reason) == "length":
+        parts.append("likely_reasoning_budget_exhaustion")
+    return f" [{', '.join(parts)}]"
+
+
+def _burnout_retry_budget(
+    *,
+    first_pass_max_tokens: int,
+    model_def: Any,
+    flat_ceiling: int,
+) -> int | None:
+    """Return the rescue budget for a budget-exhausted first pass.
+
+    The 2026-10-14 forge incident: a ``target_length``-derived budget
+    (words × tokens-per-word, e.g. 1300 tokens for a 1000-word target) is an
+    *output* heuristic, but a reasoning model spends its chain-of-thought
+    against the same budget — the deliberation alone exhausted it before
+    any document text was emitted. The turn-loop rescues share this shape;
+    a plain 2× of a derived budget is still too small when the deliberation
+    is long (verified: 2 × 1300 = 2600 still burned out on the same query).
+
+    The rescue therefore jumps to the operation's flat ceiling — the budget
+    the *without-target* path already proves sufficient — when that
+    exceeds the exhausted first-pass budget; ``None`` when raising cannot
+    help (flat ceiling not above the base, or the model's declared
+    ``max_completion_tokens`` caps below the base).
+    """
+    model_ceiling = model_budgets._model_completion_ceiling(model_def)
+    candidates = [flat_ceiling]
+    if model_ceiling is not None:
+        candidates.append(model_ceiling)
+    resolved = max(first_pass_max_tokens, min(candidates))
+    if resolved <= first_pass_max_tokens:
+        return None
+    return resolved
+
+
+async def _complete_raw(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    memory_context: str,
+    existing_document: str,
+    max_tokens: int,
+    target_length_guidance: str,
+    model_def: Any,
+) -> Any:
+    """Issue one forge completion and return the raw host completion object.
+
+    ``_call_llm`` reduces the completion to four scalars; the burnout
+    classifier needs the spending shape (``usage``), so the forge first
+    pass goes through this variant. Renders the same prompts byte-identical
+    to ``_call_llm``.
+    """
+    system_prompt = _load_text(ctx, _SYSTEM_PROMPT_PATH)
+    user_template = _load_text(ctx, _USER_PROMPT_PATH)
+    user_prompt = _format_template(
+        user_template,
+        user_input=user_input,
+        memory_context=memory_context or "(no recalled context)",
+        existing_document=existing_document or "(no existing document — start fresh)",
+        target_length_guidance=target_length_guidance,
+    )
+    return await ctx.host.complete(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        model_def=model_def,
+        max_tokens=max_tokens,
+        temperature=0.2,
+        tools=None,
+        response_format=None,
+    )
+
+
+def _completion_spent(completion: Any, *, requested: int) -> bool:
+    """Return True when the completion visibly consumed its whole budget.
+
+    A ``length`` stop is the provider's own exhaustion proof. A clean stop
+    needs the completion-token spend to reach the shared burn share — the
+    exact predicate the turn-loop rescues run.
+    """
+    if getattr(completion, "finish_reason", None) == "length":
+        return True
+    return model_budgets._is_reasoning_burnout_completion(
+        completion, base_max_tokens=requested
+    )
+
+
+async def _call_llm_forge(
+    ctx: OperationExecutionContext,
+    user_input: str,
+    memory_context: str,
+    *,
+    existing_document: str,
+    max_tokens: int,
+    target_length_guidance: str,
+    flat_ceiling: int,
+    burnout_rescue: bool,
+) -> tuple[str, Any, bool | None, str | None, int]:
+    """Forge first pass plus one budget-shape rescue.
+
+    Reasoning-capable models can exhaust a small derived budget on
+    chain-of-thought before emitting anything (the 2026-10-14 forge Empty
+    Response incident: four reproducible failures with
+    ``finish_reason=length, content=""`` at a target-derived 1300-token
+    budget). When the first pass consumed its budget and returned no
+    visible content, the same call retries once at
+    ``_burnout_retry_budget``'s usable ceiling. Any other empty response
+    (a cheap provider-empty generation whose spend never approached the
+    budget) returns unchanged — the model really had nothing, and retrying
+    would only double an already-wasted call.
+
+    Returns ``(content, model_def, truncated, finish_reason, max_tokens)``
+    where ``max_tokens`` is the budget that produced the returned content
+    (the rescue's ceiling when the retry ran).
+    """
+    host = ctx.host
+    if host is None:
+        raise RuntimeError(
+            "markdown requires OperationHost.complete and OperationHost.resolve_model"
+        )
+    preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
+    model_def = host.resolve_model(preferred_model_id)
+    if model_def is None:
+        raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
+
+    completion = await _complete_raw(
+        ctx,
+        user_input=user_input,
+        memory_context=memory_context,
+        existing_document=existing_document,
+        max_tokens=max_tokens,
+        target_length_guidance=target_length_guidance,
+        model_def=model_def,
+    )
+    content = (getattr(completion, "content", "") or "").strip()
+    truncated = getattr(completion, "truncated", None)
+    finish_reason = getattr(completion, "finish_reason", None)
+    if (
+        not content
+        and burnout_rescue
+        and _completion_spent(completion, requested=max_tokens)
+    ):
+        retry_tokens = _burnout_retry_budget(
+            first_pass_max_tokens=max_tokens,
+            model_def=model_def,
+            flat_ceiling=flat_ceiling,
+        )
+        if retry_tokens is not None:
+            logger.warning(
+                "forge_document: first pass consumed its budget with empty content "
+                "(finish_reason=%r, max_tokens=%d); retrying once with a higher "
+                "budget (model=%s, to=%d)",
+                finish_reason,
+                max_tokens,
+                getattr(model_def, "model_id", ""),
+                retry_tokens,
+            )
+            retry_completion = await _complete_raw(
+                ctx,
+                user_input=user_input,
+                memory_context=memory_context,
+                existing_document=existing_document,
+                max_tokens=retry_tokens,
+                target_length_guidance=target_length_guidance,
+                model_def=model_def,
+            )
+            return (
+                (getattr(retry_completion, "content", "") or "").strip(),
+                model_def,
+                getattr(retry_completion, "truncated", None),
+                getattr(retry_completion, "finish_reason", None),
+                retry_tokens,
+            )
+        logger.warning(
+            "forge_document: first pass consumed its budget with empty content "
+            "(finish_reason=%r, max_tokens=%d) and no higher budget is available; "
+            "not retrying (model=%s)",
+            finish_reason,
+            max_tokens,
+            getattr(model_def, "model_id", ""),
+        )
+    return content, model_def, truncated, finish_reason, max_tokens
 
 
 def _user_asked_not_to_annotate(user_input: str) -> bool:
@@ -655,7 +889,9 @@ async def _persist_no_outline_document(
     )
 
 
-async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
+async def _validate_outline(
+    ctx: OperationExecutionContext, document: str
+) -> dict[str, Any]:
     """Run the ``markdown_gehost.execute_toolnd return its outline dict.
 
     Raises ``RuntimeError`` if the tool returns an error.
@@ -693,9 +929,9 @@ async def _persist_document(
     path: str,
 ) -> dict[str, Any]:
     """Write the document to lisa-storage via the ``write_file`` tool.
-host.execute_tool
-    Returns the parsed JSON response (with ``ok``/``path``/``bytes``).
-    Raises ``RuntimeError`` on any tool failure.
+    host.execute_tool
+        Returns the parsed JSON response (with ``ok``/``path``/``bytes``).
+        Raises ``RuntimeError`` on any tool failure.
     """
     tool_result = await ctx.host.execute_tool(
         _WRITE_TOOL_ID,
@@ -734,7 +970,9 @@ def _format_markdown(document: str) -> str:
     try:
         return mdformat.text(document, options={"number": True}).rstrip() + "\n"
     except Exception as exc:  # pylint: disable=broad-except
-        logger.warning("forge_document: mdformat failed (%s); using unformatted document", exc)
+        logger.warning(
+            "forge_document: mdformat failed (%s); using unformatted document", exc
+        )
         return document
 
 
@@ -785,16 +1023,31 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         if target_words is not None
         else cfg.max_continue_tokens
     )
-    completion_text, model_def, first_truncated, first_finish_reason = await _call_llm(
+    (
+        completion_text,
+        model_def,
+        first_truncated,
+        first_finish_reason,
+        effective_max_tokens,
+    ) = await _call_llm_forge(
         ctx,
         user_input,
         memory_context,
         existing_document=existing_document,
         max_tokens=first_pass_max_tokens,
         target_length_guidance=target_guidance,
+        flat_ceiling=cfg.max_completion_tokens,
+        burnout_rescue=cfg.burnout_rescue,
     )
     if not completion_text or not completion_text.strip():
-        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+        return OperationResult(
+            output_text=_format_template(
+                _load_text(ctx, _EMPTY_RESPONSE_PATH),
+                diagnostics=_empty_response_diagnostics(
+                    first_finish_reason, effective_max_tokens
+                ),
+            )
+        )
 
     document = extract_markdown_block(completion_text)
     if not document.strip():
@@ -811,18 +1064,22 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     # (``stop_reason``) is the structured outcome surfaced in
     # ``OperationResult.extra["continuation"]`` so the kernel and the
     # cap-pause diagnostic can see *why* the continuation stopped.
-    document, was_truncated, continue_attempts, final_finish_reason, continuation_stop_reason = (
-        await continue_until_complete(
-            ctx,
-            user_input=user_input,
-            document=document,
-            model_def=model_def,
-            first_truncated=first_truncated,
-            first_finish_reason=first_finish_reason,
-            max_continue_attempts=cfg.max_continue_attempts,
-            max_continue_tokens=first_pass_continue_tokens,
-            continue_prompt_path=_CONTINUE_PROMPT_PATH,
-        )
+    (
+        document,
+        was_truncated,
+        continue_attempts,
+        final_finish_reason,
+        continuation_stop_reason,
+    ) = await continue_until_complete(
+        ctx,
+        user_input=user_input,
+        document=document,
+        model_def=model_def,
+        first_truncated=first_truncated,
+        first_finish_reason=first_finish_reason,
+        max_continue_attempts=cfg.max_continue_attempts,
+        max_continue_tokens=first_pass_continue_tokens,
+        continue_prompt_path=_CONTINUE_PROMPT_PATH,
     )
 
     # Lint/format the document so the persisted output is clean and consistent.
@@ -830,7 +1087,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
 
     # Char cap.
     if len(document) > cfg.max_document_chars:
-        document = document[:cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
+        document = document[: cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
         was_truncated = True
         continuation_stop_reason = "char_cap"
 
@@ -971,7 +1228,9 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             else None
         ),
         extra={
-            "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
+            "memory_context_lines": memory_context.count("\n") + 1
+            if memory_context
+            else 0,
             "document_path": stored_path,
             "truncated": was_truncated,
             "continue_attempts": continue_attempts,

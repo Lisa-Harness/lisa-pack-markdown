@@ -56,6 +56,13 @@ class _FakeCompletion:
     request_id: str = "test"
     tool_calls: list[Any] | None = None
     usage: Any = None
+    # Per-call completion-token spend, mirroring the ``CompletionResult``
+    # direct attribute the burnout predicate reads (``usage`` carries it in
+    # provider shapes; tests can pass either).
+    completion_tokens: int = 0
+    # Reasoning-model chain-of-thought, per ``CompletionResult`` — the
+    # burnout predicate requires it to be present for the clean-stop shape.
+    reasoning_content: str = ""
     # Default to a clean stop (not truncated) so existing tests do not trip
     # the continuation path. Tests that exercise truncation pass
     # ``truncated=True`` explicitly. ``finish_reason`` is kept for telemetry.
