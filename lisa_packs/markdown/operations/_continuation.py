@@ -25,6 +25,20 @@ complete; otherwise we keep going up to the budget.
 ``_load_text`` lives here because every continuation pass loads an authored
 continue prompt via ``ctx.host.read_authored_text``; the caller supplies
 the exact ``continue_prompt_path`` so each operation can use its own prompt.
+
+Outline-contract machinery (self-abridgment defense):
+
+``parse_forge_plan`` strips the ``<!-- forge-plan: ... -->`` section
+declaration the forge prompts ask for and returns the planned ``##``
+sections. ``missing_planned_sections`` diffs that plan against the headings
+actually present in the document. ``expand_missing_sections`` issues bounded
+expansion passes that write only the missing sections and merge them. This
+is the defense against a model that stops cleanly but quietly omits planned
+sections — the 2026-10-16 unveil-strategy incident, where
+``truncated=False``/``finish_reason=stop`` was truthful (the model *did*
+stop on its own) yet sections 4–5 were never written. None of this runs
+when the model emits no plan marker, so documents without a declared plan
+take the legacy path byte-for-byte.
 """
 
 from __future__ import annotations
@@ -39,7 +53,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "continue_until_complete",
+    "expand_missing_sections",
     "extract_markdown_block",
+    "missing_planned_sections",
+    "parse_forge_plan",
 ]
 
 # The structured stop reason for a continuation run, surfaced in
@@ -155,7 +172,9 @@ def _looks_complete(document: str) -> bool:
         return True  # ends on a blank line — clean
     if last_line.endswith(("```", ".", "!", "?", ":", ";", ">", ")")):
         return True
-    if re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(r"^\s*\d+\. +\S", last_line):
+    if re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(
+        r"^\s*\d+\. +\S", last_line
+    ):
         return True
     # A heading as the LAST content line is a truncation signal: the model
     # opened a section but wrote no body.
@@ -219,7 +238,7 @@ def _tail_is_duplicate(document_so_far: str, tail: str) -> bool:
         # The continuation is longer than the entire document-so-far — it
         # must contain new content, so not a pure duplicate.
         return False
-    suffix = head_lines[-len(tail_lines):]
+    suffix = head_lines[-len(tail_lines) :]
     return suffix == tail_lines
 
 
@@ -242,7 +261,9 @@ async def _continue_llm(
     """
     host = ctx.host
     if host is None:
-        raise RuntimeError("markdown requires OperationHost.complete to continue a truncated document")
+        raise RuntimeError(
+            "markdown requires OperationHost.complete to continue a truncated document"
+        )
 
     continue_template = _load_text(ctx, continue_prompt_path)
     continue_prompt = continue_template.replace("{user_input}", user_input).replace(
@@ -303,7 +324,9 @@ async def continue_until_complete(
     continuation path's (otherwise the continuation consumes the retry
     budget duplicating a heading-only tail before the density retry runs).
     """
-    structurally_incomplete = _ends_on_dangling_heading(document) if structural_override else False
+    structurally_incomplete = (
+        _ends_on_dangling_heading(document) if structural_override else False
+    )
 
     # Decide whether to continue at all.
     if first_truncated is False and not structurally_incomplete:
@@ -377,7 +400,8 @@ async def continue_until_complete(
         current = _merge_continuation(current, tail)
         if _looks_complete(current) and cont_truncated is False:
             logger.info(
-                "forge_document: continuation pass %d completed the document", attempt,
+                "forge_document: continuation pass %d completed the document",
+                attempt,
             )
             stop_reason = "completed"
             logger.info(
@@ -392,10 +416,15 @@ async def continue_until_complete(
             logger.warning(
                 "forge_document: exhausted %d continuation attempts; "
                 "persisting with truncated annotation (final finish_reason=%r)",
-                attempt, cont_finish_reason,
+                attempt,
+                cont_finish_reason,
             )
             stop_reason = "exhausted"
-    if first_truncated is None and not structurally_incomplete and stop_reason == "exhausted":
+    if (
+        first_truncated is None
+        and not structurally_incomplete
+        and stop_reason == "exhausted"
+    ):
         # The unknown-truncated safety-net pass ran and did not complete
         # the document. ``stop_reason`` stays as set by the break path
         # (``"empty"`` / ``"no_markdown_tail"`` / ``"duplicate_tail"``) or
@@ -413,3 +442,217 @@ async def continue_until_complete(
         len(current),
     )
     return current, True, attempts, final_finish_reason, stop_reason
+
+
+# ── Outline contract (self-abridgment defense) ─────────────────────────
+
+
+#: The plan marker the forge prompts ask for: an HTML comment as the first
+#: line inside the fenced block, listing the intended ``##`` section titles.
+_PLAN_MARKER_RE = re.compile(r"^\s*<!--\s*forge-plan\s*:\s*(.*?)\s*-->\s*$")
+#: A planned-section entry. ``##`` is stripped from emitted entries so a
+#: model that writes ``forge-plan: ## Rules / ## Usage`` and one that writes
+#: ``forge-plan: Rules / Usage`` parse identically.
+_PLAN_SECTION_RE = re.compile(r"^#{1,6}\s+")
+_PLAN_SPLIT_RE = re.compile(r"[,;/•]|\band\b")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def parse_forge_plan(document: str) -> tuple[str, tuple[str, ...]]:
+    """Split a forged document into ``(body, planned_sections)``.
+
+    The forge prompts ask the model to declare its section plan as a
+    ``<!-- forge-plan: ## A / ## B -->`` comment as the first line of the
+    fenced block. When present, that line is removed from the body (the
+    marker is scaffolding and must never reach the persisted document) and
+    the planned ``##`` titles are returned normalized (heading marker
+    stripped, whitespace collapsed).
+
+    Returns the document unchanged with an empty plan tuple when no marker
+    is present — the legacy path for models that ignore the instruction.
+    """
+    if not document:
+        return document, ()
+    lines = document.splitlines()
+    for idx, line in enumerate(lines):
+        m = _PLAN_MARKER_RE.match(line)
+        if not m:
+            # A continuation pass may re-emit the marker at its own start;
+            # only a leading-position marker (before body content) counts.
+            if line.strip():
+                break
+            continue
+        raw = m.group(1)
+        planned: list[str] = []
+        for entry in _PLAN_SPLIT_RE.split(raw):
+            title = _PLAN_SECTION_RE.sub("", entry.strip()).strip()
+            if title and title.lower() not in (s.lower() for s in planned):
+                planned.append(title)
+        body = "\n".join(lines[:idx] + lines[idx + 1 :]).strip()
+        return body, tuple(planned)
+    return document, ()
+
+
+def _norm_title(title: str) -> str:
+    """Case/punctuation-insensitive title normalization for plan matching."""
+    return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+
+
+def missing_planned_sections(
+    planned: tuple[str, ...], document: str
+) -> tuple[str, ...]:
+    """Return the planned ``##`` titles with no matching heading in the document.
+
+    Matching is a normalized fuzzy containment in either direction: a
+    planned section counts as present when a document title contains it or
+    it contains a document title (covers "Launch sequence" planning a
+    document heading "## 4. Launch sequence", and numbered-prefix drift
+    such as "Competitive FAQ" vs "## 5. Competitive FAQ — why not just X?").
+    Only ``##``-level and deeper headings satisfy the contract; a lone
+    ``#``-level title does not.
+    """
+    if not planned:
+        return ()
+    present: list[tuple[str, str]] = []
+    for line in document.splitlines():
+        m = _HEADING_RE.match(line.rstrip())
+        if m and m.group(1) != "#":
+            present.append((_norm_title(m.group(2)), m.group(2)))
+    missing: list[str] = []
+    for planned_title in planned:
+        want = _norm_title(planned_title)
+        if not want:
+            continue
+        if want.startswith("no plan") or want in ("none", "n a"):
+            continue
+        hit = False
+        for norm, _raw in present:
+            if want in norm or norm in want:
+                hit = True
+                break
+        if not hit:
+            missing.append(planned_title)
+    return tuple(missing)
+
+
+def _planned_section_body(planned_title: str, tail: str) -> str:
+    """Extract one planned section's body from an expansion-pass tail.
+
+    The expansion prompt asks for each missing section under its declared
+    ``##`` heading. Returns the body from that heading to the section end
+    (next same-or-shallower heading or EOF), or ``""`` when the tail has no
+    heading matching ``planned_title`` — the caller handles heading-less
+    tails with its own whole-tail fallback.
+    """
+    lines = tail.splitlines()
+    start: int | None = None
+    start_level = 2
+    for idx, line in enumerate(lines):
+        m = _HEADING_RE.match(line.rstrip())
+        if not m:
+            continue
+        norm = _norm_title(m.group(2))
+        want = _norm_title(planned_title)
+        if norm == want or want in norm or norm in want:
+            start = idx
+            start_level = len(m.group(1))
+            break
+    if start is None:
+        return ""
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        m = _HEADING_RE.match(lines[idx].rstrip())
+        if (
+            m
+            and len(m.group(1)) <= start_level
+            and _norm_title(m.group(2)) != _norm_title(planned_title)
+        ):
+            end = idx
+            break
+    return "\n".join(lines[start:end]).strip()
+
+
+async def expand_missing_sections(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    document: str,
+    planned: tuple[str, ...],
+    missing: tuple[str, ...],
+    model_def: Any,
+    max_tokens: int,
+    max_attempts: int,
+    expand_prompt_path: str,
+) -> tuple[str, int, bool]:
+    """Run bounded expansion passes for planned sections absent from the document.
+
+    Each pass feeds the model the document and the remaining missing
+    sections via the authored expand prompt; the returned sections are
+    merged with ``_merge_continuation`` and the diff is recomputed. At
+    most ``max_attempts`` passes run (each should write at least one
+    section, so the number of missing sections is an upper bound too).
+    Returns ``(document, attempts, still_missing)``. The document is
+    returned unchanged when a pass yields nothing usable, mirroring the
+    continuation path's give-up semantics (``stop_reason`` values
+    ``"empty"`` / ``"no_markdown_tail"`` / ``"duplicate_tail"`` collapse
+    here into plain aborts — the caller logs the final missing set).
+    """
+    host = ctx.host
+    if host is None:
+        raise RuntimeError(
+            "markdown requires OperationHost.complete to expand missing sections"
+        )
+    template = _load_text(ctx, expand_prompt_path)
+    current = document
+    still = tuple(missing)
+    attempts = 0
+    for _attempt in range(1, max(max_attempts, 0) + 1):
+        if not still:
+            break
+        attempts += 1
+        prompt = (
+            template.replace("{user_input}", user_input)
+            .replace("{document_so_far}", current)
+            .replace(
+                "{missing_sections}", "\n".join(f"- ## {title}" for title in still)
+            )
+        )
+        completion = await host.complete(
+            messages=[{"role": "user", "content": prompt}],
+            model_def=model_def,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            tools=None,
+            response_format=None,
+        )
+        content = (getattr(completion, "content", "") or "").strip()
+        if not content:
+            break
+        tail = extract_markdown_block(content)
+        if not tail.strip():
+            break
+        # Collect the heading-anchored bodies the pass actually wrote; skip
+        # duplicates of the existing document tail (looping models). When
+        # the tail carries no planned heading at all, fall back to the
+        # whole tail ONCE — two missing titles must never merge the same
+        # prose twice.
+        usable: list[str] = []
+        matched_any_heading = False
+        for title in still:
+            body = _planned_section_body(title, tail)
+            if not body:
+                continue
+            matched_any_heading = True
+            if _tail_is_duplicate(current, body):
+                continue
+            usable.append(body)
+        if not usable:
+            if matched_any_heading:
+                break
+            body = tail.strip()
+            if not body or _tail_is_duplicate(current, body):
+                break
+            usable.append(body)
+        current = _merge_continuation(current, "\n\n".join(usable))
+        still = missing_planned_sections(planned, current)
+    return current, attempts, bool(still)

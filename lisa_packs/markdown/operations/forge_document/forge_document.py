@@ -46,7 +46,10 @@ from kernel.models import (
 from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
 from lisa_packs.markdown.operations._continuation import (
     continue_until_complete,
+    expand_missing_sections,
     extract_markdown_block,
+    missing_planned_sections,
+    parse_forge_plan,
 )
 from lisa_packs.markdown.operations._lint import (
     LintIssue,
@@ -89,6 +92,7 @@ _EMPTY_DOCUMENT_PATH = f"{_PROMPT_DIR}/forge_document_empty_document.md"
 _NO_OUTLINE_PATH = f"{_PROMPT_DIR}/forge_document_no_outline.md"
 _STORAGE_FAILED_PATH = f"{_PROMPT_DIR}/forge_document_storage_failed.md"
 _CONTINUE_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_continue.md"
+_EXPAND_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_expand.md"
 _LINT_REPAIR_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_lint_repair.md"
 
 # Fallback defaults for the operation's configurable budgets. The
@@ -118,6 +122,15 @@ _MIN_TARGET_WORDS = 100
 # single repair pass. Lint is advisory — the outline gate stays the only
 # hard reject.
 _DEFAULT_LINT_RULES = ""
+
+# Outline contract (self-abridgment defense, 2026-10-16 incident): when the
+# model declares a ``<!-- forge-plan: ... -->`` section plan and the finished
+# document is missing planned sections, run bounded expansion passes. The
+# gate is advisory — like lint, it never hard-rejects; a still-incomplete
+# document persists with a degraded status and a structured telemetry block.
+# Documents without a plan marker skip the gate entirely (legacy path).
+_DEFAULT_OUTLINE_CONTRACT = True
+_DEFAULT_OUTLINE_CONTRACT_ATTEMPTS = 2
 _DEFAULT_LINT_REPAIR = True
 
 # Reasoning-burnout rescue default. ``forge_burnout_rescue`` gates the
@@ -242,6 +255,10 @@ class _ResolvedSettings:
     # Reasoning-burnout rescue: whether the empty-first-pass retry fires.
     burnout_rescue: bool
 
+    # Outline contract: expand passes for planned-but-missing sections.
+    outline_contract: bool
+    outline_contract_attempts: int
+
 
 def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
@@ -263,6 +280,12 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         lint_repair=cfg_bool(pc, "forge_lint_repair", _DEFAULT_LINT_REPAIR),
         tokens_per_word=cfg_float(
             pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD
+        ),
+        outline_contract=cfg_bool(
+            pc, "forge_outline_contract", _DEFAULT_OUTLINE_CONTRACT
+        ),
+        outline_contract_attempts=cfg_int(
+            pc, "forge_outline_contract_attempts", _DEFAULT_OUTLINE_CONTRACT_ATTEMPTS
         ),
         burnout_rescue=cfg_bool(pc, "forge_burnout_rescue", _DEFAULT_BURNOUT_RESCUE),
     )
@@ -670,12 +693,14 @@ def _build_model_annotation(
     truncated: bool = False,
     final_finish_reason: str | None = None,
     continue_attempts: int = 0,
+    missing_sections: tuple[str, ...] = (),
 ) -> str:
     """Build a trailing HTML-comment attribution line for the resolved model.
 
     When ``truncated`` is True, an explicit ``truncated by model`` marker is
     appended so a reader scanning the artifact knows the document is
-    incomplete even though the operation persisted it.
+    incomplete even though the operation persisted it. ``missing_sections``
+    is the outline-contract gap: planned sections the document still lacks.
     """
     provider = str(getattr(model_def, "provider", "") or "").strip()
     model_id = str(getattr(model_def, "model_id", "") or "").strip()
@@ -686,7 +711,10 @@ def _build_model_annotation(
         parts.append(f"model: {model_id}")
     if truncated:
         reason = final_finish_reason or "unknown"
-        parts.append(f"truncated by model · finish_reason: {reason}")
+        if missing_sections:
+            parts.append("missing sections: " + ", ".join(missing_sections))
+        else:
+            parts.append(f"truncated by model · finish_reason: {reason}")
         if continue_attempts:
             parts.append(f"continue_attempts: {continue_attempts}")
     if not parts:
@@ -809,6 +837,10 @@ async def _persist_no_outline_document(
     first_finish_reason: str | None,
     final_finish_reason: str | None,
     continuation_stop_reason: str,
+    forge_plan: tuple[str, ...] = (),
+    planned_missing: tuple[str, ...] = (),
+    outline_contract_attempts: int = 0,
+    outline_contract_stop_reason: str = "skipped",
 ) -> OperationResult:
     """Persist a zero-heading document with a warning comment instead of discarding it.
 
@@ -878,6 +910,13 @@ async def _persist_no_outline_document(
             "truncated": was_truncated,
             "continue_attempts": continue_attempts,
             "no_outline": True,
+            "outline_contract": {
+                "planned": list(forge_plan),
+                "missing_before": list(planned_missing),
+                "missing_after": list(planned_missing),
+                "attempts": outline_contract_attempts,
+                "stop_reason": outline_contract_stop_reason,
+            },
             "continuation": {
                 "was_truncated": was_truncated,
                 "attempts": continue_attempts,
@@ -1057,6 +1096,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         return OperationResult(output_text=text)
 
+    # Outline contract: strip the declared section plan from the body and
+    # remember it for the post-continuation completeness check. No marker →
+    # no plan → the gate is skipped entirely (legacy path, no extra calls).
+    document, forge_plan = parse_forge_plan(document)
+
     # Truncation handling: the provider-owned ``truncated`` signal drives
     # the decision. ``True`` → continue up to the budget; ``False`` → no
     # continuation (unless a dangling-heading structural override fires);
@@ -1082,6 +1126,77 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         continue_prompt_path=_CONTINUE_PROMPT_PATH,
     )
 
+    # Outline-contract gate: the model may stop cleanly yet quietly omit
+    # planned sections (the 2026-10-16 self-abridgment incident —
+    # ``truncated=False`` was truthful, the doc was still short). When a
+    # plan was declared and sections are missing, run the same number of
+    # bounded expand passes as the continuation budget allows, at the same
+    # per-pass budget the continuation path uses. Advisory: a document that
+    # is still missing sections persists with degraded status and telemetry.
+    missing_plan_sections: tuple[str, ...] = ()
+    planned_missing: tuple[str, ...] = ()
+    outline_contract_attempts = 0
+    outline_contract_stop_reason = "skipped"
+    if cfg.outline_contract and forge_plan:
+        planned_missing = missing_planned_sections(forge_plan, document)
+        if planned_missing:
+            try:
+                (
+                    document,
+                    outline_contract_attempts,
+                    _contract_incomplete,
+                ) = await expand_missing_sections(
+                    ctx,
+                    user_input=user_input,
+                    document=document,
+                    planned=forge_plan,
+                    missing=planned_missing,
+                    model_def=model_def,
+                    max_tokens=first_pass_continue_tokens,
+                    max_attempts=cfg.outline_contract_attempts,
+                    expand_prompt_path=_EXPAND_PROMPT_PATH,
+                )
+                missing_plan_sections = missing_planned_sections(forge_plan, document)
+                if not missing_plan_sections:
+                    outline_contract_stop_reason = "expanded"
+                elif missing_plan_sections != planned_missing:
+                    outline_contract_stop_reason = "partial"
+                else:
+                    outline_contract_stop_reason = "still_missing"
+            except RuntimeError as exc:
+                logger.warning(
+                    "forge_document: outline-contract expansion failed (%s); "
+                    "persisting without it",
+                    exc,
+                )
+                outline_contract_stop_reason = "error"
+                missing_plan_sections = planned_missing
+            if missing_plan_sections:
+                logger.warning(
+                    "forge_document: document still missing planned section(s) "
+                    "after expansion: %s",
+                    ", ".join(missing_plan_sections),
+                )
+                was_truncated = True
+                continuation_stop_reason = (
+                    continuation_stop_reason
+                    if continuation_stop_reason not in ("completed", "not_needed")
+                    else "outline_contract"
+                )
+            logger.info(
+                "forge.outline_contract: attempts=%d planned=%d "
+                "missing_before=%d missing_after=%d stop_reason=%s",
+                outline_contract_attempts,
+                len(forge_plan),
+                len(planned_missing),
+                len(missing_plan_sections),
+                outline_contract_stop_reason,
+            )
+        else:
+            outline_contract_stop_reason = "satisfied"
+    elif not cfg.outline_contract:
+        outline_contract_stop_reason = "disabled"
+
     # Lint/format the document so the persisted output is clean and consistent.
     document = _format_markdown(document)
 
@@ -1099,6 +1214,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             truncated=was_truncated,
             final_finish_reason=final_finish_reason if was_truncated else None,
             continue_attempts=continue_attempts if was_truncated else 0,
+            missing_sections=missing_plan_sections,
         )
         if annotation:
             document = document.rstrip() + "\n\n" + annotation + "\n"
@@ -1124,6 +1240,10 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             first_finish_reason=first_finish_reason,
             final_finish_reason=final_finish_reason,
             continuation_stop_reason=continuation_stop_reason,
+            forge_plan=forge_plan,
+            planned_missing=planned_missing,
+            outline_contract_attempts=outline_contract_attempts,
+            outline_contract_stop_reason=outline_contract_stop_reason,
         )
 
     # Phase A: advisory lint gate. Lint is never a hard reject — the outline
@@ -1163,6 +1283,10 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
                     first_finish_reason=first_finish_reason,
                     final_finish_reason=final_finish_reason,
                     continuation_stop_reason=continuation_stop_reason,
+                    forge_plan=forge_plan,
+                    planned_missing=planned_missing,
+                    outline_contract_attempts=outline_contract_attempts,
+                    outline_contract_stop_reason=outline_contract_stop_reason,
                 )
             lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
     if lint_issues:
@@ -1195,11 +1319,18 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         f"({byte_count} bytes, {heading_count} headings)."
     )
     if was_truncated:
-        summary += (
-            f" WARNING: persisted truncated after {continue_attempts} "
-            f"continuation attempt(s) (final finish_reason="
-            f"{final_finish_reason!r}). See annotation in document."
-        )
+        if missing_plan_sections:
+            summary += (
+                f" WARNING: document is missing planned section(s) after "
+                f"{outline_contract_attempts} expansion attempt(s): "
+                f"{', '.join(missing_plan_sections)}. See annotation in document."
+            )
+        else:
+            summary += (
+                f" WARNING: persisted truncated after {continue_attempts} "
+                f"continuation attempt(s) (final finish_reason="
+                f"{final_finish_reason!r}). See annotation in document."
+            )
     if lint_issues:
         summary += (
             f" Note: {len(lint_issues)} structural lint warning(s) remain "
@@ -1219,6 +1350,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "lint_warnings": len(lint_issues),
             "lint_repair_used": lint_repair_used,
             "target_words": target_words,
+            "missing_plan_sections": list(missing_plan_sections),
         },
         status="degraded" if was_truncated else "success",
         error_detail=(
@@ -1236,6 +1368,13 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "continue_attempts": continue_attempts,
             "lint_warnings": len(lint_issues),
             "target_words": target_words,
+            "outline_contract": {
+                "planned": list(forge_plan),
+                "missing_before": list(planned_missing) if forge_plan else [],
+                "missing_after": list(missing_plan_sections),
+                "attempts": outline_contract_attempts,
+                "stop_reason": outline_contract_stop_reason,
+            },
             "continuation": {
                 "was_truncated": was_truncated,
                 "attempts": continue_attempts,
