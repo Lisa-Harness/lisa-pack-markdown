@@ -50,6 +50,7 @@ from lisa_packs.markdown.operations._continuation import (
     extract_markdown_block,
     missing_planned_sections,
     parse_forge_plan,
+    repair_inline_fences,
 )
 from lisa_packs.markdown.operations._lint import (
     LintIssue,
@@ -1198,6 +1199,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         outline_contract_stop_reason = "disabled"
 
     # Lint/format the document so the persisted output is clean and consistent.
+    # Inline-fence repair runs BEFORE formatting: mdformat treats a closing
+    # fence appended to the last code line as legal CommonMark and preserves
+    # it, so the hygiene split must land first. Re-runs after repair below
+    # for the same reason the re-format does.
+    document = repair_inline_fences(document)
     document = _format_markdown(document)
 
     # Char cap.
@@ -1265,7 +1271,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         if repaired != document:
             lint_repair_used = True
-            document = _format_markdown(repaired)
+            # The repair pass regenerated the text, so re-run the fence
+            # hygiene split before formatting (same order rationale as
+            # the primary pass above).
+            document = repair_inline_fences(repaired)
+            document = _format_markdown(document)
             # Re-validate the repaired document's outline.
             try:
                 outline = await _validate_outline(ctx, document)

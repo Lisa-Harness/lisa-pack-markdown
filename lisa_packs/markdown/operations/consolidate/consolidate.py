@@ -51,6 +51,7 @@ from lisa_packs.markdown.operations._lint import (
 from lisa_packs.markdown.operations._continuation import (
     continue_until_complete,
     extract_markdown_block,
+    repair_inline_fences,
 )
 from lisa_packs.markdown.operations.consolidate._source_paths import (
     SourceSpec,
@@ -1571,7 +1572,10 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     else:
         per_source_meta = None
 
-    # Lint/format the document.
+    # Lint/format the document. Inline-fence repair runs BEFORE formatting:
+    # mdformat treats a closing fence appended to the last code line as legal
+    # CommonMark and preserves it, so the hygiene split must land first.
+    document = repair_inline_fences(document)
     document = _format_markdown(document)
 
     # Char cap.
@@ -1646,7 +1650,10 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         )
         if repaired != document:
             lint_repair_used = True
-            document = _format_markdown(repaired)
+            # Re-split inline fences before formatting (the repair pass
+            # regenerated the text).
+            document = repair_inline_fences(repaired)
+            document = _format_markdown(document)
             try:
                 outline = await _validate_outline(ctx, document)
             except RuntimeError as exc:

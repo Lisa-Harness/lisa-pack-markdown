@@ -1063,10 +1063,111 @@ def test_extract_markdown_block_empty_text() -> None:
 
 
 def test_extract_markdown_block_untagged_fence() -> None:
-    """Untagged fences (just `````) are accepted."""
+    """Untagged fences accept the block and return its body."""
     from lisa_packs.markdown.operations._continuation import extract_markdown_block
 
     text = "```\\n# Title\\n\\nBody.\\n```"
+    result = extract_markdown_block(text)
+    assert "# Title" in result
+    assert "Body." in result
+
+
+# ── repair_inline_fences unit tests (2026-10-18 p920 punch-list incident) ──
+
+
+def _incident_document() -> str:
+    """The exact forge output shape from the 2026-10-18 p920 incident.
+
+    The punch-list code block opens at line start but its closing fence
+    was authored INLINE on the last command line, hiding it from
+    line-start fence checks and keeping the block open to EOF.
+    """
+    return (
+        "# Assessment\n"
+        "\n"
+        "## Punch List\n"
+        "\n"
+        "Run in order.\n"
+        "\n"
+        "```bash\n"
+        "# 1. xrdp fix\n"
+        "sudo sed -i 's/...' /etc/xrdp/xrdp.ini\n"
+        "update-desktop-database ~/.local/share/applications```\n"
+        "\n"
+        "## Verification Steps\n"
+        "\n"
+        "Run the checks above.\n"
+    )
+
+
+def test_repair_inline_fences_splits_incident_closer() -> None:
+    """The incident shape: the inline closer is moved onto its own line."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    repaired = repair_inline_fences(_incident_document())
+    lines = repaired.splitlines()
+    assert lines[9] == "update-desktop-database ~/.local/share/applications"
+    assert lines[10] == "```"
+    assert lines[12] == "## Verification Steps"
+    # The transformation is exactly the split: removing the inserted
+    # standalone fence line from the repaired output reproduces the
+    # original document byte-for-byte.
+    restored = repaired.replace(
+        "update-desktop-database ~/.local/share/applications\n```",
+        "update-desktop-database ~/.local/share/applications```",
+        1,
+    )
+    assert restored == _incident_document()
+
+
+def test_repair_inline_fences_balanced_document_untouched() -> None:
+    """A balanced document with an intentional inline marker is never touched."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    balanced = "```bash\necho 'demo```'\n```\n\n## After\n\nBody.\n"
+    assert repair_inline_fences(balanced) == balanced
+
+
+def test_repair_inline_fences_dangling_without_inline_untouched() -> None:
+    """A dangling opener with NO inline fence gets no invented repair."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    dangling = "# Doc\n\n```bash\nsudo systemctl restart xrdp\n\n## After\nBody.\n"
+    assert repair_inline_fences(dangling) == dangling
+
+
+def test_repair_inline_fences_clean_document_untouched() -> None:
+    """Empty and fence-free documents pass through unchanged."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    assert repair_inline_fences("") == ""
+    assert repair_inline_fences("# Clean\n\ntext\n") == "# Clean\n\ntext\n"
+
+
+def test_repair_inline_fences_input_without_trailing_newline() -> None:
+    """Input lacking a trailing newline still produces a clean fenced output."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    repaired = repair_inline_fences("# Doc\n\n```bash\ncmd1\napplications```")
+    assert repaired.endswith("```\n")
+    assert repaired.splitlines()[-2] == "applications"
+
+
+def test_repair_inline_fences_four_backtick_variant() -> None:
+    """A four-backtick fence gets the same split treatment."""
+    from lisa_packs.markdown.operations._continuation import repair_inline_fences
+
+    repaired = repair_inline_fences("# Doc\n\n````bash\ncmd1\napplications````\n")
+    lines = repaired.splitlines()
+    assert lines[4] == "applications"
+    assert lines[5] == "````"
+
+
+def test_extract_markdown_block_untagged_fence_body() -> None:
+    """Untagged fenced blocks return their body (legacy behavior preserved)."""
+    from lisa_packs.markdown.operations._continuation import extract_markdown_block
+
+    text = "```\n# Title\n\nBody.\n```"
     result = extract_markdown_block(text)
     assert "# Title" in result
     assert "Body." in result

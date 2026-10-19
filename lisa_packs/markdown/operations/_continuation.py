@@ -22,6 +22,16 @@ A merged document that ends on a clean boundary (``_looks_complete``)
 AND whose continuation reported ``truncated is False`` is considered
 complete; otherwise we keep going up to the budget.
 
+Fence hygiene: LLM-authored documents occasionally append the closing
+fence of a code block INLINE at the end of the last code line (the
+closing marker riding on the final `` command`` line) instead of on its
+own line. Strict CommonMark then keeps the block open to EOF, rendering
+everything after it as code. ``repair_inline_fences`` splits such a
+fence onto its own line — but only when the document actually has a
+dangling block (odd count of line-start fence markers), so an
+intentional inline marker inside a balanced document (e.g. a literal
+backtick run in an ``echo`` demo) is never touched.
+
 ``_load_text`` lives here because every continuation pass loads an authored
 continue prompt via ``ctx.host.read_authored_text``; the caller supplies
 the exact ``continue_prompt_path`` so each operation can use its own prompt.
@@ -57,6 +67,7 @@ __all__ = [
     "extract_markdown_block",
     "missing_planned_sections",
     "parse_forge_plan",
+    "repair_inline_fences",
 ]
 
 # The structured stop reason for a continuation run, surfaced in
@@ -143,6 +154,47 @@ def extract_markdown_block(text: str) -> str:
     return text.strip()
 
 
+#: A line that carries content BEFORE a fence marker — e.g. a shell command
+#: with the closing fence appended to it (the 2026-10-18 p920 punch-list
+#: incident: the last command of the block ended with the closing fence
+#: appended to the same line). Under strict CommonMark the block stays
+#: open to EOF and everything after it renders as code.
+_INLINE_FENCE_RE = re.compile(r"^(.+?)(`{3,})\s*$")
+
+
+def repair_inline_fences(document: str) -> str:
+    """Split a fence marker appended to a content line onto its own line.
+
+    Only runs when line-start fence markers are UNPAIRED (odd count) —
+    the signature of a block whose closing fence is hidden on a content
+    line, because that marker never registers at line start. A balanced
+    document is returned unchanged, so an intentional inline marker
+    (literal backticks in prose, a backtick run echoed by a command) is
+    never touched.
+
+    Only the LAST content-bearing inline fence line is split: it is the
+    closer hiding at the end of the block. Returns the document
+    unchanged when it is already balanced or carries no inline fence.
+    """
+    if not document:
+        return document
+    stripped = document.rstrip("\n")
+    start_markers = len(re.findall(r"^\s*`{3,}", stripped, flags=re.MULTILINE))
+    if start_markers % 2 == 0:
+        return document
+    lines = stripped.splitlines()
+    repaired = list(lines)
+    for idx in range(len(lines) - 1, -1, -1):
+        m = _INLINE_FENCE_RE.match(lines[idx])
+        if m:
+            content, fence = m.groups()
+            repaired[idx : idx + 1] = [content.rstrip(), fence]
+            break
+    else:
+        return document
+    return "\n".join(repaired) + "\n"
+
+
 def _looks_complete(document: str) -> bool:
     """Heuristic: does the document end on a clean paragraph/list boundary?
 
@@ -164,6 +216,9 @@ def _looks_complete(document: str) -> bool:
     if re.search(r"[\-\*\+] +$", stripped):
         return False
     # Dangling fenced code block (odd number of fences) = truncated.
+    # Line-start parity is sufficient: a closing fence hidden on a content
+    # line never counts here, so the opener it belongs to is always
+    # unpaired and shows up as odd (2026-10-18 p920 punch-list incident).
     fence_count = len(re.findall(r"^```", stripped, flags=re.MULTILINE))
     if fence_count % 2 == 1:
         return False
