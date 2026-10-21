@@ -13,7 +13,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["cfg_int", "cfg_float", "cfg_bool", "cfg_str"]
+__all__ = ["cfg_bool", "cfg_float", "cfg_int", "cfg_str"]
 
 
 def cfg_str(pack_config: Any, key: str, default: str) -> str:
@@ -50,7 +50,9 @@ def cfg_int(pack_config: Any, key: str, default: int) -> int:
     try:
         return int(raw)
     except (TypeError, ValueError):
-        logger.warning("markdown: pack_config[%r]=%r is not an int; using default %d", key, raw, default)
+        logger.warning(
+            "markdown: pack_config[%r]=%r is not an int; using default %d", key, raw, default
+        )
         return default
 
 
@@ -67,7 +69,9 @@ def cfg_float(pack_config: Any, key: str, default: float) -> float:
     try:
         return float(raw)
     except (TypeError, ValueError):
-        logger.warning("markdown: pack_config[%r]=%r is not a float; using default %s", key, raw, default)
+        logger.warning(
+            "markdown: pack_config[%r]=%r is not a float; using default %s", key, raw, default
+        )
         return default
 
 
@@ -90,5 +94,7 @@ def cfg_bool(pack_config: Any, key: str, default: bool) -> bool:
         return True
     if text in ("false", "0", "no", "off", ""):
         return False
-    logger.warning("markdown: pack_config[%r]=%r is not a bool; using default %s", key, raw, default)
+    logger.warning(
+        "markdown: pack_config[%r]=%r is not a bool; using default %s", key, raw, default
+    )
     return default

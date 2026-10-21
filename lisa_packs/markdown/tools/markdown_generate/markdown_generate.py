@@ -16,9 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from kernel.models import ToolExecutionContext, ToolResult
+from pydantic import BaseModel, Field
 
 try:
     from markdown_it import MarkdownIt
@@ -29,6 +28,12 @@ except ImportError as exc:  # pragma: no cover - dependency declared in pyprojec
     ) from exc
 
 TOOL_ID = "markdown_generate"
+
+# ATX heading levels recognised by markdown-it (h1 through h6).
+_MIN_HEADING_LEVEL = 1
+_MAX_HEADING_LEVEL = 6
+# Shortest heading tag that can carry a level ("h" plus one digit).
+_MIN_HEADING_TAG_LENGTH = 2
 
 # Markdown-it tokens that mark inline code or fenced code blocks.
 _CODE_TOKENS = frozenset(
@@ -58,13 +63,13 @@ class Parameters(BaseModel):
 def _heading_level(token: Any) -> int | None:
     """Return the heading level (1-6) for a ``heading_open`` token, else None."""
     tag = getattr(token, "tag", "") or ""
-    if not tag.startswith("h") or len(tag) < 2:
+    if not tag.startswith("h") or len(tag) < _MIN_HEADING_TAG_LENGTH:
         return None
     try:
         level = int(tag[1:])
     except ValueError:
         return None
-    return level if 1 <= level <= 6 else None
+    return level if _MIN_HEADING_LEVEL <= level <= _MAX_HEADING_LEVEL else None
 
 
 def _collect_outline(tokens: list[Any], max_headings: int) -> list[dict[str, Any]]:
@@ -126,7 +131,7 @@ def _count_code(tokens: list[Any]) -> dict[str, int]:
     inline = 0
     for token in tokens:
         t = token.type
-        if t == "fence" or t == "code_block":
+        if t in {"fence", "code_block"}:
             fences += 1
         elif t == "code_inline":
             inline += 1

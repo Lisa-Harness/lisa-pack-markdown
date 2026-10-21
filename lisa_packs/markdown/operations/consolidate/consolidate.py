@@ -33,26 +33,24 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
-
 from kernel.models import OperationExecutionContext, OperationResult, ToolExecutionContext
-
 from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
+from lisa_packs.markdown.operations._continuation import (
+    continue_until_complete,
+    extract_markdown_block,
+    repair_inline_fences,
+)
 from lisa_packs.markdown.operations._lint import (
     LintIssue,
     format_lint_issues,
     lint_markdown,
     lint_summary_comment,
 )
-from lisa_packs.markdown.operations._continuation import (
-    continue_until_complete,
-    extract_markdown_block,
-    repair_inline_fences,
-)
+from lisa_packs.markdown.operations._memory import recall_memory
 from lisa_packs.markdown.operations.consolidate._source_paths import (
     SourceSpec,
     expand_globs,
@@ -68,6 +66,7 @@ from lisa_packs.markdown.operations.consolidate._source_paths import (
     stat_source_chars,
     total_source_bytes,
 )
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +78,6 @@ _OUTLINE_TOOL_ID = "markdown_generate"
 _WRITE_TOOL_ID = "write_file"
 _READ_TOOL_ID = "read_file"
 _APPEND_TOOL_ID = "append_file"
-_MEMORY_SEARCH_TOOL_ID = "memory.search"
 _OKF_EMIT_TOOL_ID = "okf_emit_concept"
 _OKF_LOG_TOOL_ID = "okf_log"
 
@@ -133,10 +131,16 @@ _MAX_QUERY_CHARS = 20_000
 _MAP_REDUCE_BYTE_THRESHOLD = 8_000
 _MAP_REDUCE_SOURCE_THRESHOLD = 2
 # Density floor (consolidation anti-abridgment gate).
-_DENSITY_FLOOR_MANY_SOURCES_RATIO = 0.15   # 5+ readable sources
-_DENSITY_FLOOR_FEW_SOURCES_RATIO = 0.30    # 2-4 readable sources
+_DENSITY_FLOOR_MANY_SOURCES_RATIO = 0.15  # 5+ readable sources
+_DENSITY_FLOOR_FEW_SOURCES_RATIO = 0.30  # 2-4 readable sources
 _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD = 5
+_DENSITY_FLOOR_FEW_SOURCES_THRESHOLD = 2
 _DENSITY_RETRY_ATTEMPTS = 2
+# Provenance tier summary: how many source paths to list per priority tier.
+_SINGLE_TIER_PATH_LIMIT = 4
+_MULTI_TIER_PATH_LIMIT = 3
+# A single source above this many chars is accumulated in rolling mode.
+_ROLLING_ACCUMULATION_CHAR_THRESHOLD = 32_000
 # Per-source density floor (map-reduce path).
 _PER_SOURCE_MIN_RATIO = 0.10
 # Phase A: advisory lint gate defaults (mirrors forge_document).
@@ -182,27 +186,30 @@ class Parameters(BaseModel):
 
     document_path: str = Field(
         default="docs/consolidated.md",
-        description="Relative path within the lisa-storage files sandbox where the consolidated document is persisted.",
+        description="Relative path within the lisa-storage files sandbox where the consolidated "
+        "document is persisted.",
     )
     source_paths: list[str | dict[str, str]] = Field(
         default_factory=list,
-        description="Ordered list of source documents to consolidate. Each entry is either a path/glob string "
-        "(default priority 'normal') or a dict with 'path' (required) and 'priority' (optional NL prose). When "
-        "supplied, the operation consolidates the sources preserving detail rather than summarizing.",
+        description="Ordered list of source documents to consolidate. Each entry is either a "
+        "path/glob string (default priority 'normal') or a dict with 'path' (required) and "
+        "'priority' (optional NL prose). When supplied, the operation consolidates the sources "
+        "preserving detail rather than summarizing.",
     )
     query: str = Field(
         default="",
-        description="Natural-language instruction for the document. Falls back to ctx.query when empty.",
+        description="Natural-language instruction for the document. Falls back to ctx.query when "
+        "empty.",
     )
     okf_bundle_path: str = Field(
         default="okf/forge-provenance",
-        description="Relative path of the OKF bundle directory where the provenance concept is written. "
-        "Set to empty to skip OKF provenance capture.",
+        description="Relative path of the OKF bundle directory where the provenance concept is "
+        "written. Set to empty to skip OKF provenance capture.",
     )
     annotate_model: bool = Field(
         default=True,
-        description="When True, append a non-rendering HTML comment to the forged document noting the "
-        "provider/model that wrote it. Set False to suppress unconditionally.",
+        description="When True, append a non-rendering HTML comment to the forged document noting "
+        "the provider/model that wrote it. Set False to suppress unconditionally.",
     )
 
 
@@ -247,10 +254,16 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
         max_continue_tokens=cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
         max_continue_attempts=cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
         max_recall_records=cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
-        max_document_chars=cfg_int(pc, "forge_max_document_chars_with_sources", _MAX_DOCUMENT_CHARS),
+        max_document_chars=cfg_int(
+            pc, "forge_max_document_chars_with_sources", _MAX_DOCUMENT_CHARS
+        ),
         max_query_chars=cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
-        map_reduce_byte_threshold=cfg_int(pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD),
-        map_reduce_source_threshold=cfg_int(pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD),
+        map_reduce_byte_threshold=cfg_int(
+            pc, "forge_map_reduce_byte_threshold", _MAP_REDUCE_BYTE_THRESHOLD
+        ),
+        map_reduce_source_threshold=cfg_int(
+            pc, "forge_map_reduce_source_threshold", _MAP_REDUCE_SOURCE_THRESHOLD
+        ),
         per_source_min_ratio=cfg_float(pc, "forge_per_source_min_ratio", _PER_SOURCE_MIN_RATIO),
         per_source_max_tokens=cfg_int(pc, "forge_per_source_max_tokens", _PER_SOURCE_MAX_TOKENS),
         forge_rolling_accumulation=cfg_bool(pc, "forge_rolling_accumulation", False),
@@ -270,7 +283,9 @@ def _document_stem(document_path: str) -> str:
     return base or "consolidated"
 
 
-def _extract_query(ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int) -> str:
+def _extract_query(
+    ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int
+) -> str:
     """Return the user-supplied instruction, bounded in length."""
     raw = str(params.get("query") or ctx.query or "").strip()
     if len(raw) > max_query_chars:
@@ -287,58 +302,7 @@ async def _recall_memory(
     """Recall relevant memories via the ``memory.search`` MCP alias."""
     if ctx.host is None:
         raise RuntimeError("markdown requires execute_tool_fn to call memory/storage tools")
-
-    recall_limit = max(1, min(int(limit), 20))
-    tool_result = await ctx.host.execute_tool(
-        _MEMORY_SEARCH_TOOL_ID,
-        ToolExecutionContext(
-            tool_id=_MEMORY_SEARCH_TOOL_ID,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            user_slug=ctx.user_slug,
-            surface_type=ctx.surface_type,
-            surface_id=ctx.surface_id,
-            memory_scope=ctx.memory_scope,
-            mode_id=ctx.mode_id,
-            query=query,
-            parameters={
-                "query": query,
-                "user_slug": ctx.user_slug,
-                "workspace_id": ctx.workspace_id,
-                "memory_scope": ctx.memory_scope,
-                "surface_id": ctx.surface_id,
-                "limit": recall_limit,
-            },
-        ),
-    )
-    error_text = getattr(tool_result, "error", "") or ""
-    if error_text:
-        logger.warning("markdown: memory.search returned error: %s", error_text)
-        return ""
-    output_text = getattr(tool_result, "output_text", "") or ""
-    try:
-        data = json.loads(output_text)
-    except (json.JSONDecodeError, TypeError):
-        return output_text.strip()
-    if isinstance(data, list):
-        lines: list[str] = []
-        for item in data:
-            if isinstance(item, dict):
-                content = str(item.get("content") or "").strip()
-                if content:
-                    lines.append(f"- {content}")
-            elif isinstance(item, str) and item.strip():
-                lines.append(f"- {item.strip()}")
-        return "\n".join(lines)
-    if isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
-        lines = []
-        for item in data["results"]:
-            if isinstance(item, dict):
-                content = str(item.get("content") or "").strip()
-                if content:
-                    lines.append(f"- {content}")
-        return "\n".join(lines)
-    return output_text.strip()
+    return await recall_memory(ctx, query, limit=limit)
 
 
 async def _call_llm(
@@ -348,7 +312,7 @@ async def _call_llm(
     source_block: str,
     *,
     max_tokens: int,
-) -> tuple[str, Any, str | None]:
+) -> tuple[str, Any, bool | None, str | None]:
     """Call the host's completion function with the source-aware consolidate prompt."""
     if ctx.host is None:
         raise RuntimeError("markdown requires complete_fn and resolve_model_fn")
@@ -406,9 +370,7 @@ async def _lint_repair_pass(
     the preserve-detail directive. Returns the repaired document text or
     the original ``document`` on any failure. Never raises; lint is advisory.
     """
-    if not issues:
-        return document
-    if ctx.host is None:
+    if not issues or ctx.host is None:
         return document
     try:
         repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
@@ -513,7 +475,7 @@ def _density_floor_ratio(source_count: int) -> float:
     """Return the minimum output/source byte ratio that is NOT a lossy abridgment."""
     if source_count >= _DENSITY_FLOOR_MANY_SOURCES_THRESHOLD:
         return _DENSITY_FLOOR_MANY_SOURCES_RATIO
-    if source_count >= 2:
+    if source_count >= _DENSITY_FLOOR_FEW_SOURCES_THRESHOLD:
         return _DENSITY_FLOOR_FEW_SOURCES_RATIO
     return 0.0
 
@@ -525,7 +487,7 @@ def _density_floor_check(
     source_count: int,
 ) -> str | None:
     """Return a violation message if the output looks like a lossy abridgment."""
-    if source_total_bytes <= 0 or source_count < 2:
+    if source_total_bytes <= 0 or source_count < _DENSITY_FLOOR_FEW_SOURCES_THRESHOLD:
         return None
     min_ratio = _density_floor_ratio(source_count)
     if min_ratio <= 0.0:
@@ -828,7 +790,15 @@ async def _forge_one_source(
                     f"`{spec.path}` — {len(section.encode('utf-8'))}B "
                     f"vs {spec.bytes}B source -->"
                 )
-    return section, finish_reason, density_passed, density_reason, failed_paths, passes, density_marker
+    return (
+        section,
+        finish_reason,
+        density_passed,
+        density_reason,
+        failed_paths,
+        passes,
+        density_marker,
+    )
 
 
 def _tail_headings(document: str, *, max_headings: int = 3) -> str:
@@ -969,7 +939,7 @@ async def _merge_sections(
     system_prompt = _load_text(ctx, _SYSTEM_PROMPT_MERGE_PATH)
     user_template = _load_text(ctx, _USER_PROMPT_MERGE_PATH)
     rendered: list[str] = []
-    for idx, (section, spec) in enumerate(zip(sections, specs), start=1):
+    for idx, (section, spec) in enumerate(zip(sections, specs, strict=False), start=1):
         if not section.strip():
             continue
         rendered.append(
@@ -1061,7 +1031,11 @@ def _build_extended_annotation(
     if okf_concept_path:
         parts.append(f"provenance: {okf_concept_path}")
     body = " · ".join(parts)
-    return f"<!--\n  {body}\n  \n  Full provenance (per-source treatment, exact priorities, density math):\n  {okf_concept_path}\n-->"
+    return (
+        f"<!--\n  {body}\n  \n"
+        "  Full provenance (per-source treatment, exact priorities, density math):\n"
+        f"  {okf_concept_path}\n-->"
+    )
 
 
 def _summarize_source_tiers(readable: list[SourceSpec]) -> str:
@@ -1077,15 +1051,15 @@ def _summarize_source_tiers(readable: list[SourceSpec]) -> str:
             order.append(key)
         tiers[key].append(spec.path)
     if len(order) == 1:
-        paths = "; ".join(tiers[order[0]][:4])
-        if len(tiers[order[0]]) > 4:
-            paths += f"; +{len(tiers[order[0]]) - 4} more"
+        paths = "; ".join(tiers[order[0]][:_SINGLE_TIER_PATH_LIMIT])
+        if len(tiers[order[0]]) > _SINGLE_TIER_PATH_LIMIT:
+            paths += f"; +{len(tiers[order[0]]) - _SINGLE_TIER_PATH_LIMIT} more"
         return paths
     chunks: list[str] = []
     for key in order:
-        paths = "; ".join(tiers[key][:3])
-        if len(tiers[key]) > 3:
-            paths += f"; +{len(tiers[key]) - 3} more"
+        paths = "; ".join(tiers[key][:_MULTI_TIER_PATH_LIMIT])
+        if len(tiers[key]) > _MULTI_TIER_PATH_LIMIT:
+            paths += f"; +{len(tiers[key]) - _MULTI_TIER_PATH_LIMIT} more"
         chunks.append(f"{key}: {paths}")
     return "; ".join(chunks)
 
@@ -1141,12 +1115,18 @@ def _build_okf_provenance_body(
     lines.append("## Processing")
     lines.append("")
     lines.append(f"- **Model:** {provider}/{model_id}")
-    lines.append(f"- **Passes:** {passes} primary"
-                 + (f" + {continue_attempts} continuation" if continue_attempts else ""))
-    lines.append(f"- **finish_reason:** first={first_finish_reason!r}, final={final_finish_reason!r}")
-    lines.append(f"- **Density check:** output {output_bytes}B "
-                 f"({density_ratio:.0%} of source bytes; floor {density_floor:.0%}) "
-                 f"— {'passed' if density_passed else 'FAILED (lossy abridgment)'}")
+    lines.append(
+        f"- **Passes:** {passes} primary"
+        + (f" + {continue_attempts} continuation" if continue_attempts else "")
+    )
+    lines.append(
+        f"- **finish_reason:** first={first_finish_reason!r}, final={final_finish_reason!r}"
+    )
+    lines.append(
+        f"- **Density check:** output {output_bytes}B "
+        f"({density_ratio:.0%} of source bytes; floor {density_floor:.0%}) "
+        f"— {'passed' if density_passed else 'FAILED (lossy abridgment)'}"
+    )
     lines.append(f"- **Truncated:** {'yes' if truncated else 'no'}")
     lines.append(f"- **Forge timestamp:** {forge_timestamp}")
     lines.append("")
@@ -1224,8 +1204,7 @@ async def _write_okf_provenance(
                     "type": "forge-provenance",
                     "title": f"Forge provenance for {stored_path}",
                     "description": (
-                        f"Consolidated {readable_count(sources)} source(s) "
-                        f"into {stored_path}"
+                        f"Consolidated {readable_count(sources)} source(s) into {stored_path}"
                     ),
                     "tags": ["forge", "provenance", "markdown"],
                     "status": "stable",
@@ -1261,8 +1240,7 @@ async def _write_okf_provenance(
                     "concept_path": concept_rel,
                     "by": f"lisa-pack-markdown/{model_id or 'unknown'}",
                     "note": (
-                        f"consolidated {readable_count(sources)} source(s) "
-                        f"into {stored_path}"
+                        f"consolidated {readable_count(sources)} source(s) into {stored_path}"
                     ),
                 },
             ),
@@ -1275,7 +1253,7 @@ async def _write_okf_provenance(
 def _format_markdown(document: str) -> str:
     """Lint/format the document via ``mdformat`` if available."""
     try:
-        import mdformat  # type: ignore[import-not-found]
+        import mdformat
     except ImportError:
         return document
     try:
@@ -1285,455 +1263,746 @@ def _format_markdown(document: str) -> str:
         return document
 
 
-async def execute(ctx: OperationExecutionContext) -> OperationResult:
-    """Consolidate multiple source documents into one markdown document, preserving detail."""
-    params = ctx.params or {}
-    cfg = _resolve_settings(ctx)
-    user_input = _extract_query(ctx, params, cfg.max_query_chars)
-    if not user_input:
-        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+# ── Consolidation phases ────────────────────────────────────────────
+#
+# ``execute`` is the pipeline's orchestrator, not its implementation. The
+# work is split into five phases — prepare → forge → finalize → validate
+# → persist — each in its own helper, so no single function carries the
+# whole pipeline's complexity. ``_ConsolidationState`` is the shared
+# mutable record the phases read and write: the map-reduce and single-pass
+# paths fill in the same fields, so the shared post-merge phases (density
+# assessment, annotation, provenance, summary) do not need to know which
+# path ran.
 
-    try:
-        document_path = _extract_document_path(params)
-    except RuntimeError as exc:
-        return OperationResult(output_text=str(exc))
 
-    if ctx.host is None:
-        raise RuntimeError("markdown_consolidate_sources requires execute_tool_fn")
+@dataclass
+class _MapReduceSections:
+    """Per-source forge results for the map-reduce path."""
 
-    # ── Source ingestion ───────────────────────────────────────────────
-    sources: list[SourceSpec] = []
-    if has_sources(params):
-        try:
-            sources = parse_source_paths(params)
-        except RuntimeError as exc:
-            return OperationResult(output_text=str(exc))
-        if not sources:
-            return OperationResult(
-                output_text=(
-                    "source_paths was supplied but parsed to no entries "
-                    "(all empty or invalid)."
-                )
-            )
-        sources = await expand_globs(sources, ctx=ctx)
-        sources = await read_sources(sources, ctx=ctx)
-        readable = [s for s in sources if s.text]
-        if not readable:
-            failed_note = "; ".join(
-                f"{s.path}: {s.read_error}" for s in failed_specs(sources)
-            ) or "unknown"
-            return OperationResult(
-                output_text=(
-                    "All source_paths entries were unreadable. No source "
-                    f"material to consolidate. Failures: {failed_note}"
-                )
-            )
-        source_block = render_source_block(sources)
-    else:
-        return OperationResult(
-            output_text="markdown_consolidate_sources requires a non-empty source_paths."
-        )
+    sections: list[str] = field(default_factory=list)
+    finish_reasons: list[str | None] = field(default_factory=list)
+    passes: list[int] = field(default_factory=list)
+    density: list[str] = field(default_factory=list)
+    density_markers: list[str] = field(default_factory=list)
+    density_failed_sources: list[str] = field(default_factory=list)
+    rolling_used: bool = False
 
-    memory_context = await _recall_memory(ctx, user_input, limit=cfg.max_recall_records)
 
-    # ── Map-reduce decision ────────────────────────────────────────────
-    source_total = total_source_bytes(sources)
-    n_readable = readable_count(sources)
-    use_map_reduce = (
-        bool(sources)
-        and (
-            source_total >= cfg.map_reduce_byte_threshold
-            or n_readable >= cfg.map_reduce_source_threshold
-        )
-    )
+@dataclass
+class _ConsolidationState:
+    """Operation state threaded through the consolidation phases."""
 
+    # ── prepared inputs ──
+    params: dict[str, Any]
+    cfg: _ResolvedSettings
+    user_input: str = ""
+    document_path: str = ""
+    sources: list[SourceSpec] = field(default_factory=list)
+    source_block: str = ""
+    source_total: int = 0
+    n_readable: int = 0
+    use_map_reduce: bool = False
+
+    # ── forge outputs ──
+    document: str = ""
     model_def: Any = None
+    memory_context: str = ""
     first_finish_reason: str | None = None
     final_finish_reason: str | None = None
-    was_truncated = False
-    continue_attempts = 0
-    document = ""
-    density_passed = True
-    density_violation: str | None = None
-    density_ratio = 0.0
-    density_floor_value = 0.0
-    density_retried = False
-    density_failed_sources: list[str] = []
-    per_source_passes: list[int] = []
-    per_source_density: list[str] = []
-    per_source_meta: list[dict[str, Any]] | None = None
-    rolling_used = False
+    was_truncated: bool = False
+    continue_attempts: int = 0
 
-    # Resolve the model once for all passes.
+    # ── density telemetry ──
+    density_passed: bool = True
+    density_violation: str | None = None
+    density_ratio: float = 0.0
+    density_floor_value: float = 0.0
+    density_retried: bool = False
+    density_failed_sources: list[str] = field(default_factory=list)
+    per_source_passes: list[int] = field(default_factory=list)
+    per_source_density: list[str] = field(default_factory=list)
+    per_source_meta: list[dict[str, Any]] | None = None
+    rolling_used: bool = False
+
+
+@dataclass
+class _LintOutcome:
+    """Result of the outline validation + advisory lint gate."""
+
+    document: str
+    outline: dict[str, Any]
+    heading_count: int
+    issues: list[LintIssue]
+    repair_used: bool
+    error: str | None = None
+
+
+async def _ingest_sources(
+    ctx: OperationExecutionContext,
+    params: dict[str, Any],
+) -> tuple[list[SourceSpec], str, str | None]:
+    """Parse, expand, and read every source document.
+
+    Returns ``(sources, source_block, error)``. ``error`` is the
+    user-facing message when the sources cannot be consolidated; the
+    sources list is empty in that case.
+    """
+    if not has_sources(params):
+        return [], "", "markdown_consolidate_sources requires a non-empty source_paths."
+    try:
+        sources = parse_source_paths(params)
+    except RuntimeError as exc:
+        return [], "", str(exc)
+    if not sources:
+        return (
+            [],
+            "",
+            "source_paths was supplied but parsed to no entries (all empty or invalid).",
+        )
+    sources = await expand_globs(sources, ctx=ctx)
+    sources = await read_sources(sources, ctx=ctx)
+    if not [s for s in sources if s.text]:
+        failed_note = (
+            "; ".join(f"{s.path}: {s.read_error}" for s in failed_specs(sources)) or "unknown"
+        )
+        return (
+            sources,
+            "",
+            "All source_paths entries were unreadable. No source "
+            f"material to consolidate. Failures: {failed_note}",
+        )
+    return sources, render_source_block(sources), None
+
+
+async def _prepare_consolidation(
+    ctx: OperationExecutionContext,
+) -> tuple[_ConsolidationState, OperationResult | None]:
+    """Phase 1 — resolve settings, the user instruction, and the sources.
+
+    Returns ``(state, failure)``. ``failure`` is a terminal
+    ``OperationResult`` when the operation cannot proceed (no
+    instruction, an invalid document path, or unusable sources).
+    """
+    params = ctx.params or {}
+    cfg = _resolve_settings(ctx)
+    state = _ConsolidationState(params=params, cfg=cfg)
+    user_input = _extract_query(ctx, params, cfg.max_query_chars)
+    if not user_input:
+        return state, OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+    state.user_input = user_input
+    try:
+        state.document_path = _extract_document_path(params)
+    except RuntimeError as exc:
+        return state, OperationResult(output_text=str(exc))
+    if ctx.host is None:
+        raise RuntimeError("markdown_consolidate_sources requires execute_tool_fn")
+    sources, source_block, error = await _ingest_sources(ctx, params)
+    if error is not None:
+        return state, OperationResult(output_text=error)
+    state.sources = sources
+    state.source_block = source_block
+    return state, None
+
+
+def _resolve_model(ctx: OperationExecutionContext) -> Any:
+    """Resolve the operation's model definition once for all passes."""
     if ctx.host is None:
         raise RuntimeError("markdown requires resolve_model_fn")
     preferred_model_id = ctx.preferred_model_id or ctx.model_id or "default"
     model_def = ctx.host.resolve_model(preferred_model_id)
     if model_def is None:
         raise RuntimeError(f"markdown could not resolve model '{preferred_model_id}'")
+    return model_def
 
-    if use_map_reduce:
-        readable = [s for s in sources if s.text]
-        sections: list[str] = []
-        per_source_finish_reasons: list[str | None] = []
-        density_markers: list[str] = []
-        for idx, spec in enumerate(readable, start=1):
-            use_rolling = False
-            if cfg.forge_rolling_accumulation and len(readable) == 1:
-                stat_size = await stat_source_chars(spec, ctx=ctx)
-                if stat_size is not None and stat_size > 32_000:
-                    use_rolling = True
-            if use_rolling:
-                rolling_used = True
-                chunks = await read_source_chunks(spec, ctx=ctx)
-                if chunks and chunks[0].read_error:
-                    sections.append("")
-                    per_source_finish_reasons.append(None)
-                    per_source_passes.append(1)
-                    per_source_density.append("n/a")
-                    continue
-                section, chunk_finishs = await _forge_rolling(
-                    ctx,
-                    chunks,
-                    user_input=user_input,
-                    memory_context=memory_context,
-                    model_def=model_def,
-                    max_tokens=cfg.per_source_max_tokens,
-                    max_continue_attempts=cfg.max_continue_attempts,
-                    max_continue_tokens=cfg.max_continue_tokens,
-                    continue_prompt_path=_CONTINUE_PROMPT_PATH,
-                    document_path=document_path,
-                    incremental_persist=cfg.forge_rolling_incremental_persist,
-                )
-                sections.append(section)
-                per_source_finish_reasons.append(
-                    chunk_finishs[-1] if chunk_finishs else None
-                )
-                per_source_passes.append(max(1, len(chunks)))
-                per_source_density.append("n/a")
-                continue
-            section, sec_finish, _passed, _reason, failed, passes, marker = await _forge_one_source(
-                ctx,
-                spec=spec,
-                idx=idx,
-                user_input=user_input,
-                memory_context=memory_context,
-                model_def=model_def,
-                max_tokens=cfg.per_source_max_tokens,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-                continue_prompt_path=_CONTINUE_PROMPT_PATH,
-                per_source_min_ratio=cfg.per_source_min_ratio,
-            )
-            sections.append(section)
-            per_source_finish_reasons.append(sec_finish)
-            per_source_passes.append(passes)
-            if failed:
-                density_failed_sources.extend(failed)
-                per_source_density.append("FAILED")
-                if marker:
-                    density_markers.append(marker)
-            else:
-                per_source_density.append("pass")
-        first_finish_reason = per_source_finish_reasons[0] if per_source_finish_reasons else None
-        if rolling_used and len(sections) == 1:
-            merged = sections[0]
-            merge_finish = per_source_finish_reasons[0] if per_source_finish_reasons else None
-        else:
-            merged, merge_finish = await _merge_sections(
-                ctx,
-                sections=sections,
-                specs=readable,
-                user_input=user_input,
-                memory_context=memory_context,
-                model_def=model_def,
-                max_tokens=cfg.max_completion_tokens,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-                continue_prompt_path=_CONTINUE_PROMPT_PATH,
-            )
-        if not merged or not merged.strip():
-            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
-        document = extract_markdown_block(merged) if "```" in merged else merged
-        if not document.strip():
-            text = _format_template(
-                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
-                response_preview=merged[:400],
-            )
-            return OperationResult(output_text=text)
-        if density_markers:
-            marker_block = "\n\n".join(density_markers)
-            document = marker_block + "\n\n" + document
-        final_finish_reason = merge_finish
+
+async def _should_use_rolling(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    spec: SourceSpec,
+    readable: list[SourceSpec],
+) -> bool:
+    """Return True when this source must be forged in rolling mode.
+
+    Rolling accumulation is opt-in (``forge_rolling_accumulation``) and
+    applies only when a SINGLE source is oversized.
+    """
+    if not state.cfg.forge_rolling_accumulation or len(readable) != 1:
+        return False
+    stat_size = await stat_source_chars(spec, ctx=ctx)
+    return stat_size is not None and stat_size > _ROLLING_ACCUMULATION_CHAR_THRESHOLD
+
+
+async def _forge_rolling_source(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    sections: _MapReduceSections,
+    spec: SourceSpec,
+) -> None:
+    """Forge one source in rolling mode and record its per-source result."""
+    cfg = state.cfg
+    chunks = await read_source_chunks(spec, ctx=ctx)
+    if chunks and chunks[0].read_error:
+        sections.sections.append("")
+        sections.finish_reasons.append(None)
+        sections.passes.append(1)
+        sections.density.append("n/a")
+        return
+    section, chunk_finishs = await _forge_rolling(
+        ctx,
+        chunks,
+        user_input=state.user_input,
+        memory_context=state.memory_context,
+        model_def=state.model_def,
+        max_tokens=cfg.per_source_max_tokens,
+        max_continue_attempts=cfg.max_continue_attempts,
+        max_continue_tokens=cfg.max_continue_tokens,
+        continue_prompt_path=_CONTINUE_PROMPT_PATH,
+        document_path=state.document_path,
+        incremental_persist=cfg.forge_rolling_incremental_persist,
+    )
+    sections.sections.append(section)
+    sections.finish_reasons.append(chunk_finishs[-1] if chunk_finishs else None)
+    sections.passes.append(max(1, len(chunks)))
+    sections.density.append("n/a")
+
+
+async def _forge_plain_source(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    sections: _MapReduceSections,
+    spec: SourceSpec,
+    idx: int,
+) -> None:
+    """Forge one source in bounded-context mode and record its result."""
+    cfg = state.cfg
+    section, sec_finish, _passed, _reason, failed, passes, marker = await _forge_one_source(
+        ctx,
+        spec=spec,
+        idx=idx,
+        user_input=state.user_input,
+        memory_context=state.memory_context,
+        model_def=state.model_def,
+        max_tokens=cfg.per_source_max_tokens,
+        max_continue_attempts=cfg.max_continue_attempts,
+        max_continue_tokens=cfg.max_continue_tokens,
+        continue_prompt_path=_CONTINUE_PROMPT_PATH,
+        per_source_min_ratio=cfg.per_source_min_ratio,
+    )
+    sections.sections.append(section)
+    sections.finish_reasons.append(sec_finish)
+    sections.passes.append(passes)
+    if failed:
+        sections.density_failed_sources.extend(failed)
+        sections.density.append("FAILED")
+        if marker:
+            sections.density_markers.append(marker)
     else:
-        # ── Single-pass consolidation ─────────────────────────────────
-        completion_text, model_def, first_truncated, first_finish_reason = await _call_llm(
+        sections.density.append("pass")
+
+
+async def _forge_source_section(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    sections: _MapReduceSections,
+    spec: SourceSpec,
+    idx: int,
+    readable: list[SourceSpec],
+) -> None:
+    """Forge one source's section, choosing the rolling or bounded path."""
+    if await _should_use_rolling(ctx, state=state, spec=spec, readable=readable):
+        sections.rolling_used = True
+        await _forge_rolling_source(ctx, state=state, sections=sections, spec=spec)
+        return
+    await _forge_plain_source(ctx, state=state, sections=sections, spec=spec, idx=idx)
+
+
+async def _merge_forged_sections(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    sections: _MapReduceSections,
+    readable: list[SourceSpec],
+) -> tuple[str, str | None]:
+    """Merge the per-source sections into one coherent document.
+
+    A single rolling-mode section is already the whole document, so it is
+    not merged again.
+    """
+    if state.rolling_used and len(sections.sections) == 1:
+        finish = sections.finish_reasons[0] if sections.finish_reasons else None
+        return sections.sections[0], finish
+    cfg = state.cfg
+    return await _merge_sections(
+        ctx,
+        sections=sections.sections,
+        specs=readable,
+        user_input=state.user_input,
+        memory_context=state.memory_context,
+        model_def=state.model_def,
+        max_tokens=cfg.max_completion_tokens,
+        max_continue_attempts=cfg.max_continue_attempts,
+        max_continue_tokens=cfg.max_continue_tokens,
+        continue_prompt_path=_CONTINUE_PROMPT_PATH,
+    )
+
+
+async def _run_map_reduce_pass(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+) -> OperationResult | None:
+    """Phase 2 (map-reduce) — forge one section per source, then merge."""
+    readable = [s for s in state.sources if s.text]
+    sections = _MapReduceSections()
+    for idx, spec in enumerate(readable, start=1):
+        await _forge_source_section(
+            ctx, state=state, sections=sections, spec=spec, idx=idx, readable=readable
+        )
+    state.first_finish_reason = sections.finish_reasons[0] if sections.finish_reasons else None
+    state.per_source_passes = sections.passes
+    state.per_source_density = sections.density
+    state.density_failed_sources = sections.density_failed_sources
+    state.rolling_used = sections.rolling_used
+    merged, merge_finish = await _merge_forged_sections(
+        ctx, state=state, sections=sections, readable=readable
+    )
+    if not merged or not merged.strip():
+        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+    document = extract_markdown_block(merged) if "```" in merged else merged
+    if not document.strip():
+        text = _format_template(
+            _load_text(ctx, _EMPTY_DOCUMENT_PATH),
+            response_preview=merged[:400],
+        )
+        return OperationResult(output_text=text)
+    if sections.density_markers:
+        marker_block = "\n\n".join(sections.density_markers)
+        document = marker_block + "\n\n" + document
+    state.document = document
+    state.final_finish_reason = merge_finish
+    return None
+
+
+async def _enforce_density_floor(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+) -> None:
+    """Apply the anti-abridgment density floor to a single-pass document.
+
+    Issues up to ``density_retry_attempts`` sharpened re-forge passes while
+    the output stays below the floor.
+    """
+    cfg = state.cfg
+    if not (state.sources and state.source_total > 0):
+        return
+    state.density_floor_value = _density_floor_ratio(state.n_readable)
+    state.density_violation = _density_floor_check(
+        source_total_bytes=state.source_total,
+        output_bytes=len(state.document.encode("utf-8")),
+        source_count=state.n_readable,
+    )
+    if state.density_violation is None:
+        return
+    state.density_passed = False
+    violation_msg = state.density_violation
+    for _ in range(cfg.density_retry_attempts):
+        state.density_retried = True
+        retry_text, retry_finish = await _reforge_for_density(
             ctx,
-            user_input,
-            memory_context,
-            source_block,
+            user_input=state.user_input,
+            memory_context=state.memory_context,
+            source_block=state.source_block,
+            model_def=state.model_def,
+            violation=violation_msg,
+            source_total_bytes=state.source_total,
+            output_bytes=len(state.document.encode("utf-8")),
+            source_count=state.n_readable,
             max_tokens=cfg.max_completion_tokens,
         )
-        if not completion_text or not completion_text.strip():
-            return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
-        document = extract_markdown_block(completion_text)
-        if not document.strip():
-            text = _format_template(
-                _load_text(ctx, _EMPTY_DOCUMENT_PATH),
-                response_preview=completion_text[:400],
-            )
-            return OperationResult(output_text=text)
-        document, was_truncated, continue_attempts, final_finish_reason, _stop = (
-            await continue_until_complete(
-                ctx,
-                user_input=user_input,
-                document=document,
-                model_def=model_def,
-                first_truncated=first_truncated,
-                first_finish_reason=first_finish_reason,
-                max_continue_attempts=cfg.max_continue_attempts,
-                max_continue_tokens=cfg.max_continue_tokens,
-                continue_prompt_path=_CONTINUE_PROMPT_PATH,
-            )
+        if not retry_text or not retry_text.strip():
+            break
+        retry_document = extract_markdown_block(retry_text)
+        if not retry_document.strip():
+            break
+        (
+            retry_document,
+            was_truncated,
+            continue_attempts,
+            final_finish_reason,
+            _stop,
+        ) = await continue_until_complete(
+            ctx,
+            user_input=state.user_input,
+            document=retry_document,
+            model_def=state.model_def,
+            first_truncated=False,
+            first_finish_reason=retry_finish,
+            max_continue_attempts=cfg.max_continue_attempts,
+            max_continue_tokens=cfg.max_continue_tokens,
+            continue_prompt_path=_CONTINUE_PROMPT_PATH,
         )
-        # ── Density floor ─────────────────────────────────────────────
-        if sources and source_total > 0:
-            density_floor_value = _density_floor_ratio(n_readable)
-            density_violation = _density_floor_check(
-                source_total_bytes=source_total,
-                output_bytes=len(document.encode("utf-8")),
-                source_count=n_readable,
-            )
-            if density_violation is not None:
-                density_passed = False
-                violation_msg = density_violation
-                for _ in range(cfg.density_retry_attempts):
-                    density_retried = True
-                    retry_text, retry_finish = await _reforge_for_density(
-                        ctx,
-                        user_input=user_input,
-                        memory_context=memory_context,
-                        source_block=source_block,
-                        model_def=model_def,
-                        violation=violation_msg,
-                        source_total_bytes=source_total,
-                        output_bytes=len(document.encode("utf-8")),
-                        source_count=n_readable,
-                        max_tokens=cfg.max_completion_tokens,
-                    )
-                    if not retry_text or not retry_text.strip():
-                        break
-                    retry_document = extract_markdown_block(retry_text)
-                    if not retry_document.strip():
-                        break
-                    retry_document, was_truncated, continue_attempts, final_finish_reason, _stop = (
-                        await continue_until_complete(
-                            ctx,
-                            user_input=user_input,
-                            document=retry_document,
-                            model_def=model_def,
-                            first_truncated=False,
-                            first_finish_reason=retry_finish,
-                            max_continue_attempts=cfg.max_continue_attempts,
-                            max_continue_tokens=cfg.max_continue_tokens,
-                            continue_prompt_path=_CONTINUE_PROMPT_PATH,
-                        )
-                    )
-                    document = retry_document
-                    density_violation = _density_floor_check(
-                        source_total_bytes=source_total,
-                        output_bytes=len(document.encode("utf-8")),
-                        source_count=n_readable,
-                    )
-                    density_passed = density_violation is None
-                    if density_passed:
-                        break
-        density_ratio = (
-            len(document.encode("utf-8")) / source_total if source_total else 1.0
+        state.document = retry_document
+        state.was_truncated = was_truncated
+        state.continue_attempts = continue_attempts
+        state.final_finish_reason = final_finish_reason
+        state.density_violation = _density_floor_check(
+            source_total_bytes=state.source_total,
+            output_bytes=len(state.document.encode("utf-8")),
+            source_count=state.n_readable,
         )
+        state.density_passed = state.density_violation is None
+        if state.density_passed:
+            break
 
-    # ── Map-reduce density assessment (post-merge) ────────────────────
-    if use_map_reduce and sources and source_total > 0:
-        density_floor_value = _density_floor_ratio(n_readable)
-        density_violation = _density_floor_check(
-            source_total_bytes=source_total,
-            output_bytes=len(document.encode("utf-8")),
-            source_count=n_readable,
+
+async def _run_single_pass(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+) -> OperationResult | None:
+    """Phase 2 (single pass) — forge the whole document in one call."""
+    cfg = state.cfg
+    completion_text, resolved_model, first_truncated, first_finish_reason = await _call_llm(
+        ctx,
+        state.user_input,
+        state.memory_context,
+        state.source_block,
+        max_tokens=cfg.max_completion_tokens,
+    )
+    state.model_def = resolved_model
+    state.first_finish_reason = first_finish_reason
+    if not completion_text or not completion_text.strip():
+        return OperationResult(output_text=_load_text(ctx, _EMPTY_RESPONSE_PATH))
+    document = extract_markdown_block(completion_text)
+    if not document.strip():
+        text = _format_template(
+            _load_text(ctx, _EMPTY_DOCUMENT_PATH),
+            response_preview=completion_text[:400],
         )
-        density_passed = not density_failed_sources
-        density_ratio = (
-            len(document.encode("utf-8")) / source_total if source_total else 1.0
-        )
-        per_source_meta = [
-            {"passes": per_source_passes[i] if i < len(per_source_passes) else 0,
-             "density": per_source_density[i] if i < len(per_source_density) else "n/a"}
-            for i in range(n_readable)
-        ]
+        return OperationResult(output_text=text)
+    (
+        document,
+        was_truncated,
+        continue_attempts,
+        final_finish_reason,
+        _stop,
+    ) = await continue_until_complete(
+        ctx,
+        user_input=state.user_input,
+        document=document,
+        model_def=state.model_def,
+        first_truncated=first_truncated,
+        first_finish_reason=first_finish_reason,
+        max_continue_attempts=cfg.max_continue_attempts,
+        max_continue_tokens=cfg.max_continue_tokens,
+        continue_prompt_path=_CONTINUE_PROMPT_PATH,
+    )
+    state.document = document
+    state.was_truncated = was_truncated
+    state.continue_attempts = continue_attempts
+    state.final_finish_reason = final_finish_reason
+    await _enforce_density_floor(ctx, state)
+    state.density_ratio = (
+        len(state.document.encode("utf-8")) / state.source_total if state.source_total else 1.0
+    )
+    return None
+
+
+def _assess_map_reduce_density(state: _ConsolidationState) -> None:
+    """Assess the merged document against the density floor (map-reduce path)."""
+    if not (state.use_map_reduce and state.sources and state.source_total > 0):
+        state.per_source_meta = None
+        return
+    state.density_floor_value = _density_floor_ratio(state.n_readable)
+    state.density_violation = _density_floor_check(
+        source_total_bytes=state.source_total,
+        output_bytes=len(state.document.encode("utf-8")),
+        source_count=state.n_readable,
+    )
+    state.density_passed = not state.density_failed_sources
+    state.density_ratio = (
+        len(state.document.encode("utf-8")) / state.source_total if state.source_total else 1.0
+    )
+    state.per_source_meta = [
+        {
+            "passes": state.per_source_passes[i] if i < len(state.per_source_passes) else 0,
+            "density": state.per_source_density[i] if i < len(state.per_source_density) else "n/a",
+        }
+        for i in range(state.n_readable)
+    ]
+
+
+async def _forge_consolidation(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+) -> OperationResult | None:
+    """Phase 2 — recall memory, choose the forge path, and forge the document."""
+    cfg = state.cfg
+    state.memory_context = await _recall_memory(ctx, state.user_input, limit=cfg.max_recall_records)
+    state.source_total = total_source_bytes(state.sources)
+    state.n_readable = readable_count(state.sources)
+    state.use_map_reduce = bool(state.sources) and (
+        state.source_total >= cfg.map_reduce_byte_threshold
+        or state.n_readable >= cfg.map_reduce_source_threshold
+    )
+    state.model_def = _resolve_model(ctx)
+    if state.use_map_reduce:
+        failure = await _run_map_reduce_pass(ctx, state)
     else:
-        per_source_meta = None
+        failure = await _run_single_pass(ctx, state)
+    if failure is not None:
+        return failure
+    _assess_map_reduce_density(state)
+    return None
 
-    # Lint/format the document. Inline-fence repair runs BEFORE formatting:
-    # mdformat treats a closing fence appended to the last code line as legal
-    # CommonMark and preserves it, so the hygiene split must land first.
-    document = repair_inline_fences(document)
-    document = _format_markdown(document)
 
-    # Char cap.
-    if len(document) > cfg.max_document_chars:
-        document = document[:cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
-        was_truncated = True
-
-    # Annotate with the model that wrote it, unless the user opted out.
+def _apply_annotation(
+    *,
+    state: _ConsolidationState,
+    document: str,
+) -> str:
+    """Append the non-rendering provenance footer unless the user opted out."""
+    params = state.params
     annotate_model = bool(params.get("annotate_model", True))
-    if annotate_model and not _user_asked_not_to_annotate(user_input):
-        okf_bundle_path = str(params.get("okf_bundle_path") or "").strip()
-        okf_concept_path = ""
-        if okf_bundle_path:
-            stem = _document_stem(document_path)
-            okf_concept_path = f"{okf_bundle_path}/{stem}.forge.md"
-        processing_summary = (
-            "1 primary pass"
-            + (f" + {continue_attempts} continuation" if continue_attempts else "")
-            + ("; density passed" if density_passed else "; density FAILED"
-               if sources and source_total > 0 else "")
-            + ("; re-forged" if density_retried else "")
-            + f" · finish_reason: {final_finish_reason!r}"
+    if not annotate_model or _user_asked_not_to_annotate(state.user_input):
+        return document
+    okf_bundle_path = str(params.get("okf_bundle_path") or "").strip()
+    okf_concept_path = ""
+    if okf_bundle_path:
+        stem = _document_stem(state.document_path)
+        okf_concept_path = f"{okf_bundle_path}/{stem}.forge.md"
+    processing_summary = (
+        "1 primary pass"
+        + (f" + {state.continue_attempts} continuation" if state.continue_attempts else "")
+        + (
+            "; density passed"
+            if state.density_passed
+            else "; density FAILED"
+            if state.sources and state.source_total > 0
+            else ""
         )
-        density_line = ""
-        if sources and source_total > 0:
-            density_line = (
-                f"{len(document.encode('utf-8'))}B / {source_total}B "
-                f"({density_ratio:.0%})"
-            )
-        annotation = _build_extended_annotation(
-            model_def,
-            sources=sources,
-            processing_summary=processing_summary,
-            density_line=density_line,
-            okf_concept_path=okf_concept_path,
-            truncated=was_truncated,
-            final_finish_reason=final_finish_reason if was_truncated else None,
-            continue_attempts=continue_attempts if was_truncated else 0,
+        + ("; re-forged" if state.density_retried else "")
+        + f" · finish_reason: {state.final_finish_reason!r}"
+    )
+    density_line = ""
+    if state.sources and state.source_total > 0:
+        density_line = (
+            f"{len(document.encode('utf-8'))}B / {state.source_total}B ({state.density_ratio:.0%})"
         )
-        if annotation:
-            document = document.rstrip() + "\n\n" + annotation + "\n"
+    annotation = _build_extended_annotation(
+        state.model_def,
+        sources=state.sources,
+        processing_summary=processing_summary,
+        density_line=density_line,
+        okf_concept_path=okf_concept_path,
+        truncated=state.was_truncated,
+        final_finish_reason=state.final_finish_reason if state.was_truncated else None,
+        continue_attempts=state.continue_attempts if state.was_truncated else 0,
+    )
+    if not annotation:
+        return document
+    return document.rstrip() + "\n\n" + annotation + "\n"
 
+
+def _finalize_document(ctx: OperationExecutionContext, state: _ConsolidationState) -> str:
+    """Phase 3 — repair fences, format, cap, and annotate the document."""
+    # Inline-fence repair runs BEFORE formatting: mdformat treats a closing
+    # fence appended to the last code line as legal CommonMark and preserves
+    # it, so the hygiene split must land first.
+    document = repair_inline_fences(state.document)
+    document = _format_markdown(document)
+    if len(document) > state.cfg.max_document_chars:
+        document = document[: state.cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
+        state.was_truncated = True
+    return _apply_annotation(state=state, document=document)
+
+
+async def _outline_for_document(
+    ctx: OperationExecutionContext,
+    document: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Validate the document's outline. Returns ``(outline, error)``."""
     try:
         outline = await _validate_outline(ctx, document)
     except RuntimeError as exc:
-        return OperationResult(output_text=str(exc))
+        return {}, str(exc)
+    return outline, None
 
-    heading_count = int(outline.get("heading_count", 0) or 0)
-    if heading_count < _MIN_HEADINGS:
-        text = _format_template(
-            _load_text(ctx, _NO_OUTLINE_PATH),
-            heading_count=heading_count,
-        )
-        return OperationResult(output_text=text)
 
-    # Phase A: advisory lint gate (mirrors forge_document). Lint is never a
-    # hard reject; the outline gate above is the only hard gate. One repair
-    # pass when ``forge_lint_repair`` is set; residual issues are persisted
-    # as a non-rendering HTML comment so the user knows the artifact has
-    # warnings. The repair pass uses the source-aware system prompt so the
-    # preserve-detail directive still applies.
-    lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
-    lint_repair_used = False
-    if lint_issues and cfg.lint_repair:
+async def _run_lint_gate(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    document: str,
+    outline: dict[str, Any],
+    heading_count: int,
+) -> _LintOutcome:
+    """Phase 4b — advisory lint gate with one optional repair pass.
+
+    Lint is never a hard reject; the outline gate is the only hard gate.
+    One repair pass when ``forge_lint_repair`` is set; residual issues are
+    persisted as a non-rendering HTML comment so the user knows the
+    artifact has warnings.
+    """
+    cfg = state.cfg
+    issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    repair_used = False
+    if issues and cfg.lint_repair:
         repaired = await _lint_repair_pass(
             ctx,
-            user_input=user_input,
+            user_input=state.user_input,
             document=document,
-            model_def=model_def,
-            issues=lint_issues,
+            model_def=state.model_def,
+            issues=issues,
             max_tokens=cfg.max_completion_tokens,
         )
         if repaired != document:
-            lint_repair_used = True
-            # Re-split inline fences before formatting (the repair pass
-            # regenerated the text).
+            repair_used = True
+            # The repair pass regenerated the text, so re-run the fence
+            # hygiene split before formatting (same order rationale as
+            # the primary pass).
             document = repair_inline_fences(repaired)
             document = _format_markdown(document)
-            try:
-                outline = await _validate_outline(ctx, document)
-            except RuntimeError as exc:
-                return OperationResult(output_text=str(exc))
+            new_outline, failure = await _outline_for_document(ctx, document)
+            if failure is not None:
+                return _LintOutcome(
+                    document=document,
+                    outline=outline,
+                    heading_count=heading_count,
+                    issues=issues,
+                    repair_used=repair_used,
+                    error=failure,
+                )
+            outline = new_outline
             heading_count = int(outline.get("heading_count", 0) or 0)
             if heading_count < _MIN_HEADINGS:
                 text = _format_template(
                     _load_text(ctx, _NO_OUTLINE_PATH),
                     heading_count=heading_count,
                 )
-                return OperationResult(output_text=text)
-            lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
-    if lint_issues:
-        comment = lint_summary_comment(lint_issues)
+                return _LintOutcome(
+                    document=document,
+                    outline=outline,
+                    heading_count=heading_count,
+                    issues=issues,
+                    repair_used=repair_used,
+                    error=text,
+                )
+            issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    if issues:
+        comment = lint_summary_comment(issues)
         if comment:
             document = document.rstrip() + "\n\n" + comment + "\n"
+    return _LintOutcome(
+        document=document,
+        outline=outline,
+        heading_count=heading_count,
+        issues=issues,
+        repair_used=repair_used,
+    )
 
-    try:
-        write_response = await _persist_document(ctx, document, document_path)
-    except RuntimeError as exc:
-        text = _format_template(
-            _load_text(ctx, _STORAGE_FAILED_PATH),
-            error=str(exc),
+
+async def _validate_and_lint(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+    document: str,
+) -> _LintOutcome:
+    """Phase 4 — outline gate (hard) followed by the advisory lint gate."""
+    outline, failure = await _outline_for_document(ctx, document)
+    if failure is not None:
+        return _LintOutcome(
+            document=document,
+            outline={},
+            heading_count=0,
+            issues=[],
+            repair_used=False,
+            error=failure,
         )
-        return OperationResult(output_text=text)
-
-    ok = bool(write_response.get("ok", False))
-    if not ok:
+    heading_count = int(outline.get("heading_count", 0) or 0)
+    if heading_count < _MIN_HEADINGS:
         text = _format_template(
-            _load_text(ctx, _STORAGE_FAILED_PATH),
-            error=write_response.get("raw", "unknown storage error"),
-        )
-        return OperationResult(output_text=text)
-
-    stored_path = str(write_response.get("path") or document_path)
-    byte_count = int(write_response.get("bytes") or len(document.encode("utf-8")))
-
-    okf_concept_path_written: str | None = None
-    if sources and str(params.get("okf_bundle_path") or "").strip():
-        okf_concept_path_written = await _write_okf_provenance(
-            ctx,
-            okf_bundle_path=str(params["okf_bundle_path"]).strip(),
-            document_stem=_document_stem(document_path),
-            sources=sources,
-            stored_path=stored_path,
-            output_bytes=byte_count,
+            _load_text(ctx, _NO_OUTLINE_PATH),
             heading_count=heading_count,
-            model_def=model_def,
-            passes=1 + (1 if density_retried else 0),
-            continue_attempts=continue_attempts,
-            density_ratio=density_ratio,
-            density_floor=density_floor_value,
-            density_passed=density_passed,
-            first_finish_reason=first_finish_reason,
-            final_finish_reason=final_finish_reason,
-            truncated=was_truncated,
-            per_source_meta=per_source_meta,
         )
+        return _LintOutcome(
+            document=document,
+            outline=outline,
+            heading_count=heading_count,
+            issues=[],
+            repair_used=False,
+            error=text,
+        )
+    return await _run_lint_gate(
+        ctx, state=state, document=document, outline=outline, heading_count=heading_count
+    )
 
+
+async def _write_consolidation_provenance(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ConsolidationState,
+    stored_path: str,
+    byte_count: int,
+    heading_count: int,
+) -> str | None:
+    """Write the OKF forge-provenance concept when a bundle path is set."""
+    if not (state.sources and str(state.params.get("okf_bundle_path") or "").strip()):
+        return None
+    return await _write_okf_provenance(
+        ctx,
+        okf_bundle_path=str(state.params["okf_bundle_path"]).strip(),
+        document_stem=_document_stem(state.document_path),
+        sources=state.sources,
+        stored_path=stored_path,
+        output_bytes=byte_count,
+        heading_count=heading_count,
+        model_def=state.model_def,
+        passes=1 + (1 if state.density_retried else 0),
+        continue_attempts=state.continue_attempts,
+        density_ratio=state.density_ratio,
+        density_floor=state.density_floor_value,
+        density_passed=state.density_passed,
+        first_finish_reason=state.first_finish_reason,
+        final_finish_reason=state.final_finish_reason,
+        truncated=state.was_truncated,
+        per_source_meta=state.per_source_meta,
+    )
+
+
+def _build_consolidation_summary(
+    *,
+    state: _ConsolidationState,
+    stored_path: str,
+    byte_count: int,
+    heading_count: int,
+    okf_concept_path_written: str | None,
+    lint_issues: list[LintIssue],
+    lint_repair_used: bool,
+) -> str:
+    """Build the user-facing summary of the consolidation result."""
     summary = (
         f"Document consolidated and stored at `{stored_path}` "
         f"({byte_count} bytes, {heading_count} headings)."
     )
-    if was_truncated:
+    if state.was_truncated:
         summary += (
-            f" WARNING: persisted truncated after {continue_attempts} "
+            f" WARNING: persisted truncated after {state.continue_attempts} "
             f"continuation attempt(s) (final finish_reason="
-            f"{final_finish_reason!r}). See annotation in document."
+            f"{state.final_finish_reason!r}). See annotation in document."
         )
-    if sources and not density_passed:
+    if state.sources and not state.density_passed:
         summary += (
-            f" WARNING: density floor FAILED ({density_ratio:.0%} of "
-            f"{source_total}B source; floor {density_floor_value:.0%}). "
+            f" WARNING: density floor FAILED ({state.density_ratio:.0%} of "
+            f"{state.source_total}B source; floor {state.density_floor_value:.0%}). "
             f"The persisted document may be a lossy abridgment — review it."
         )
-    if density_failed_sources:
+    if state.density_failed_sources:
         summary += (
             f" WARNING: per-source density floor failed for "
-            f"{len(density_failed_sources)} source(s): "
-            f"{', '.join(density_failed_sources)}. See inline markers in "
+            f"{len(state.density_failed_sources)} source(s): "
+            f"{', '.join(state.density_failed_sources)}. See inline markers in "
             f"the persisted document."
         )
     if okf_concept_path_written:
@@ -1743,35 +2012,101 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             f" Note: {len(lint_issues)} structural lint warning(s) remain "
             f"after {'a' if lint_repair_used else 'no'} repair pass; see lint comment in document."
         )
+    return summary
+
+
+async def _persist_consolidation(
+    ctx: OperationExecutionContext,
+    state: _ConsolidationState,
+    outcome: _LintOutcome,
+) -> OperationResult:
+    """Phase 5 — persist the document, capture provenance, and report."""
+    document = outcome.document
+    try:
+        write_response = await _persist_document(ctx, document, state.document_path)
+    except RuntimeError as exc:
+        text = _format_template(
+            _load_text(ctx, _STORAGE_FAILED_PATH),
+            error=str(exc),
+        )
+        return OperationResult(output_text=text)
+    if not bool(write_response.get("ok", False)):
+        text = _format_template(
+            _load_text(ctx, _STORAGE_FAILED_PATH),
+            error=write_response.get("raw", "unknown storage error"),
+        )
+        return OperationResult(output_text=text)
+    stored_path = str(write_response.get("path") or state.document_path)
+    byte_count = int(write_response.get("bytes") or len(document.encode("utf-8")))
+    okf_concept_path_written = await _write_consolidation_provenance(
+        ctx,
+        state=state,
+        stored_path=stored_path,
+        byte_count=byte_count,
+        heading_count=outcome.heading_count,
+    )
+    summary = _build_consolidation_summary(
+        state=state,
+        stored_path=stored_path,
+        byte_count=byte_count,
+        heading_count=outcome.heading_count,
+        okf_concept_path_written=okf_concept_path_written,
+        lint_issues=outcome.issues,
+        lint_repair_used=outcome.repair_used,
+    )
     return OperationResult(
         output_text=summary,
         output_json={
             "path": stored_path,
             "bytes": byte_count,
-            "heading_count": heading_count,
-            "outline": outline,
-            "truncated": was_truncated,
-            "continue_attempts": continue_attempts,
-            "first_finish_reason": first_finish_reason,
-            "final_finish_reason": final_finish_reason,
-            "source_count": n_readable,
-            "rolling_accumulation_used": rolling_used,
-            "source_total_bytes": source_total,
-            "density_ratio": density_ratio,
-            "density_passed": density_passed,
-            "density_retried": density_retried,
-            "density_failed_sources": density_failed_sources,
+            "heading_count": outcome.heading_count,
+            "outline": outcome.outline,
+            "truncated": state.was_truncated,
+            "continue_attempts": state.continue_attempts,
+            "first_finish_reason": state.first_finish_reason,
+            "final_finish_reason": state.final_finish_reason,
+            "source_count": state.n_readable,
+            "rolling_accumulation_used": state.rolling_used,
+            "source_total_bytes": state.source_total,
+            "density_ratio": state.density_ratio,
+            "density_passed": state.density_passed,
+            "density_retried": state.density_retried,
+            "density_failed_sources": state.density_failed_sources,
             "okf_provenance_path": okf_concept_path_written,
-            "lint_warnings": len(lint_issues),
-            "lint_repair_used": lint_repair_used,
+            "lint_warnings": len(outcome.issues),
+            "lint_repair_used": outcome.repair_used,
         },
         extra={
-            "memory_context_lines": memory_context.count("\n") + 1 if memory_context else 0,
+            "memory_context_lines": state.memory_context.count("\n") + 1
+            if state.memory_context
+            else 0,
             "document_path": stored_path,
-            "truncated": was_truncated,
-            "continue_attempts": continue_attempts,
-            "source_count": n_readable,
-            "density_passed": density_passed,
-            "lint_warnings": len(lint_issues),
+            "truncated": state.was_truncated,
+            "continue_attempts": state.continue_attempts,
+            "source_count": state.n_readable,
+            "density_passed": state.density_passed,
+            "lint_warnings": len(outcome.issues),
         },
     )
+
+
+async def execute(ctx: OperationExecutionContext) -> OperationResult:
+    """Consolidate multiple source documents into one markdown document, preserving detail.
+
+    Orchestrates the five pipeline phases — prepare (parse + read the
+    sources), forge (map-reduce or single-pass plus the density floor),
+    finalize (format, cap, annotate), validate (outline + advisory lint),
+    and persist (write + OKF provenance). Each phase lives in its own
+    helper; this function only wires them together.
+    """
+    state, failure = await _prepare_consolidation(ctx)
+    if failure is not None:
+        return failure
+    failure = await _forge_consolidation(ctx, state)
+    if failure is not None:
+        return failure
+    document = _finalize_document(ctx, state)
+    outcome = await _validate_and_lint(ctx, state, document)
+    if outcome.error is not None:
+        return OperationResult(output_text=outcome.error)
+    return await _persist_consolidation(ctx, state, outcome)

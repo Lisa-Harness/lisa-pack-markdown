@@ -1,0 +1,13 @@
+# Keep the working tree's line endings as committed. The framework's
+# ruff configuration pins line-ending = "lf", so a Windows checkout that
+# rewrote LF to CRLF would fail the format check on every file.
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf

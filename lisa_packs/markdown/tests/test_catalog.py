@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 
-import lisa_packs.markdown as markdown
 from sdk.content import (
     build_operation_catalog_json,
     build_tool_catalog_json,
 )
+
+from lisa_packs import markdown
 
 
 def test_forge_document_discovered() -> None:

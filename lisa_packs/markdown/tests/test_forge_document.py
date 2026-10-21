@@ -11,19 +11,36 @@ fallbacks — tests must wire both callbacks exactly as production hosts do.
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import pytest
-
 from kernel.models import OperationExecutionContext, ToolResult
+
+from lisa_packs.markdown.operations._lint import LintIssue
 from lisa_packs.markdown.operations.forge_document.forge_document import (
     Parameters,
     execute,
 )
 
 _CONTENT_ROOT = Path(__file__).resolve().parents[1]
+
+# The operation's flat completion-token ceiling, and the number of completion
+# calls a lint-repair pass makes (initial forge plus one repair).
+_FLAT_TOKEN_CEILING = 50_000
+_LINT_REPAIR_CALL_COUNT = 2
+
+
+class ToolExecutor(Protocol):
+    """The ``execute_tool_fn`` seam a fake storage tool implements."""
+
+    def __call__(
+        self,
+        tool_id: str,
+        ctx: Any,
+    ) -> Awaitable[ToolResult]: ...
 
 
 def _make_loader() -> Any:
@@ -84,13 +101,96 @@ _VALID_DOCUMENT = (
 )
 
 
+def _memory_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    memory_records: list[str] | None,
+    captures: dict[str, Any],
+) -> ToolResult:
+    """Fake ``memory.search`` response."""
+    captures["memory_query"] = params.get("query")
+    if memory_records is None:
+        return ToolResult(tool_id=tool_id, output_text="No relevant memories found.")
+    lines = [f"- {r}" for r in memory_records]
+    return ToolResult(tool_id=tool_id, output_text="\n".join(lines))
+
+
+def _outline_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    outline: dict[str, Any] | None,
+    captures: dict[str, Any],
+) -> ToolResult:
+    """Fake ``markdown_generate`` response (injected fixture or computed)."""
+    captures["outline_markdown"] = params.get("markdown")
+    if outline is not None:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text="Outline from injected fixture.",
+            output_json=outline,
+        )
+    # Compute a minimal outline from the supplied markdown so the
+    # operation's heading-count gate can be exercised realistically.
+    md_text = str(params.get("markdown") or "")
+    heading_count = sum(1 for line in md_text.splitlines() if line.lstrip().startswith("#"))
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=f"Outline: {heading_count} headings.",
+        output_json={"heading_count": heading_count, "headings": []},
+    )
+
+
+def _read_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    store: dict[str, str],
+    captures: dict[str, Any],
+) -> ToolResult:
+    """Fake ``read_file`` response served from the in-memory store."""
+    path = str(params.get("path") or "")
+    captures["read_paths"].append(path)
+    if path in store:
+        return ToolResult(tool_id=tool_id, output_text=store[path])
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps({"error": f"file not found: {path}"}),
+    )
+
+
+def _write_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    store: dict[str, str],
+    captures: dict[str, Any],
+    write_ok: bool,
+) -> ToolResult:
+    """Fake ``write_file`` response; records the persisted content."""
+    path = str(params.get("path") or "")
+    content = str(params.get("content") or "")
+    captures["writes"].append({"path": path, "content": content})
+    if not write_ok:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text=json.dumps({"error": "server is read-only"}),
+        )
+    store[path] = content
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps({"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}),
+    )
+
+
 def _make_tool_executor(
     *,
     memory_records: list[str] | None = None,
     outline: dict[str, Any] | None = None,
     write_ok: bool = True,
     stored_documents: dict[str, str] | None = None,
-) -> tuple[Any, dict[str, Any]]:
+) -> tuple[ToolExecutor, dict[str, Any]]:
     """Return a fake ``execute_tool_fn`` and a captures dict.
 
     ``captures`` records the arguments of each ``write_file`` call so tests
@@ -109,54 +209,16 @@ def _make_tool_executor(
     async def execute_tool_fn(tool_id: str, ctx: Any) -> ToolResult:
         params = getattr(ctx, "parameters", {}) or {}
         if tool_id == "memory.search":
-            captures["memory_query"] = params.get("query")
-            if memory_records is None:
-                return ToolResult(tool_id=tool_id, output_text="No relevant memories found.")
-            lines = [f"- {r}" for r in memory_records]
-            return ToolResult(tool_id=tool_id, output_text="\n".join(lines))
+            return _memory_tool_result(
+                tool_id, params, memory_records=memory_records, captures=captures
+            )
         if tool_id == "markdown_generate":
-            captures["outline_markdown"] = params.get("markdown")
-            if outline is not None:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text="Outline from injected fixture.",
-                    output_json=outline,
-                )
-            # Compute a minimal outline from the supplied markdown so the
-            # operation's heading-count gate can be exercised realistically.
-            md_text = str(params.get("markdown") or "")
-            heading_count = sum(
-                1 for line in md_text.splitlines() if line.lstrip().startswith("#")
-            )
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=f"Outline: {heading_count} headings.",
-                output_json={"heading_count": heading_count, "headings": []},
-            )
+            return _outline_tool_result(tool_id, params, outline=outline, captures=captures)
         if tool_id == "read_file":
-            path = str(params.get("path") or "")
-            captures["read_paths"].append(path)
-            if path in store:
-                return ToolResult(tool_id=tool_id, output_text=store[path])
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps({"error": f"file not found: {path}"}),
-            )
+            return _read_tool_result(tool_id, params, store=store, captures=captures)
         if tool_id == "write_file":
-            path = str(params.get("path") or "")
-            content = str(params.get("content") or "")
-            captures["writes"].append({"path": path, "content": content})
-            if not write_ok:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text=json.dumps({"error": "server is read-only"}),
-                )
-            store[path] = content
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(
-                    {"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}
-                ),
+            return _write_tool_result(
+                tool_id, params, store=store, captures=captures, write_ok=write_ok
             )
         return ToolResult(tool_id=tool_id, error=f"unknown tool: {tool_id}")
 
@@ -221,7 +283,9 @@ async def test_empty_input_returns_no_input_message() -> None:
 
 @pytest.mark.asyncio
 async def test_forges_and_persists_document() -> None:
-    tool_fn, captures = _make_tool_executor(memory_records=["Incident 42: VM stuck, restart fixed it."])
+    tool_fn, captures = _make_tool_executor(
+        memory_records=["Incident 42: VM stuck, restart fixed it."]
+    )
     ctx = _make_ctx(
         complete_fn=_fake_complete_returning(_VALID_DOCUMENT),
         resolve_model_fn=_fake_resolve_model(),
@@ -597,15 +661,7 @@ async def test_annotation_suppressed_by_user_phrase() -> None:
 @pytest.mark.asyncio
 async def test_document_formatted_by_mdformat() -> None:
     """The persisted document is normalized (single trailing newline, clean spacing)."""
-    messy = (
-        "# Runbook\n"
-        "\n\n\n"
-        "## Steps\n"
-        "\n"
-        "-  step one\n"
-        "-   step two\n"
-        "\n\n\n"
-    )
+    messy = "# Runbook\n\n\n\n## Steps\n\n-  step one\n-   step two\n\n\n\n"
     tool_fn, captures = _make_tool_executor()
     ctx = _make_ctx(
         complete_fn=_fake_complete_returning(messy),
@@ -647,8 +703,8 @@ def _fake_complete_sequence(
     to override (e.g. ``[None, False]`` for the unknown-signal safety-net
     case).
     """
-    if truncated is None:
-        truncated = [True, False] + [False] * max(0, len(documents) - 2)
+    default_flags: Sequence[bool | None] = [True, False] + [False] * max(0, len(documents) - 2)
+    truncated_flags: Sequence[bool | None] = truncated if truncated is not None else default_flags
     state = {"index": 0}
 
     async def _complete(**_kwargs: Any) -> _FakeCompletion:
@@ -656,7 +712,7 @@ def _fake_complete_sequence(
         state["index"] += 1
         doc = documents[idx] if idx < len(documents) else ""
         finish = finish_reasons[idx] if idx < len(finish_reasons) else "stop"
-        trunc = truncated[idx] if idx < len(truncated) else False
+        trunc: bool | None = truncated_flags[idx] if idx < len(truncated_flags) else False
         return _FakeCompletion(
             content=f"```markdown\n{doc}\n```",
             finish_reason=finish,
@@ -676,13 +732,7 @@ _PARTIAL_SWOT = (
     "- Steeper learning curve.\n"
 )
 
-_SWOT_TAIL = (
-    "## Opportunities\n"
-    "- Enterprise adoption.\n"
-    "\n"
-    "## Threats\n"
-    "- Integrated IDE dominance.\n"
-)
+_SWOT_TAIL = "## Opportunities\n- Enterprise adoption.\n\n## Threats\n- Integrated IDE dominance.\n"
 
 _FULL_SWOT = _PARTIAL_SWOT + "\n" + _SWOT_TAIL
 
@@ -744,7 +794,7 @@ async def test_unknown_finish_reason_triggers_continuation() -> None:
 @pytest.mark.asyncio
 async def test_none_finish_reason_triggers_continuation() -> None:
     """A missing signal (truncated=None) triggers one safety-net continuation."""
-    tool_fn, captures = _make_tool_executor()
+    tool_fn, _captures = _make_tool_executor()
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, _SWOT_TAIL],
         finish_reasons=[None, "stop"],
@@ -998,11 +1048,7 @@ async def test_continuation_prose_outside_fence_falls_back_to_raw() -> None:
     """
     tool_fn, captures = _make_tool_executor()
     tail_as_prose = (
-        "## Opportunities\\n"
-        "- Enterprise adoption.\\n"
-        "\\n"
-        "## Threats\\n"
-        "- Integrated IDE dominance.\\n"
+        "## Opportunities\\n- Enterprise adoption.\\n\\n## Threats\\n- Integrated IDE dominance.\\n"
     )
     complete_fn = _fake_complete_sequence(
         documents=[_PARTIAL_SWOT, tail_as_prose],
@@ -1029,17 +1075,7 @@ def test_extract_markdown_block_nested_fences() -> None:
     """Nested fences inside a markdown block must not close the outer block."""
     from lisa_packs.markdown.operations._continuation import extract_markdown_block
 
-    text = (
-        "```markdown\\n"
-        "# Title\\n"
-        "\\n"
-        "```python\\n"
-        "print('hello')\\n"
-        "```\\n"
-        "\\n"
-        "Body.\\n"
-        "```"
-    )
+    text = "```markdown\\n# Title\\n\\n```python\\nprint('hello')\\n```\\n\\nBody.\\n```"
     result = extract_markdown_block(text)
     assert "# Title" in result
     assert "print('hello')" in result
@@ -1223,7 +1259,7 @@ async def test_lint_issues_trigger_repair_pass() -> None:
             return _FakeCompletion(content=f"```markdown\n{malformed}\n```", finish_reason="stop")
         return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```", finish_reason="stop")
 
-    tool_fn, captures = _make_tool_executor()
+    tool_fn, _captures = _make_tool_executor()
     ctx = _make_ctx(
         complete_fn=_complete,
         resolve_model_fn=_fake_resolve_model(),
@@ -1232,7 +1268,7 @@ async def test_lint_issues_trigger_repair_pass() -> None:
     result = await execute(ctx)
     assert result.output_json["lint_repair_used"] is True
     # Two complete_fn calls: initial forge + one lint repair.
-    assert len(calls) == 2
+    assert len(calls) == _LINT_REPAIR_CALL_COUNT
     # The repair call's user prompt contains the lint issues block.
     repair_user = calls[1]["messages"][1]["content"]
     assert "Structural lint issues to fix" in repair_user
@@ -1240,7 +1276,7 @@ async def test_lint_issues_trigger_repair_pass() -> None:
 
 @pytest.mark.asyncio
 async def test_lint_repair_disabled_by_config() -> None:
-    """When ``forge_lint_repair`` is False, issues persist as an advisory comment, no repair call."""
+    """With ``forge_lint_repair`` False, issues persist as an advisory comment, no repair call."""
     malformed = "# Title\n\n#### Skipped\n\nBody.\n"
     calls: list[dict[str, Any]] = []
 
@@ -1273,10 +1309,10 @@ async def test_pymarkdownlnt_missing_silently_skips() -> None:
 
     real_lint = fd_mod.lint_markdown
 
-    def _empty_lint(document: str, *, rules_csv: str | None = None) -> list:
+    def _empty_lint(document: str, *, rules_csv: str | None = None) -> list[LintIssue]:
         return []
 
-    fd_mod.lint_markdown = _empty_lint  # type: ignore[assignment]
+    fd_mod.lint_markdown = _empty_lint
     try:
         ctx = _make_ctx(
             complete_fn=_fake_complete_returning(malformed),
@@ -1285,7 +1321,7 @@ async def test_pymarkdownlnt_missing_silently_skips() -> None:
         )
         result = await execute(ctx)
     finally:
-        fd_mod.lint_markdown = real_lint  # type: ignore[assignment]
+        fd_mod.lint_markdown = real_lint
     assert "Document forged" in result.output_text
     assert result.output_json["lint_warnings"] == 0
     persisted = captures["writes"][0]["content"]
@@ -1304,7 +1340,7 @@ async def test_lint_repair_introduces_no_new_truncation() -> None:
             return _FakeCompletion(content=f"```markdown\n{malformed}\n```", finish_reason="stop")
         return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```", finish_reason="stop")
 
-    tool_fn, captures = _make_tool_executor()
+    tool_fn, _captures = _make_tool_executor()
     ctx = _make_ctx(
         complete_fn=_complete,
         resolve_model_fn=_fake_resolve_model(),
@@ -1332,6 +1368,7 @@ async def test_target_length_scales_max_tokens() -> None:
     )
     await execute(ctx)
     import math
+
     expected = min(50_000, max(512, math.ceil(500 * 1.3)))
     assert calls[0]["max_tokens"] == expected
 
@@ -1347,7 +1384,7 @@ async def test_target_length_none_preserves_flat_budget() -> None:
         execute_tool_fn=tool_fn,
     )
     await execute(ctx)
-    assert calls[0]["max_tokens"] == 50_000
+    assert calls[0]["max_tokens"] == _FLAT_TOKEN_CEILING
 
 
 @pytest.mark.asyncio
@@ -1363,6 +1400,7 @@ async def test_target_length_zero_coerced_to_default() -> None:
     )
     await execute(ctx)
     import math
+
     from lisa_packs.markdown.operations.forge_document.forge_document import _DEFAULT_TARGET_WORDS
 
     expected = min(50_000, max(512, math.ceil(_DEFAULT_TARGET_WORDS * 1.3)))
@@ -1384,6 +1422,7 @@ async def test_target_length_exceeds_char_cap_is_clamped() -> None:
     await execute(ctx)
     # Clamped to 20000 // 5 = 4000 words -> ceil(4000 * 1.3) = 5200 tokens.
     import math
+
     expected = min(50_000, max(512, math.ceil(4000 * 1.3)))
     assert calls[0]["max_tokens"] == expected
 
@@ -1439,4 +1478,3 @@ async def test_target_length_scales_continue_budget() -> None:
     # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.3) = 650.
     assert result.output_json["truncated"] is False
     assert result.output_json["continue_attempts"] == 1
-

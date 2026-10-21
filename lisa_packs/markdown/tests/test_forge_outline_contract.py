@@ -44,9 +44,7 @@ class _FakeModel:
     display_name: str = "GPT Chat"
 
 
-_DOC_NO_PLAN = (
-    "# Runbook\n\n## Symptoms\n- VM is unresponsive.\n\n## Steps\n1. Restart the VM.\n"
-)
+_DOC_NO_PLAN = "# Runbook\n\n## Symptoms\n- VM is unresponsive.\n\n## Steps\n1. Restart the VM.\n"
 
 
 def _doc_with_plan(plan: str, body: str) -> str:
@@ -96,6 +94,13 @@ _FAQ_SECTION = (
 )
 
 _PLAN = "## Positioning / ## Evidence / ## Launch sequence / ## Competitive FAQ"
+
+# Outline-contract attempt and completion-call counts the expansion paths
+# are expected to make.
+_SINGLE_ATTEMPT = 1
+_TWO_ATTEMPTS = 2
+_TWO_COMPLETION_CALLS = 2
+_THREE_COMPLETION_CALLS = 3
 
 
 def _document_from(content: str) -> _FakeCompletion:
@@ -210,9 +215,7 @@ def test_missing_sections_empty_plan_is_empty() -> None:
 def test_missing_sections_top_level_heading_does_not_satisfy() -> None:
     """A lone ``#`` title does not satisfy a planned ``##`` section."""
     document = "# Launch sequence\nbody\n"
-    assert missing_planned_sections(("Launch sequence",), document) == (
-        "Launch sequence",
-    )
+    assert missing_planned_sections(("Launch sequence",), document) == ("Launch sequence",)
 
 
 # ── execute() gate behavior ────────────────────────────────────────────
@@ -270,9 +273,9 @@ async def test_missing_sections_expand_and_persist_complete_document() -> None:
     assert contract["missing_before"] == ["Launch sequence", "Competitive FAQ"]
     assert contract["missing_after"] == []
     assert contract["stop_reason"] == "expanded"
-    assert contract["attempts"] == 2
+    assert contract["attempts"] == _TWO_ATTEMPTS
     # First forge pass + two expansion passes.
-    assert len(captures["complete_calls"]) == 3
+    assert len(captures["complete_calls"]) == _THREE_COMPLETION_CALLS
 
 
 @pytest.mark.asyncio
@@ -296,7 +299,7 @@ async def test_expansion_still_missing_persists_degraded_with_warning() -> None:
     assert contract["stop_reason"] == "still_missing"
     # Both budgeted attempts ran; each returned an empty pass and the gate
     # gave up after exhausting the budget.
-    assert contract["attempts"] == 2
+    assert contract["attempts"] == _TWO_ATTEMPTS
     persisted = captures["writes"][0]["content"]
     assert "missing sections: Launch sequence, Competitive FAQ" in persisted
 
@@ -309,9 +312,7 @@ async def test_whole_tail_fallback_merges_tail_once() -> None:
     append the same prose twice (once per remaining title) under the
     per-title loop. The whole-tail fallback is single-shot.
     """
-    loose = (
-        "1. Publish the packages.\n2. Record the demo.\n3. Answer each alternative.\n"
-    )
+    loose = "1. Publish the packages.\n2. Record the demo.\n3. Answer each alternative.\n"
     ctx, captures = _make_ctx(
         [
             _document_from(_doc_with_plan(_PLAN, _PARTIAL_BODY)),
@@ -326,7 +327,7 @@ async def test_whole_tail_fallback_merges_tail_once() -> None:
     # sections stay missing — but the prose merged exactly once: pass 1
     # appended it, pass 2 detected the duplicate and aborted.
     assert contract["missing_after"] == ["Launch sequence", "Competitive FAQ"]
-    assert contract["attempts"] == 2
+    assert contract["attempts"] == _TWO_ATTEMPTS
 
 
 @pytest.mark.asyncio
@@ -346,8 +347,8 @@ async def test_single_pass_writes_both_missing_sections() -> None:
     assert "## Competitive FAQ" in persisted
     contract = result.extra["outline_contract"]
     assert contract["missing_after"] == []
-    assert contract["attempts"] == 1
-    assert len(captures["complete_calls"]) == 2
+    assert contract["attempts"] == _SINGLE_ATTEMPT
+    assert len(captures["complete_calls"]) == _TWO_COMPLETION_CALLS
 
 
 @pytest.mark.asyncio

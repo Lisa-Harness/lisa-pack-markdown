@@ -34,15 +34,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
-
-from kernel import model_budgets
 from kernel.models import (
     OperationExecutionContext,
     OperationResult,
     ToolExecutionContext,
 )
-
+from lisa_packs.markdown.operations._budget import target_words_to_max_tokens
 from lisa_packs.markdown.operations._config import cfg_bool, cfg_float, cfg_int, cfg_str
 from lisa_packs.markdown.operations._continuation import (
     continue_until_complete,
@@ -58,11 +55,14 @@ from lisa_packs.markdown.operations._lint import (
     lint_markdown,
     lint_summary_comment,
 )
-from lisa_packs.markdown.operations._budget import target_words_to_max_tokens
+from lisa_packs.markdown.operations._memory import recall_memory
+from pydantic import BaseModel, Field
+
+from kernel import model_budgets
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Parameters", "execute"]
+__all__ = ["Parameters", "execute", "lint_markdown"]
 
 # Tool ids — declared in the operation YAML ``tool_ids`` and routed through
 # ``ctx.execute_tool_fn``. ``markdown_generate`` is a pack-contributed
@@ -71,7 +71,6 @@ __all__ = ["Parameters", "execute"]
 _OUTLINE_TOOL_ID = "markdown_generate"
 _WRITE_TOOL_ID = "write_file"
 _READ_TOOL_ID = "read_file"
-_MEMORY_SEARCH_TOOL_ID = "memory.search"
 
 # User-instruction phrases that opt out of model attribution.
 _NO_ANNOTATE_PHRASES = (
@@ -152,11 +151,9 @@ def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     """
     host = ctx.host
     if host is None:
-        raise RuntimeError(
-            f"OperationHost is not wired; cannot load authored content at {path}"
-        )
+        raise RuntimeError(f"OperationHost is not wired; cannot load authored content at {path}")
     try:
-        loaded = host.read_authored_text(path).strip()
+        loaded = str(host.read_authored_text(path) or "").strip()
     except Exception as exc:  # pylint: disable=broad-except
         raise RuntimeError(f"read_authored_text failed for {path}: {exc}") from exc
     if not loaded:
@@ -189,11 +186,13 @@ class Parameters(BaseModel):
 
     document_path: str = Field(
         default="docs/forge.md",
-        description="Relative path within the lisa-storage files sandbox where the forged document is persisted.",
+        description="Relative path within the lisa-storage files sandbox where the forged document "
+        "is persisted.",
     )
     query: str = Field(
         default="",
-        description="Natural-language instruction for the document. Falls back to ctx.query when empty.",
+        description="Natural-language instruction for the document. Falls back to ctx.query when "
+        "empty.",
     )
     existing_document: str = Field(
         default="",
@@ -265,26 +264,16 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
     """Resolve all operation budgets from ``ctx.pack_config`` with fallbacks."""
     pc = ctx.pack_config
     return _ResolvedSettings(
-        max_completion_tokens=cfg_int(
-            pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS
-        ),
-        max_continue_tokens=cfg_int(
-            pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS
-        ),
-        max_continue_attempts=cfg_int(
-            pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS
-        ),
+        max_completion_tokens=cfg_int(pc, "forge_max_completion_tokens", _MAX_COMPLETION_TOKENS),
+        max_continue_tokens=cfg_int(pc, "forge_max_continue_tokens", _MAX_CONTINUE_TOKENS),
+        max_continue_attempts=cfg_int(pc, "forge_max_continue_attempts", _MAX_CONTINUE_ATTEMPTS),
         max_recall_records=cfg_int(pc, "forge_max_recall_records", _MAX_RECALL_RECORDS),
         max_document_chars=cfg_int(pc, "forge_max_document_chars", _MAX_DOCUMENT_CHARS),
         max_query_chars=cfg_int(pc, "forge_max_query_chars", _MAX_QUERY_CHARS),
         lint_rules=cfg_str(pc, "forge_lint_rules", _DEFAULT_LINT_RULES),
         lint_repair=cfg_bool(pc, "forge_lint_repair", _DEFAULT_LINT_REPAIR),
-        tokens_per_word=cfg_float(
-            pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD
-        ),
-        outline_contract=cfg_bool(
-            pc, "forge_outline_contract", _DEFAULT_OUTLINE_CONTRACT
-        ),
+        tokens_per_word=cfg_float(pc, "forge_tokens_per_word", _DEFAULT_TOKENS_PER_WORD),
+        outline_contract=cfg_bool(pc, "forge_outline_contract", _DEFAULT_OUTLINE_CONTRACT),
         outline_contract_attempts=cfg_int(
             pc, "forge_outline_contract_attempts", _DEFAULT_OUTLINE_CONTRACT_ATTEMPTS
         ),
@@ -360,65 +349,8 @@ async def _recall_memory(
     ``RuntimeError`` only when the tool executor itself is missing.
     """
     if ctx.host is None:
-        raise RuntimeError(
-            "markdown requires OperationHost to call memory/storage tools"
-        )
-
-    recall_limit = max(1, min(int(limit), 20))
-    tool_result = await ctx.host.execute_tool(
-        _MEMORY_SEARCH_TOOL_ID,
-        ToolExecutionContext(
-            tool_id=_MEMORY_SEARCH_TOOL_ID,
-            workspace_id=ctx.workspace_id,
-            user_id=ctx.user_id,
-            user_slug=ctx.user_slug,
-            surface_type=ctx.surface_type,
-            surface_id=ctx.surface_id,
-            memory_scope=ctx.memory_scope,
-            mode_id=ctx.mode_id,
-            query=query,
-            parameters={
-                "query": query,
-                "user_slug": ctx.user_slug,
-                "workspace_id": ctx.workspace_id,
-                "memory_scope": ctx.memory_scope,
-                "surface_id": ctx.surface_id,
-                "limit": recall_limit,
-            },
-        ),
-    )
-    error_text = getattr(tool_result, "error", "") or ""
-    if error_text:
-        logger.warning("markdown: memory.search returned error: %s", error_text)
-        return ""
-    output_text = getattr(tool_result, "output_text", "") or ""
-    try:
-        data = json.loads(output_text)
-    except (json.JSONDecodeError, TypeError):
-        return output_text.strip()
-    if isinstance(data, list):
-        lines: list[str] = []
-        for item in data:
-            if isinstance(item, dict):
-                content = str(item.get("content") or "").strip()
-                if content:
-                    lines.append(f"- {content}")
-            elif isinstance(item, str) and item.strip():
-                lines.append(f"- {item.strip()}")
-        return "\n".join(lines)
-    if (
-        isinstance(data, dict)
-        and "results" in data
-        and isinstance(data["results"], list)
-    ):
-        lines = []
-        for item in data["results"]:
-            if isinstance(item, dict):
-                content = str(item.get("content") or "").strip()
-                if content:
-                    lines.append(f"- {content}")
-        return "\n".join(lines)
-    return output_text.strip()
+        raise RuntimeError("markdown requires OperationHost to call memory/storage tools")
+    return await recall_memory(ctx, query, limit=limit)
 
 
 async def _call_llm(
@@ -580,9 +512,7 @@ def _completion_spent(completion: Any, *, requested: int) -> bool:
     """
     if getattr(completion, "finish_reason", None) == "length":
         return True
-    return model_budgets._is_reasoning_burnout_completion(
-        completion, base_max_tokens=requested
-    )
+    return model_budgets._is_reasoning_burnout_completion(completion, base_max_tokens=requested)
 
 
 async def _call_llm_forge(
@@ -635,11 +565,7 @@ async def _call_llm_forge(
     content = (getattr(completion, "content", "") or "").strip()
     truncated = getattr(completion, "truncated", None)
     finish_reason = getattr(completion, "finish_reason", None)
-    if (
-        not content
-        and burnout_rescue
-        and _completion_spent(completion, requested=max_tokens)
-    ):
+    if not content and burnout_rescue and _completion_spent(completion, requested=max_tokens):
         retry_tokens = _burnout_retry_budget(
             first_pass_max_tokens=max_tokens,
             model_def=model_def,
@@ -747,8 +673,7 @@ def _resolve_target_length(
         return None, "", 0
     if words == 0:
         words = _DEFAULT_TARGET_WORDS
-    if words < _MIN_TARGET_WORDS:
-        words = _MIN_TARGET_WORDS
+    words = max(words, _MIN_TARGET_WORDS)
 
     # Coherence: a target whose char equivalent exceeds the document char
     # cap would be silently clipped post-merge. Clamp it down.
@@ -767,13 +692,12 @@ def _resolve_target_length(
 
     max_tokens = target_words_to_max_tokens(words, tokens_per_word=tokens_per_word)
     guidance = (
-        f"Target length: approximately {words} words "
-        f"({max(2, words // 200)} sections suggested)."
+        f"Target length: approximately {words} words ({max(2, words // 200)} sections suggested)."
     )
     return words, guidance, max_tokens
 
 
-async def _lint_repair_pass(
+async def _request_lint_repair(
     ctx: OperationExecutionContext,
     *,
     user_input: str,
@@ -781,22 +705,21 @@ async def _lint_repair_pass(
     model_def: Any,
     issues: list[LintIssue],
     max_tokens: int,
-) -> str:
-    """Issue one repair pass feeding the lint issues back to the model.
+) -> str | None:
+    """Ask the model to repair the lint issues. Returns ``None`` on failure.
 
-    Returns the repaired document text (extracted from the fenced
-    markdown block), or the original ``document`` on any failure. Never
-    raises; advisory.
+    The ``None`` result covers every failure mode: no host, an unloadable
+    repair prompt, a raised completion, an empty completion, and a
+    completion whose fenced block yields no usable text. The caller
+    treats ``None`` as "keep the original document".
     """
-    if not issues:
-        return document
     if ctx.host is None:
-        return document
+        return None
     try:
         repair_prompt = _load_text(ctx, _LINT_REPAIR_PROMPT_PATH)
     except RuntimeError as exc:
         logger.warning("markdown: lint repair prompt unavailable: %s", exc)
-        return document
+        return None
     user_prompt = _format_template(
         repair_prompt,
         user_input=user_input,
@@ -818,12 +741,42 @@ async def _lint_repair_pass(
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("markdown: lint repair pass raised: %s", exc)
-        return document
+        return None
     content = (getattr(completion, "content", "") or "").strip()
     if not content:
-        return document
+        return None
     repaired = extract_markdown_block(content)
     if not repaired.strip():
+        return None
+    return repaired
+
+
+async def _lint_repair_pass(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    document: str,
+    model_def: Any,
+    issues: list[LintIssue],
+    max_tokens: int,
+) -> str:
+    """Issue one repair pass feeding the lint issues back to the model.
+
+    Returns the repaired document text (extracted from the fenced
+    markdown block), or the original ``document`` on any failure. Never
+    raises; advisory.
+    """
+    if not issues:
+        return document
+    repaired = await _request_lint_repair(
+        ctx,
+        user_input=user_input,
+        document=document,
+        model_def=model_def,
+        issues=issues,
+        max_tokens=max_tokens,
+    )
+    if repaired is None:
         return document
     return repaired
 
@@ -832,6 +785,7 @@ async def _persist_no_outline_document(
     ctx: OperationExecutionContext,
     document: str,
     document_path: str,
+    *,
     heading_count: int,
     was_truncated: bool,
     continue_attempts: int,
@@ -929,9 +883,7 @@ async def _persist_no_outline_document(
     )
 
 
-async def _validate_outline(
-    ctx: OperationExecutionContext, document: str
-) -> dict[str, Any]:
+async def _validate_outline(ctx: OperationExecutionContext, document: str) -> dict[str, Any]:
     """Run the ``markdown_gehost.execute_toolnd return its outline dict.
 
     Raises ``RuntimeError`` if the tool returns an error.
@@ -1003,66 +955,144 @@ async def _persist_document(
 def _format_markdown(document: str) -> str:
     """Lint/format the document via ``mdformat`` if available."""
     try:
-        import mdformat  # type: ignore[import-not-found]
+        import mdformat
     except ImportError:
         logger.debug("mdformat not installed; skipping markdown formatting")
         return document
     try:
         return mdformat.text(document, options={"number": True}).rstrip() + "\n"
     except Exception as exc:  # pylint: disable=broad-except
-        logger.warning(
-            "forge_document: mdformat failed (%s); using unformatted document", exc
-        )
+        logger.warning("forge_document: mdformat failed (%s); using unformatted document", exc)
         return document
 
 
-async def execute(ctx: OperationExecutionContext) -> OperationResult:
-    """Forge a markdown document from user input + recalled memory and persist it."""
+# ── Forging phases ──────────────────────────────────────────────────
+#
+# ``execute`` is the pipeline's orchestrator, not its implementation. The
+# work is split into phases — prepare → forge → outline contract →
+# finalize → validate → persist — each in its own helper. ``_ForgeState``
+# is the shared record the phases read and write.
+
+
+@dataclass
+class _ForgeState:
+    """Operation state threaded through the forging phases."""
+
+    # ── prepared inputs ──
+    params: dict[str, Any]
+    cfg: _ResolvedSettings
+    user_input: str = ""
+    document_path: str = ""
+    memory_context: str = ""
+    existing_document: str = ""
+
+    # ── target-length budgets ──
+    target_words: int | None = None
+    target_guidance: str = ""
+    first_pass_max_tokens: int = 0
+    first_pass_continue_tokens: int = 0
+
+    # ── forge outputs ──
+    document: str = ""
+    model_def: Any = None
+    first_truncated: bool | None = None
+    first_finish_reason: str | None = None
+    final_finish_reason: str | None = None
+    was_truncated: bool = False
+    continue_attempts: int = 0
+    continuation_stop_reason: str = ""
+
+    # ── outline contract ──
+    forge_plan: tuple[str, ...] = ()
+    planned_missing: tuple[str, ...] = ()
+    missing_plan_sections: tuple[str, ...] = ()
+    outline_contract_attempts: int = 0
+    outline_contract_stop_reason: str = "skipped"
+
+
+async def _prepare_forge(
+    ctx: OperationExecutionContext,
+) -> tuple[_ForgeState, OperationResult | None]:
+    """Phase 1 — resolve settings, the instruction, and the existing document.
+
+    Returns ``(state, failure)``. ``failure`` is a terminal
+    ``OperationResult`` when the operation cannot proceed (no
+    instruction, an invalid document path, or an unwired host).
+    """
     params = ctx.params or {}
     cfg = _resolve_settings(ctx)
+    state = _ForgeState(params=params, cfg=cfg)
     user_input = _extract_query(ctx, params, cfg.max_query_chars)
     if not user_input:
-        return OperationResult(output_text=_load_text(ctx, _NO_INPUT_PATH))
-
+        return state, OperationResult(output_text=_load_text(ctx, _NO_INPUT_PATH))
+    state.user_input = user_input
     try:
-        document_path = _extract_document_path(params)
+        state.document_path = _extract_document_path(params)
+    except RuntimeError as exc:
+        return state, OperationResult(output_text=str(exc))
+    if ctx.host is None:
+        return state, OperationResult(output_text=_load_text(ctx, _USAGE_PATH))
+    return state, None
+
+
+async def _load_existing_document(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+) -> OperationResult | None:
+    """Read the document the caller wants revised, when one is not supplied.
+
+    When the caller omits ``existing_document`` but the target path
+    already exists in storage, read it so the LLM revises rather than
+    replacing wholesale. Returns a terminal ``OperationResult`` when the
+    read fails.
+    """
+    existing_document = str(state.params.get("existing_document") or "").strip()
+    if existing_document:
+        state.existing_document = existing_document
+        return None
+    try:
+        state.existing_document = await _read_existing_document(ctx, state.document_path)
     except RuntimeError as exc:
         return OperationResult(output_text=str(exc))
+    return None
 
-    if ctx.host is None:
-        return OperationResult(output_text=_load_text(ctx, _USAGE_PATH))
 
-    recall_limit = int(params.get("limit") or cfg.max_recall_records)
-    memory_context = await _recall_memory(ctx, user_input, limit=recall_limit)
+def _resolve_forge_budgets(state: _ForgeState) -> None:
+    """Resolve ``target_length`` into the first-pass and continuation budgets.
 
-    # Iteration: when the caller supplies an existing document, use it. When
-    # the caller omits it but the target path already exists in storage,
-    # read it so the LLM revises rather than replacing wholesale.
-    existing_document = str(params.get("existing_document") or "").strip()
-    if not existing_document:
-        try:
-            existing_document = await _read_existing_document(ctx, document_path)
-        except RuntimeError as exc:
-            return OperationResult(output_text=str(exc))
-
-    # Phase B: resolve optional target_length into a derived max_tokens and
-    # prompt guidance. ``target_words is None`` preserves the legacy flat
-    # 50k-token budget exactly — no behavior change on the default path.
+    ``target_words is None`` preserves the legacy flat 50k-token budget
+    exactly — no behavior change on the default path.
+    """
+    cfg = state.cfg
     target_words, target_guidance, derived_max_tokens = _resolve_target_length(
-        params,
+        state.params,
         max_document_chars=cfg.max_document_chars,
         tokens_per_word=cfg.tokens_per_word,
     )
-    first_pass_max_tokens = (
+    state.target_words = target_words
+    state.target_guidance = target_guidance
+    state.first_pass_max_tokens = (
         derived_max_tokens if target_words is not None else cfg.max_completion_tokens
     )
     # Scale the continuation budget with the target so a small target does
     # not retain the 50k continuation ceiling (which would re-truncate).
-    first_pass_continue_tokens = (
-        min(cfg.max_continue_tokens, first_pass_max_tokens * 2)
+    state.first_pass_continue_tokens = (
+        min(cfg.max_continue_tokens, state.first_pass_max_tokens * 2)
         if target_words is not None
         else cfg.max_continue_tokens
     )
+
+
+async def _forge_document_body(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+) -> OperationResult | None:
+    """Phase 2 — call the model and continue until the document is complete.
+
+    Returns a terminal ``OperationResult`` when the model produced nothing
+    usable.
+    """
+    cfg = state.cfg
     (
         completion_text,
         model_def,
@@ -1071,24 +1101,24 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         effective_max_tokens,
     ) = await _call_llm_forge(
         ctx,
-        user_input,
-        memory_context,
-        existing_document=existing_document,
-        max_tokens=first_pass_max_tokens,
-        target_length_guidance=target_guidance,
+        state.user_input,
+        state.memory_context,
+        existing_document=state.existing_document,
+        max_tokens=state.first_pass_max_tokens,
+        target_length_guidance=state.target_guidance,
         flat_ceiling=cfg.max_completion_tokens,
         burnout_rescue=cfg.burnout_rescue,
     )
+    state.model_def = model_def
+    state.first_truncated = first_truncated
+    state.first_finish_reason = first_finish_reason
     if not completion_text or not completion_text.strip():
         return OperationResult(
             output_text=_format_template(
                 _load_text(ctx, _EMPTY_RESPONSE_PATH),
-                diagnostics=_empty_response_diagnostics(
-                    first_finish_reason, effective_max_tokens
-                ),
+                diagnostics=_empty_response_diagnostics(first_finish_reason, effective_max_tokens),
             )
         )
-
     document = extract_markdown_block(completion_text)
     if not document.strip():
         text = _format_template(
@@ -1096,12 +1126,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             response_preview=completion_text[:400],
         )
         return OperationResult(output_text=text)
-
     # Outline contract: strip the declared section plan from the body and
     # remember it for the post-continuation completeness check. No marker →
     # no plan → the gate is skipped entirely (legacy path, no extra calls).
     document, forge_plan = parse_forge_plan(document)
-
+    state.forge_plan = forge_plan
     # Truncation handling: the provider-owned ``truncated`` signal drives
     # the decision. ``True`` → continue up to the budget; ``False`` → no
     # continuation (unless a dangling-heading structural override fires);
@@ -1117,235 +1146,325 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
         continuation_stop_reason,
     ) = await continue_until_complete(
         ctx,
-        user_input=user_input,
+        user_input=state.user_input,
         document=document,
         model_def=model_def,
         first_truncated=first_truncated,
         first_finish_reason=first_finish_reason,
         max_continue_attempts=cfg.max_continue_attempts,
-        max_continue_tokens=first_pass_continue_tokens,
+        max_continue_tokens=state.first_pass_continue_tokens,
         continue_prompt_path=_CONTINUE_PROMPT_PATH,
     )
+    state.document = document
+    state.was_truncated = was_truncated
+    state.continue_attempts = continue_attempts
+    state.final_finish_reason = final_finish_reason
+    state.continuation_stop_reason = continuation_stop_reason
+    return None
 
-    # Outline-contract gate: the model may stop cleanly yet quietly omit
-    # planned sections (the 2026-10-16 self-abridgment incident —
-    # ``truncated=False`` was truthful, the doc was still short). When a
-    # plan was declared and sections are missing, run the same number of
-    # bounded expand passes as the continuation budget allows, at the same
-    # per-pass budget the continuation path uses. Advisory: a document that
-    # is still missing sections persists with degraded status and telemetry.
-    missing_plan_sections: tuple[str, ...] = ()
-    planned_missing: tuple[str, ...] = ()
-    outline_contract_attempts = 0
-    outline_contract_stop_reason = "skipped"
-    if cfg.outline_contract and forge_plan:
-        planned_missing = missing_planned_sections(forge_plan, document)
-        if planned_missing:
-            try:
-                (
-                    document,
-                    outline_contract_attempts,
-                    _contract_incomplete,
-                ) = await expand_missing_sections(
-                    ctx,
-                    user_input=user_input,
-                    document=document,
-                    planned=forge_plan,
-                    missing=planned_missing,
-                    model_def=model_def,
-                    max_tokens=first_pass_continue_tokens,
-                    max_attempts=cfg.outline_contract_attempts,
-                    expand_prompt_path=_EXPAND_PROMPT_PATH,
-                )
-                missing_plan_sections = missing_planned_sections(forge_plan, document)
-                if not missing_plan_sections:
-                    outline_contract_stop_reason = "expanded"
-                elif missing_plan_sections != planned_missing:
-                    outline_contract_stop_reason = "partial"
-                else:
-                    outline_contract_stop_reason = "still_missing"
-            except RuntimeError as exc:
-                logger.warning(
-                    "forge_document: outline-contract expansion failed (%s); "
-                    "persisting without it",
-                    exc,
-                )
-                outline_contract_stop_reason = "error"
-                missing_plan_sections = planned_missing
-            if missing_plan_sections:
-                logger.warning(
-                    "forge_document: document still missing planned section(s) "
-                    "after expansion: %s",
-                    ", ".join(missing_plan_sections),
-                )
-                was_truncated = True
-                continuation_stop_reason = (
-                    continuation_stop_reason
-                    if continuation_stop_reason not in ("completed", "not_needed")
-                    else "outline_contract"
-                )
-            logger.info(
-                "forge.outline_contract: attempts=%d planned=%d "
-                "missing_before=%d missing_after=%d stop_reason=%s",
-                outline_contract_attempts,
-                len(forge_plan),
-                len(planned_missing),
-                len(missing_plan_sections),
-                outline_contract_stop_reason,
-            )
+
+async def _run_outline_contract(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+) -> None:
+    """Phase 3 — the outline-contract gate (self-abridgment defense).
+
+    The model may stop cleanly yet quietly omit planned sections (the
+    2026-10-16 self-abridgment incident — ``truncated=False`` was
+    truthful, the doc was still short). When a plan was declared and
+    sections are missing, run the same number of bounded expand passes as
+    the continuation budget allows, at the same per-pass budget the
+    continuation path uses. Advisory: a document that is still missing
+    sections persists with degraded status and telemetry.
+    """
+    cfg = state.cfg
+    if not cfg.outline_contract:
+        state.outline_contract_stop_reason = "disabled"
+        return
+    if not state.forge_plan:
+        return
+    planned_missing = missing_planned_sections(state.forge_plan, state.document)
+    state.planned_missing = planned_missing
+    if not planned_missing:
+        state.outline_contract_stop_reason = "satisfied"
+        return
+    try:
+        (
+            document,
+            outline_contract_attempts,
+            _contract_incomplete,
+        ) = await expand_missing_sections(
+            ctx,
+            user_input=state.user_input,
+            document=state.document,
+            planned=state.forge_plan,
+            missing=planned_missing,
+            model_def=state.model_def,
+            max_tokens=state.first_pass_continue_tokens,
+            max_attempts=cfg.outline_contract_attempts,
+            expand_prompt_path=_EXPAND_PROMPT_PATH,
+        )
+        state.document = document
+        state.outline_contract_attempts = outline_contract_attempts
+        missing_plan_sections = missing_planned_sections(state.forge_plan, document)
+        if not missing_plan_sections:
+            state.outline_contract_stop_reason = "expanded"
+        elif missing_plan_sections != planned_missing:
+            state.outline_contract_stop_reason = "partial"
         else:
-            outline_contract_stop_reason = "satisfied"
-    elif not cfg.outline_contract:
-        outline_contract_stop_reason = "disabled"
+            state.outline_contract_stop_reason = "still_missing"
+    except RuntimeError as exc:
+        logger.warning(
+            "forge_document: outline-contract expansion failed (%s); persisting without it",
+            exc,
+        )
+        state.outline_contract_stop_reason = "error"
+        missing_plan_sections = planned_missing
+    state.missing_plan_sections = missing_plan_sections
+    if missing_plan_sections:
+        logger.warning(
+            "forge_document: document still missing planned section(s) after expansion: %s",
+            ", ".join(missing_plan_sections),
+        )
+        state.was_truncated = True
+        state.continuation_stop_reason = (
+            state.continuation_stop_reason
+            if state.continuation_stop_reason not in ("completed", "not_needed")
+            else "outline_contract"
+        )
+    logger.info(
+        "forge.outline_contract: attempts=%d planned=%d "
+        "missing_before=%d missing_after=%d stop_reason=%s",
+        state.outline_contract_attempts,
+        len(state.forge_plan),
+        len(state.planned_missing),
+        len(state.missing_plan_sections),
+        state.outline_contract_stop_reason,
+    )
 
-    # Lint/format the document so the persisted output is clean and consistent.
-    # Inline-fence repair runs BEFORE formatting: mdformat treats a closing
-    # fence appended to the last code line as legal CommonMark and preserves
-    # it, so the hygiene split must land first. Re-runs after repair below
-    # for the same reason the re-format does.
-    document = repair_inline_fences(document)
+
+def _finalize_forged_document(ctx: OperationExecutionContext, state: _ForgeState) -> str:
+    """Phase 4 — repair fences, format, cap, and annotate the document.
+
+    Inline-fence repair runs BEFORE formatting: mdformat treats a closing
+    fence appended to the last code line as legal CommonMark and preserves
+    it, so the hygiene split must land first.
+    """
+    cfg = state.cfg
+    document = repair_inline_fences(state.document)
     document = _format_markdown(document)
-
-    # Char cap.
     if len(document) > cfg.max_document_chars:
         document = document[: cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
-        was_truncated = True
-        continuation_stop_reason = "char_cap"
-
-    # Annotate with the model that wrote it, unless the user opted out.
-    annotate_model = bool(params.get("annotate_model", True))
-    if annotate_model and not _user_asked_not_to_annotate(user_input):
+        state.was_truncated = True
+        state.continuation_stop_reason = "char_cap"
+    annotate_model = bool(state.params.get("annotate_model", True))
+    if annotate_model and not _user_asked_not_to_annotate(state.user_input):
         annotation = _build_model_annotation(
-            model_def,
-            truncated=was_truncated,
-            final_finish_reason=final_finish_reason if was_truncated else None,
-            continue_attempts=continue_attempts if was_truncated else 0,
-            missing_sections=missing_plan_sections,
+            state.model_def,
+            truncated=state.was_truncated,
+            final_finish_reason=state.final_finish_reason if state.was_truncated else None,
+            continue_attempts=state.continue_attempts if state.was_truncated else 0,
+            missing_sections=state.missing_plan_sections,
         )
         if annotation:
             document = document.rstrip() + "\n\n" + annotation + "\n"
+    return document
 
+
+async def _outline_for_document(
+    ctx: OperationExecutionContext,
+    document: str,
+) -> tuple[dict[str, Any], str | None]:
+    """Validate the document's outline. Returns ``(outline, error)``."""
     try:
         outline = await _validate_outline(ctx, document)
     except RuntimeError as exc:
-        return OperationResult(output_text=str(exc))
+        return {}, str(exc)
+    return outline, None
 
-    heading_count = int(outline.get("heading_count", 0) or 0)
-    if heading_count < _MIN_HEADINGS:
-        # Diagnostic gate: persist the document with a warning comment
-        # instead of discarding it. The content survives so the user can
-        # refine; the explainer loop no longer burns iterations on a hard
-        # reject that leaves no durable artifact.
-        return await _persist_no_outline_document(
-            ctx,
-            document,
-            document_path,
-            heading_count=heading_count,
-            was_truncated=was_truncated,
-            continue_attempts=continue_attempts,
-            first_finish_reason=first_finish_reason,
-            final_finish_reason=final_finish_reason,
-            continuation_stop_reason=continuation_stop_reason,
-            forge_plan=forge_plan,
-            planned_missing=planned_missing,
-            outline_contract_attempts=outline_contract_attempts,
-            outline_contract_stop_reason=outline_contract_stop_reason,
-        )
 
-    # Phase A: advisory lint gate. Lint is never a hard reject — the outline
-    # gate above is the only hard gate. When issues are found and
-    # ``forge_lint_repair`` is set, issue one repair pass feeding the lint
-    # issues back to the model; re-format and re-validate. Any issues that
-    # remain (or when repair is disabled) are persisted as a non-rendering
-    # HTML comment so the user knows the artifact has warnings.
-    lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
-    lint_repair_used = False
-    if lint_issues and cfg.lint_repair:
+async def _persist_zero_heading_document(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+    document: str,
+    heading_count: int,
+) -> OperationResult:
+    """Diagnostic gate: persist a zero-heading document with a warning comment.
+
+    The content survives so the user can refine; the explainer loop no
+    longer burns iterations on a hard reject that leaves no durable
+    artifact.
+    """
+    return await _persist_no_outline_document(
+        ctx,
+        document,
+        state.document_path,
+        heading_count=heading_count,
+        was_truncated=state.was_truncated,
+        continue_attempts=state.continue_attempts,
+        first_finish_reason=state.first_finish_reason,
+        final_finish_reason=state.final_finish_reason,
+        continuation_stop_reason=state.continuation_stop_reason,
+        forge_plan=state.forge_plan,
+        planned_missing=state.planned_missing,
+        outline_contract_attempts=state.outline_contract_attempts,
+        outline_contract_stop_reason=state.outline_contract_stop_reason,
+    )
+
+
+async def _run_forge_lint_gate(
+    ctx: OperationExecutionContext,
+    *,
+    state: _ForgeState,
+    document: str,
+    outline: dict[str, Any],
+    heading_count: int,
+) -> tuple[str, dict[str, Any], int, list[LintIssue], bool, OperationResult | None]:
+    """Phase 5b — advisory lint gate with one optional repair pass.
+
+    Lint is never a hard reject — the outline gate above is the only hard
+    gate. When issues are found and ``forge_lint_repair`` is set, issue
+    one repair pass feeding the lint issues back to the model; re-format
+    and re-validate. Any issues that remain (or when repair is disabled)
+    are persisted as a non-rendering HTML comment so the user knows the
+    artifact has warnings.
+
+    Returns ``(document, outline, heading_count, issues, repair_used,
+    failure)``.
+    """
+    cfg = state.cfg
+    issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    repair_used = False
+    if issues and cfg.lint_repair:
         repaired = await _lint_repair_pass(
             ctx,
-            user_input=user_input,
+            user_input=state.user_input,
             document=document,
-            model_def=model_def,
-            issues=lint_issues,
-            max_tokens=first_pass_max_tokens,
+            model_def=state.model_def,
+            issues=issues,
+            max_tokens=state.first_pass_max_tokens,
         )
         if repaired != document:
-            lint_repair_used = True
+            repair_used = True
             # The repair pass regenerated the text, so re-run the fence
             # hygiene split before formatting (same order rationale as
             # the primary pass above).
             document = repair_inline_fences(repaired)
             document = _format_markdown(document)
             # Re-validate the repaired document's outline.
-            try:
-                outline = await _validate_outline(ctx, document)
-            except RuntimeError as exc:
-                return OperationResult(output_text=str(exc))
+            new_outline, outline_error = await _outline_for_document(ctx, document)
+            if outline_error is not None:
+                return (
+                    document,
+                    new_outline,
+                    heading_count,
+                    issues,
+                    repair_used,
+                    OperationResult(output_text=outline_error),
+                )
+            outline = new_outline
             heading_count = int(outline.get("heading_count", 0) or 0)
             if heading_count < _MIN_HEADINGS:
-                return await _persist_no_outline_document(
-                    ctx,
-                    document,
-                    document_path,
-                    heading_count=heading_count,
-                    was_truncated=was_truncated,
-                    continue_attempts=continue_attempts,
-                    first_finish_reason=first_finish_reason,
-                    final_finish_reason=final_finish_reason,
-                    continuation_stop_reason=continuation_stop_reason,
-                    forge_plan=forge_plan,
-                    planned_missing=planned_missing,
-                    outline_contract_attempts=outline_contract_attempts,
-                    outline_contract_stop_reason=outline_contract_stop_reason,
+                zero_heading = await _persist_zero_heading_document(
+                    ctx, state, document, heading_count
                 )
-            lint_issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
-    if lint_issues:
-        comment = lint_summary_comment(lint_issues)
+                return document, outline, heading_count, issues, repair_used, zero_heading
+            issues = lint_markdown(document, rules_csv=cfg.lint_rules or None)
+    if issues:
+        comment = lint_summary_comment(issues)
         if comment:
             document = document.rstrip() + "\n\n" + comment + "\n"
+    return document, outline, heading_count, issues, repair_used, None
 
+
+async def _validate_forged_document(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+    document: str,
+) -> tuple[str, dict[str, Any], int, list[LintIssue], bool, OperationResult | None]:
+    """Phase 5 — the hard outline gate followed by the advisory lint gate."""
+    outline, outline_error = await _outline_for_document(ctx, document)
+    if outline_error is not None:
+        return document, outline, 0, [], False, OperationResult(output_text=outline_error)
+    heading_count = int(outline.get("heading_count", 0) or 0)
+    if heading_count < _MIN_HEADINGS:
+        zero_heading = await _persist_zero_heading_document(ctx, state, document, heading_count)
+        return document, outline, heading_count, [], False, zero_heading
+    return await _run_forge_lint_gate(
+        ctx, state=state, document=document, outline=outline, heading_count=heading_count
+    )
+
+
+def _build_forge_summary(
+    *,
+    state: _ForgeState,
+    stored_path: str,
+    byte_count: int,
+    heading_count: int,
+    issues: list[LintIssue],
+    repair_used: bool,
+) -> str:
+    """Build the user-facing summary of the forge result."""
+    summary = (
+        f"Document forged and stored at `{stored_path}` "
+        f"({byte_count} bytes, {heading_count} headings)."
+    )
+    if state.was_truncated:
+        if state.missing_plan_sections:
+            summary += (
+                f" WARNING: document is missing planned section(s) after "
+                f"{state.outline_contract_attempts} expansion attempt(s): "
+                f"{', '.join(state.missing_plan_sections)}. See annotation in document."
+            )
+        else:
+            summary += (
+                f" WARNING: persisted truncated after {state.continue_attempts} "
+                f"continuation attempt(s) (final finish_reason="
+                f"{state.final_finish_reason!r}). See annotation in document."
+            )
+    if issues:
+        summary += (
+            f" Note: {len(issues)} structural lint warning(s) remain "
+            f"after {'a' if repair_used else 'no'} repair pass; see lint comment in document."
+        )
+    return summary
+
+
+async def _persist_forged_document(
+    ctx: OperationExecutionContext,
+    state: _ForgeState,
+    *,
+    document: str,
+    outline: dict[str, Any],
+    heading_count: int,
+    issues: list[LintIssue],
+    repair_used: bool,
+) -> OperationResult:
+    """Phase 6 — persist the document and report the result."""
     try:
-        write_response = await _persist_document(ctx, document, document_path)
+        write_response = await _persist_document(ctx, document, state.document_path)
     except RuntimeError as exc:
         text = _format_template(
             _load_text(ctx, _STORAGE_FAILED_PATH),
             error=str(exc),
         )
         return OperationResult(output_text=text)
-
-    ok = bool(write_response.get("ok", False))
-    if not ok:
+    if not bool(write_response.get("ok", False)):
         text = _format_template(
             _load_text(ctx, _STORAGE_FAILED_PATH),
             error=write_response.get("raw", "unknown storage error"),
         )
         return OperationResult(output_text=text)
-
-    stored_path = str(write_response.get("path") or document_path)
+    stored_path = str(write_response.get("path") or state.document_path)
     byte_count = int(write_response.get("bytes") or len(document.encode("utf-8")))
-
-    summary = (
-        f"Document forged and stored at `{stored_path}` "
-        f"({byte_count} bytes, {heading_count} headings)."
+    summary = _build_forge_summary(
+        state=state,
+        stored_path=stored_path,
+        byte_count=byte_count,
+        heading_count=heading_count,
+        issues=issues,
+        repair_used=repair_used,
     )
-    if was_truncated:
-        if missing_plan_sections:
-            summary += (
-                f" WARNING: document is missing planned section(s) after "
-                f"{outline_contract_attempts} expansion attempt(s): "
-                f"{', '.join(missing_plan_sections)}. See annotation in document."
-            )
-        else:
-            summary += (
-                f" WARNING: persisted truncated after {continue_attempts} "
-                f"continuation attempt(s) (final finish_reason="
-                f"{final_finish_reason!r}). See annotation in document."
-            )
-    if lint_issues:
-        summary += (
-            f" Note: {len(lint_issues)} structural lint warning(s) remain "
-            f"after {'a' if lint_repair_used else 'no'} repair pass; see lint comment in document."
-        )
     return OperationResult(
         output_text=summary,
         output_json={
@@ -1353,44 +1472,89 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
             "bytes": byte_count,
             "heading_count": heading_count,
             "outline": outline,
-            "truncated": was_truncated,
-            "continue_attempts": continue_attempts,
-            "first_finish_reason": first_finish_reason,
-            "final_finish_reason": final_finish_reason,
-            "lint_warnings": len(lint_issues),
-            "lint_repair_used": lint_repair_used,
-            "target_words": target_words,
-            "missing_plan_sections": list(missing_plan_sections),
+            "truncated": state.was_truncated,
+            "continue_attempts": state.continue_attempts,
+            "first_finish_reason": state.first_finish_reason,
+            "final_finish_reason": state.final_finish_reason,
+            "lint_warnings": len(issues),
+            "lint_repair_used": repair_used,
+            "target_words": state.target_words,
+            "missing_plan_sections": list(state.missing_plan_sections),
         },
-        status="degraded" if was_truncated else "success",
+        status="degraded" if state.was_truncated else "success",
         error_detail=(
-            f"continuation {continuation_stop_reason}: "
-            f"{continue_attempts} attempt(s), finish_reason={final_finish_reason!r}"
-            if was_truncated
+            f"continuation {state.continuation_stop_reason}: "
+            f"{state.continue_attempts} attempt(s), finish_reason={state.final_finish_reason!r}"
+            if state.was_truncated
             else None
         ),
         extra={
-            "memory_context_lines": memory_context.count("\n") + 1
-            if memory_context
+            "memory_context_lines": state.memory_context.count("\n") + 1
+            if state.memory_context
             else 0,
             "document_path": stored_path,
-            "truncated": was_truncated,
-            "continue_attempts": continue_attempts,
-            "lint_warnings": len(lint_issues),
-            "target_words": target_words,
+            "truncated": state.was_truncated,
+            "continue_attempts": state.continue_attempts,
+            "lint_warnings": len(issues),
+            "target_words": state.target_words,
             "outline_contract": {
-                "planned": list(forge_plan),
-                "missing_before": list(planned_missing) if forge_plan else [],
-                "missing_after": list(missing_plan_sections),
-                "attempts": outline_contract_attempts,
-                "stop_reason": outline_contract_stop_reason,
+                "planned": list(state.forge_plan),
+                "missing_before": list(state.planned_missing) if state.forge_plan else [],
+                "missing_after": list(state.missing_plan_sections),
+                "attempts": state.outline_contract_attempts,
+                "stop_reason": state.outline_contract_stop_reason,
             },
             "continuation": {
-                "was_truncated": was_truncated,
-                "attempts": continue_attempts,
-                "stop_reason": continuation_stop_reason,
-                "first_finish_reason": first_finish_reason,
-                "final_finish_reason": final_finish_reason,
+                "was_truncated": state.was_truncated,
+                "attempts": state.continue_attempts,
+                "stop_reason": state.continuation_stop_reason,
+                "first_finish_reason": state.first_finish_reason,
+                "final_finish_reason": state.final_finish_reason,
             },
         },
+    )
+
+
+async def execute(ctx: OperationExecutionContext) -> OperationResult:
+    """Forge a markdown document from user input + recalled memory and persist it.
+
+    Orchestrates the six pipeline phases — prepare (resolve settings and
+    the existing document), forge (call the model and continue until the
+    document is complete), outline contract (expand planned-but-missing
+    sections), finalize (format, cap, annotate), validate (outline +
+    advisory lint), and persist. Each phase lives in its own helper; this
+    function only wires them together.
+    """
+    state, failure = await _prepare_forge(ctx)
+    if failure is not None:
+        return failure
+    recall_limit = int(state.params.get("limit") or state.cfg.max_recall_records)
+    state.memory_context = await _recall_memory(ctx, state.user_input, limit=recall_limit)
+    failure = await _load_existing_document(ctx, state)
+    if failure is not None:
+        return failure
+    _resolve_forge_budgets(state)
+    failure = await _forge_document_body(ctx, state)
+    if failure is not None:
+        return failure
+    await _run_outline_contract(ctx, state)
+    document = _finalize_forged_document(ctx, state)
+    (
+        document,
+        outline,
+        heading_count,
+        issues,
+        repair_used,
+        failure,
+    ) = await _validate_forged_document(ctx, state, document)
+    if failure is not None:
+        return failure
+    return await _persist_forged_document(
+        ctx,
+        state,
+        document=document,
+        outline=outline,
+        heading_count=heading_count,
+        issues=issues,
+        repair_used=repair_used,
     )

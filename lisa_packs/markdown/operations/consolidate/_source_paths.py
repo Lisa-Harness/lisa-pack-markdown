@@ -37,18 +37,18 @@ from kernel.models import OperationExecutionContext, ToolExecutionContext, ToolR
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MAX_PER_SOURCE_CHARS",
     "SourceSpec",
-    "parse_source_paths",
     "expand_globs",
-    "read_sources",
+    "has_sources",
+    "parse_source_paths",
     "read_source_chunks",
-    "stat_source_chars",
-    "render_source_block",
+    "read_sources",
     "render_one_source_block",
     "render_priorities_block",
+    "render_source_block",
+    "stat_source_chars",
     "total_source_bytes",
-    "has_sources",
-    "MAX_PER_SOURCE_CHARS",
 ]
 
 # Tool ids routed through ctx.execute_tool_fn (lisa-storage MCP server).
@@ -206,7 +206,8 @@ async def expand_globs(
         if not matches:
             logger.warning(
                 "source_paths: glob %r expanded to zero matches (prefix=%r)",
-                spec.path, prefix,
+                spec.path,
+                prefix,
             )
             resolved.append(spec)  # keep for provenance; read_sources will flag
             continue
@@ -383,10 +384,7 @@ def render_source_block(specs: list[SourceSpec]) -> str:
         return ""
     lines: list[str] = ["## Source Documents", ""]
     for idx, spec in enumerate(readable, start=1):
-        lines.append(
-            f"### Source {idx} — `{spec.path}` "
-            f"(priority: {spec.priority})"
-        )
+        lines.append(f"### Source {idx} — `{spec.path}` (priority: {spec.priority})")
         if spec.truncated_to_fit:
             lines.append(
                 "> NOTE: this source was truncated to fit the per-source"
@@ -458,6 +456,99 @@ def render_priorities_block(specs: list[SourceSpec]) -> str:
     return "\n".join(lines)
 
 
+def _failed_chunk(spec: SourceSpec, error: str) -> list[SourceSpec]:
+    """Build the single-element failure result for a chunked read."""
+    failed = SourceSpec(path=spec.path, priority=spec.priority)
+    failed.read_error = error
+    return [failed]
+
+
+def _single_chunk(spec: SourceSpec, text: str, *, truncated_to_fit: bool) -> list[SourceSpec]:
+    """Build the single-chunk result used by the no-stat and empty-source paths."""
+    chunk = SourceSpec(
+        path=spec.path,
+        priority=spec.priority,
+        text=text,
+        bytes=len(text.encode("utf-8")),
+        truncated_to_fit=truncated_to_fit,
+    )
+    chunk.extra["chunk_index"] = 0
+    chunk.extra["chunk_total"] = 1
+    chunk.extra["chunk_eof"] = True
+    return [chunk]
+
+
+async def _read_whole_source_as_chunk(
+    spec: SourceSpec,
+    *,
+    ctx: OperationExecutionContext,
+    read_cap: int,
+) -> list[SourceSpec]:
+    """Degrade to one ``read_file`` chunk when ``stat_file`` is unavailable.
+
+    Mirrors :func:`read_sources`'s per-source failure contract: an
+    unreadable source yields a single-element list carrying the
+    ``read_error`` so the caller can surface it rather than aborting the
+    forge.
+    """
+    text, err = await _read_one(ctx, spec.path)
+    if err is not None:
+        return _failed_chunk(spec, err)
+    if len(text) > read_cap:
+        text = text[:read_cap] + "\n\n<!-- truncated to fit per-source cap -->\n"
+    return _single_chunk(spec, text, truncated_to_fit=len(text) >= read_cap)
+
+
+async def _read_chunk_windows(
+    spec: SourceSpec,
+    *,
+    ctx: OperationExecutionContext,
+    chunk_chars: int,
+    read_cap: int,
+    stat_total: int,
+) -> list[SourceSpec]:
+    """Read successive ``read_file_range`` windows until ``eof``.
+
+    We read up to ``read_cap`` chars total; each window is ``chunk_chars``
+    wide (the last may be shorter). ``read_file_range`` is char-based and
+    reports ``eof`` when the window reaches/passes the total.
+    """
+    total_to_read = min(stat_total, read_cap)
+    chunks: list[SourceSpec] = []
+    offset = 0
+    chunk_index = 0
+    while offset < total_to_read:
+        window = min(chunk_chars, total_to_read - offset)
+        content, eof, err = await _read_file_range(ctx, spec.path, offset, window)
+        if err is not None:
+            return _failed_chunk(spec, err)
+        if not content and chunk_index > 0:
+            # No content returned mid-stream — stop to avoid an infinite loop.
+            break
+        chunk = SourceSpec(
+            path=spec.path,
+            priority=spec.priority,
+            text=content,
+            bytes=len(content.encode("utf-8")),
+            truncated_to_fit=(offset + window) >= read_cap
+            and not eof
+            and total_to_read < stat_total,
+        )
+        chunk.extra["chunk_index"] = chunk_index
+        chunk.extra["chunk_eof"] = eof
+        chunks.append(chunk)
+        chunk_index += 1
+        if eof:
+            break
+        # Defensive: ensure forward progress (read_file_range always
+        # returns >= 0 chars; a zero-length non-eof window would loop
+        # forever, so stop if the backend stalls).
+        if len(content) == 0:
+            break
+        offset += len(content)
+    return chunks
+
+
 async def read_source_chunks(
     spec: SourceSpec,
     *,
@@ -489,8 +580,7 @@ async def read_source_chunks(
     """
     if ctx.host is None:
         raise RuntimeError(
-            "read_source_chunks requires execute_tool_fn to call "
-            "stat_file/read_file_range"
+            "read_source_chunks requires execute_tool_fn to call stat_file/read_file_range"
         )
     if chunk_chars <= 0:
         chunk_chars = 8000
@@ -505,71 +595,19 @@ async def read_source_chunks(
     # source via read_file if stat is unavailable (degrade gracefully).
     stat_total = await _stat_file_chars(ctx, spec.path)
     if stat_total is None:
-        # stat failed; degrade to a single read_file chunk so the caller
-        # still gets the source (read_sources-style fallback).
-        text, err = await _read_one(ctx, spec.path)
-        if err is not None:
-            failed = SourceSpec(path=spec.path, priority=spec.priority)
-            failed.read_error = err
-            return [failed]
-        if len(text) > read_cap:
-            text = text[:read_cap] + "\n\n<!-- truncated to fit per-source cap -->\n"
-        chunk = SourceSpec(
-            path=spec.path,
-            priority=spec.priority,
-            text=text,
-            bytes=len(text.encode("utf-8")),
-            truncated_to_fit=len(text) >= read_cap,
-        )
-        chunk.extra["chunk_index"] = 0
-        chunk.extra["chunk_total"] = 1
-        chunk.extra["chunk_eof"] = True
-        return [chunk]
+        return await _read_whole_source_as_chunk(spec, ctx=ctx, read_cap=read_cap)
 
     if stat_total <= 0:
         # Empty source — one empty chunk with eof.
-        chunk = SourceSpec(path=spec.path, priority=spec.priority)
-        chunk.extra["chunk_index"] = 0
-        chunk.extra["chunk_total"] = 1
-        chunk.extra["chunk_eof"] = True
-        return [chunk]
+        return _single_chunk(spec, "", truncated_to_fit=False)
 
-    # Plan chunk boundaries. We read up to read_cap chars total; each window
-    # is chunk_chars wide (the last may be shorter). read_file_range is
-    # char-based and reports eof when the window reaches/passes total.
-    total_to_read = min(stat_total, read_cap)
-    chunks: list[SourceSpec] = []
-    offset = 0
-    chunk_index = 0
-    while offset < total_to_read:
-        window = min(chunk_chars, total_to_read - offset)
-        content, eof, err = await _read_file_range(ctx, spec.path, offset, window)
-        if err is not None:
-            failed = SourceSpec(path=spec.path, priority=spec.priority)
-            failed.read_error = err
-            return [failed]
-        if not content and chunk_index > 0:
-            # No content returned mid-stream — stop to avoid an infinite loop.
-            break
-        chunk = SourceSpec(
-            path=spec.path,
-            priority=spec.priority,
-            text=content,
-            bytes=len(content.encode("utf-8")),
-            truncated_to_fit=(offset + window) >= read_cap and not eof and total_to_read < stat_total,
-        )
-        chunk.extra["chunk_index"] = chunk_index
-        chunk.extra["chunk_eof"] = eof
-        chunks.append(chunk)
-        chunk_index += 1
-        if eof:
-            break
-        # Defensive: ensure forward progress (read_file_range always
-        # returns >= 0 chars; a zero-length non-eof window would loop
-        # forever, so stop if the backend stalls).
-        if len(content) == 0:
-            break
-        offset += len(content)
+    chunks = await _read_chunk_windows(
+        spec,
+        ctx=ctx,
+        chunk_chars=chunk_chars,
+        read_cap=read_cap,
+        stat_total=stat_total,
+    )
     # Finalize chunk_total now that we know the count.
     chunk_total = len(chunks)
     for c in chunks:
@@ -620,14 +658,12 @@ async def _stat_file_chars(
         data = json.loads(output_text)
     except (json.JSONDecodeError, TypeError):
         return None
-    if isinstance(data, dict) and data.get("error"):
+    if not isinstance(data, dict) or data.get("error"):
         return None
-    if isinstance(data, dict):
-        try:
-            return int(data.get("size") or 0)
-        except (TypeError, ValueError):
-            return None
-    return None
+    try:
+        return int(data.get("size") or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 async def stat_source_chars(

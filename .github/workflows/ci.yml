@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  quality:
+    name: Quality gates (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12"]
+
+    steps:
+      - name: Check out the pack
+        uses: actions/checkout@v4
+
+      # actions/checkout requires the path to stay under the workspace,
+      # so the framework lands in ./lisa next to the pack's own files.
+      - name: Check out framework
+        uses: actions/checkout@v4
+        with:
+          repository: Lisa-Harness/lisa
+          path: lisa
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+        working-directory: lisa
+
+      - name: Install framework
+        run: uv sync --extra dev
+        working-directory: lisa
+
+      # The pack's own runtime dependencies (markdown-it-py, mdformat,
+      # pymarkdownlnt) are not part of the framework distribution, so the
+      # pack is installed into the framework environment as well. Without
+      # this the markdown tests run against a missing formatter and the
+      # lint advisory degrades to a no-op.
+      - name: Install the pack
+        run: uv pip install --python .venv -e ..
+        working-directory: lisa
+
+      # ruff and mypy resolve their configuration from the working
+      # directory, so they run against the framework checkout: that is
+      # where the shared [tool.ruff] and [tool.mypy] settings live. The
+      # pack tree is the target, not the config.
+      - name: Format check (ruff)
+        run: uv run ruff format --check "../lisa_packs/markdown"
+        working-directory: lisa
+
+      - name: Lint (ruff)
+        run: uv run ruff check "../lisa_packs/markdown"
+        working-directory: lisa
+
+      # mypy is run against the pack root so the pack's own namespace
+      # package resolves. The exclude drops the build/ tree that a local
+      # "pip install -e ." leaves behind: it is gitignored, so it is absent
+      # in CI, but when present it duplicates the "lisa_packs" module and
+      # makes mypy stop before it checks anything.
+      - name: Type check (mypy)
+        run: uv run mypy --exclude '(^|/)build/' "../lisa_packs/markdown"
+        working-directory: lisa
+
+      # pytest runs from the pack root: the pack's own pyproject.toml sets
+      # pythonpath = ["."], which makes lisa_packs.markdown importable so the
+      # SDK can infer each operation's module_path from the source tree.
+      - name: Unit tests (no live)
+        run: uv run --project lisa pytest -m "not live" --tb=short -v

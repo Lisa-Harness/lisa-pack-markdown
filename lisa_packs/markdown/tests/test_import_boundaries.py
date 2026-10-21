@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from kernel.testing.import_boundaries import collect_import_violations
 
 _PACK_ROOT = Path(__file__).resolve().parents[1]
