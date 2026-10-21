@@ -20,16 +20,29 @@ okf_emit_concept/okf_log.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from kernel.models import OperationExecutionContext, ToolResult
+
 from lisa_packs.markdown.operations.consolidate.consolidate import execute
 
 _CONTENT_ROOT = Path(__file__).resolve().parents[1]
+
+# Completion-call and range-read counts the consolidation paths are expected
+# to make: a single-source retry, per-source/merge fan-out, and chunked reads.
+_RETRY_CALL_COUNT = 2
+_PER_SOURCE_CALL_COUNT = 2
+_MERGE_CALL_COUNT = 1
+_MAP_REDUCE_CALL_COUNT = 3
+_MIN_CHUNKED_RANGES = 2
+
+# Default character window the fake ``read_file_range`` tool serves when the
+# caller does not ask for an explicit length.
+_DEFAULT_RANGE_LENGTH = 4096
 
 
 def _make_loader() -> Any:
@@ -64,6 +77,258 @@ class _FakeCompletion:
     truncated: bool | None = False
 
 
+@dataclass
+class _FakeStorage:
+    """Shared state behind the fake storage/memory/OKF tool executor.
+
+    Holds the seeded source store, the glob list map, the stat sizes, the
+    append buffer, and the captures dict the tests assert on.
+    """
+
+    store: dict[str, str]
+    list_map: dict[str, list[str]]
+    stat_map: dict[str, int]
+    appends: dict[str, str]
+    captures: dict[str, Any]
+
+
+def _make_fake_storage(
+    *,
+    stored_sources: dict[str, str] | None,
+    list_files_map: dict[str, list[str]] | None,
+    stat_sizes: dict[str, int] | None,
+) -> _FakeStorage:
+    """Build the fake storage state and its captures dict."""
+    appends: dict[str, str] = {}
+    captures: dict[str, Any] = {
+        "writes": [],
+        "okf_emits": [],
+        "okf_logs": [],
+        "read_paths": [],
+        "list_prefixes": [],
+        "memory_query": None,
+        "outline_markdown": None,
+        "stat_paths": [],
+        "read_file_ranges": [],
+        "append_file_calls": [],
+        "appended_text": appends,
+    }
+    return _FakeStorage(
+        store=dict(stored_sources or {}),
+        list_map=dict(list_files_map or {}),
+        stat_map=dict(stat_sizes or {}),
+        appends=appends,
+        captures=captures,
+    )
+
+
+def _memory_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+    memory_records: list[str] | None,
+) -> ToolResult:
+    """Fake ``memory.search`` response."""
+    state.captures["memory_query"] = params.get("query")
+    if memory_records is None:
+        return ToolResult(tool_id=tool_id, output_text="(no memories)")
+    return ToolResult(
+        tool_id=tool_id,
+        output_text="\n".join(f"- {r}" for r in memory_records),
+    )
+
+
+def _outline_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``markdown_generate`` response with a computed heading count."""
+    state.captures["outline_markdown"] = params.get("markdown")
+    md_text = str(params.get("markdown") or "")
+    heading_count = sum(1 for line in md_text.splitlines() if line.lstrip().startswith("#"))
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=f"Outline: {heading_count} headings.",
+        output_json={"heading_count": heading_count, "headings": []},
+    )
+
+
+def _read_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``read_file`` response served from the seeded source store."""
+    path = str(params.get("path") or "")
+    state.captures["read_paths"].append(path)
+    if path in state.store:
+        return ToolResult(tool_id=tool_id, output_text=state.store[path])
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps({"error": f"file not found: {path}"}),
+    )
+
+
+def _stat_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``stat_file`` response; falls back to the stored text length."""
+    path = str(params.get("path") or "")
+    state.captures["stat_paths"].append(path)
+    if path in state.stat_map:
+        size = state.stat_map[path]
+    elif path in state.store:
+        size = len(state.store[path].encode("utf-8"))
+    else:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text=json.dumps({"error": f"not found: {path}"}),
+        )
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps(
+            {
+                "path": path,
+                "size": size,
+                "modified": "2026-08-02T00:00:00+00:00",
+                "is_dir": False,
+            }
+        ),
+    )
+
+
+def _read_range_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``read_file_range`` response serving one character window."""
+    path = str(params.get("path") or "")
+    start = int(params.get("start") or 0)
+    length = int(params.get("length") or _DEFAULT_RANGE_LENGTH)
+    state.captures["read_file_ranges"].append({"path": path, "start": start, "length": length})
+    if path not in state.store:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text=json.dumps({"error": f"file not found: {path}"}),
+        )
+    text = state.store[path]
+    total = len(text)
+    content = text[start : start + length]
+    end = start + length
+    eof = end >= total
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps(
+            {
+                "content": content,
+                "start": start,
+                "length": len(content),
+                "total": total,
+                "eof": eof,
+            }
+        ),
+    )
+
+
+def _append_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``append_file`` response; appends to the per-path buffer."""
+    path = str(params.get("path") or "")
+    content = str(params.get("content") or "")
+    state.captures["append_file_calls"].append({"path": path, "content": content})
+    state.appends[path] = state.appends.get(path, "") + content
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps(
+            {"ok": True, "path": path, "bytes": len(state.appends[path].encode("utf-8"))}
+        ),
+    )
+
+
+def _list_files_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``list_files`` response serving the seeded glob matches."""
+    prefix = str(params.get("prefix") or "")
+    state.captures["list_prefixes"].append(prefix)
+    matches = state.list_map.get(prefix, [])
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps(matches),
+    )
+
+
+def _write_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+    write_ok: bool,
+) -> ToolResult:
+    """Fake ``write_file`` response; records the persisted content."""
+    path = str(params.get("path") or "")
+    content = str(params.get("content") or "")
+    state.captures["writes"].append({"path": path, "content": content})
+    if not write_ok:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text=json.dumps({"error": "read-only"}),
+        )
+    state.store[path] = content
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=json.dumps({"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}),
+    )
+
+
+def _okf_emit_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+    okf_emit_ok: bool,
+) -> ToolResult:
+    """Fake ``okf_emit_concept`` response."""
+    state.captures["okf_emits"].append(dict(params))
+    if not okf_emit_ok:
+        return ToolResult(
+            tool_id=tool_id,
+            output_text="OKF emit failed: storage error",
+        )
+    full_path = f"{params.get('bundle_path')}/{params.get('concept_path')}"
+    return ToolResult(
+        tool_id=tool_id,
+        output_text=f"OKF concept emitted: {full_path}",
+    )
+
+
+def _okf_log_tool_result(
+    tool_id: str,
+    params: dict[str, Any],
+    *,
+    state: _FakeStorage,
+) -> ToolResult:
+    """Fake ``okf_log`` response."""
+    state.captures["okf_logs"].append(dict(params))
+    return ToolResult(tool_id=tool_id, output_text="OKF log appended")
+
+
 def _make_tool_executor(
     *,
     stored_sources: dict[str, str] | None = None,
@@ -82,146 +347,43 @@ def _make_tool_executor(
     ``captures`` records write_file, okf_emit_concept, okf_log, stat,
     read_file_range, and append_file calls.
     """
-    store: dict[str, str] = dict(stored_sources or {})
-    list_map: dict[str, list[str]] = dict(list_files_map or {})
-    stat_map: dict[str, int] = dict(stat_sizes or {})
-    appends: dict[str, str] = {}
-    captures: dict[str, Any] = {
-        "writes": [],
-        "okf_emits": [],
-        "okf_logs": [],
-        "read_paths": [],
-        "list_prefixes": [],
-        "memory_query": None,
-        "outline_markdown": None,
-        "stat_paths": [],
-        "read_file_ranges": [],
-        "append_file_calls": [],
-        "appended_text": appends,
+    state = _make_fake_storage(
+        stored_sources=stored_sources,
+        list_files_map=list_files_map,
+        stat_sizes=stat_sizes,
+    )
+
+    handlers: dict[str, Callable[[str, dict[str, Any]], ToolResult]] = {
+        "memory.search": lambda tool_id, params: _memory_tool_result(
+            tool_id, params, state=state, memory_records=memory_records
+        ),
+        "markdown_generate": lambda tool_id, params: _outline_tool_result(
+            tool_id, params, state=state
+        ),
+        "read_file": lambda tool_id, params: _read_tool_result(tool_id, params, state=state),
+        "stat_file": lambda tool_id, params: _stat_tool_result(tool_id, params, state=state),
+        "read_file_range": lambda tool_id, params: _read_range_tool_result(
+            tool_id, params, state=state
+        ),
+        "append_file": lambda tool_id, params: _append_tool_result(tool_id, params, state=state),
+        "list_files": lambda tool_id, params: _list_files_tool_result(tool_id, params, state=state),
+        "write_file": lambda tool_id, params: _write_tool_result(
+            tool_id, params, state=state, write_ok=write_ok
+        ),
+        "okf_emit_concept": lambda tool_id, params: _okf_emit_tool_result(
+            tool_id, params, state=state, okf_emit_ok=okf_emit_ok
+        ),
+        "okf_log": lambda tool_id, params: _okf_log_tool_result(tool_id, params, state=state),
     }
 
     async def execute_tool_fn(tool_id: str, ctx: Any) -> ToolResult:
         params = getattr(ctx, "parameters", {}) or {}
-        if tool_id == "memory.search":
-            captures["memory_query"] = params.get("query")
-            if memory_records is None:
-                return ToolResult(tool_id=tool_id, output_text="(no memories)")
-            return ToolResult(
-                tool_id=tool_id,
-                output_text="\n".join(f"- {r}" for r in memory_records),
-            )
-        if tool_id == "markdown_generate":
-            captures["outline_markdown"] = params.get("markdown")
-            md_text = str(params.get("markdown") or "")
-            heading_count = sum(
-                1 for line in md_text.splitlines() if line.lstrip().startswith("#")
-            )
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=f"Outline: {heading_count} headings.",
-                output_json={"heading_count": heading_count, "headings": []},
-            )
-        if tool_id == "read_file":
-            path = str(params.get("path") or "")
-            captures["read_paths"].append(path)
-            if path in store:
-                return ToolResult(tool_id=tool_id, output_text=store[path])
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps({"error": f"file not found: {path}"}),
-            )
-        if tool_id == "stat_file":
-            path = str(params.get("path") or "")
-            captures["stat_paths"].append(path)
-            if path in stat_map:
-                size = stat_map[path]
-            elif path in store:
-                size = len(store[path].encode("utf-8"))
-            else:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text=json.dumps({"error": f"not found: {path}"}),
-                )
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(
-                    {"path": path, "size": size, "modified": "2026-08-02T00:00:00+00:00", "is_dir": False}
-                ),
-            )
-        if tool_id == "read_file_range":
-            path = str(params.get("path") or "")
-            start = int(params.get("start") or 0)
-            length = int(params.get("length") or 4096)
-            captures["read_file_ranges"].append({"path": path, "start": start, "length": length})
-            if path not in store:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text=json.dumps({"error": f"file not found: {path}"}),
-                )
-            text = store[path]
-            total = len(text)
-            content = text[start:start + length]
-            end = start + length
-            eof = end >= total
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(
-                    {"content": content, "start": start, "length": len(content), "total": total, "eof": eof}
-                ),
-            )
-        if tool_id == "append_file":
-            path = str(params.get("path") or "")
-            content = str(params.get("content") or "")
-            captures["append_file_calls"].append({"path": path, "content": content})
-            appends[path] = appends.get(path, "") + content
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(
-                    {"ok": True, "path": path, "bytes": len(appends[path].encode("utf-8"))}
-                ),
-            )
-        if tool_id == "list_files":
-            prefix = str(params.get("prefix") or "")
-            captures["list_prefixes"].append(prefix)
-            matches = list_map.get(prefix, [])
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(matches),
-            )
-        if tool_id == "write_file":
-            path = str(params.get("path") or "")
-            content = str(params.get("content") or "")
-            captures["writes"].append({"path": path, "content": content})
-            if not write_ok:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text=json.dumps({"error": "read-only"}),
-                )
-            store[path] = content
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=json.dumps(
-                    {"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}
-                ),
-            )
-        if tool_id == "okf_emit_concept":
-            captures["okf_emits"].append(dict(params))
-            if not okf_emit_ok:
-                return ToolResult(
-                    tool_id=tool_id,
-                    output_text="OKF emit failed: storage error",
-                )
-            full_path = f"{params.get('bundle_path')}/{params.get('concept_path')}"
-            return ToolResult(
-                tool_id=tool_id,
-                output_text=f"OKF concept emitted: {full_path}",
-            )
-        if tool_id == "okf_log":
-            captures["okf_logs"].append(dict(params))
-            return ToolResult(tool_id=tool_id, output_text="OKF log appended")
-        return ToolResult(tool_id=tool_id, error=f"unknown tool: {tool_id}")
+        handler = handlers.get(tool_id)
+        if handler is None:
+            return ToolResult(tool_id=tool_id, error=f"unknown tool: {tool_id}")
+        return handler(tool_id, params)
 
-    return execute_tool_fn, captures
+    return execute_tool_fn, state.captures
 
 
 def _make_ctx(
@@ -317,8 +479,19 @@ _FULL_OUTPUT = (
 )
 
 
-_SOURCE_A = "# Source A: SWOT\n\n## Strengths\n- MCP-native architecture\n- 6 first-party MCP servers\n- Fork mechanism\n- IPSAR FSM\n- OpenTelemetry\n- Pack ecosystem\n\n## Weaknesses\n- Steeper learning curve\n- No A2A protocol\n- No code sandbox\n- No browser automation\n"
-_SOURCE_B = "# Source B: Comparison\n\n## Comparison\n| Framework | MCP-native | FSM |\n| --- | --- | --- |\n| Lisa | yes | yes |\n| LangChain | no | partial |\n| smolagents | no | no |\n\n## Opportunities\n- Enterprise adoption\n- OKF as interchange format\n"
+_SOURCE_A = (
+    "# Source A: SWOT\n\n"
+    "## Strengths\n- MCP-native architecture\n- 6 first-party MCP servers\n"
+    "- Fork mechanism\n- IPSAR FSM\n- OpenTelemetry\n- Pack ecosystem\n\n"
+    "## Weaknesses\n- Steeper learning curve\n- No A2A protocol\n"
+    "- No code sandbox\n- No browser automation\n"
+)
+_SOURCE_B = (
+    "# Source B: Comparison\n\n"
+    "## Comparison\n| Framework | MCP-native | FSM |\n| --- | --- | --- |\n"
+    "| Lisa | yes | yes |\n| LangChain | no | partial |\n| smolagents | no | no |\n\n"
+    "## Opportunities\n- Enterprise adoption\n- OKF as interchange format\n"
+)
 
 
 # ── source_paths parsing + reading ─────────────────────────────────────
@@ -477,7 +650,7 @@ async def test_density_floor_trips_on_abridged_output_and_reforges() -> None:
     )
     result = await execute(ctx)
     # The retry must have happened (two completion calls).
-    assert call_count["n"] == 2
+    assert call_count["n"] == _RETRY_CALL_COUNT
     # Density check must report passed after the retry.
     assert result.output_json["density_passed"] is True
     assert result.output_json["density_retried"] is True
@@ -568,8 +741,8 @@ async def test_map_reduce_forges_per_source_then_merges() -> None:
     # Two per-source calls + one merge call.
     per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
     merge_calls = [c for c in call_log if c["phase"] == "merge"]
-    assert len(per_source_calls) == 2
-    assert len(merge_calls) == 1
+    assert len(per_source_calls) == _PER_SOURCE_CALL_COUNT
+    assert len(merge_calls) == _MERGE_CALL_COUNT
     # Both sources were read.
     assert "a.md" in captures["read_paths"]
     assert "b.md" in captures["read_paths"]
@@ -600,7 +773,7 @@ async def test_map_reduce_default_threshold_takes_chunked_path() -> None:
     result = await execute(ctx)
     assert "Document consolidated and stored" in result.output_text
     # Map-reduce issues 2 per-source + 1 merge = 3 calls (no single-pass re-forge).
-    assert call_count["n"] == 3
+    assert call_count["n"] == _MAP_REDUCE_CALL_COUNT
     # The map-reduce path does not set density_retried (no single-pass re-forge).
     assert result.output_json.get("density_retried", False) is False
 
@@ -802,7 +975,7 @@ async def test_map_reduce_per_source_density_failure_surfaces_failed_paths() -> 
     # retry used the per-source density-retry instruction.
     per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
     source_one_calls = [c for c in per_source_calls if "Source 1" in c["user"]]
-    assert len(source_one_calls) == 2
+    assert len(source_one_calls) == _PER_SOURCE_CALL_COUNT
 
 
 @pytest.mark.asyncio
@@ -859,7 +1032,7 @@ async def test_map_reduce_per_source_density_retry_recovers() -> None:
     # Source 1 must have been forged twice (initial tiny + retry full).
     per_source_calls = [c for c in call_log if c["phase"] == "per-source"]
     source_one_calls = [c for c in per_source_calls if "Source 1" in c["user"]]
-    assert len(source_one_calls) == 2
+    assert len(source_one_calls) == _PER_SOURCE_CALL_COUNT
 
 
 @pytest.mark.asyncio
@@ -945,10 +1118,9 @@ from lisa_packs.markdown.operations.consolidate._source_paths import (  # noqa: 
     SourceSpec as _SourceSpec,
 )
 
-
 # A source deliberately larger than MAX_PER_SOURCE_CHARS so the rolling
 # gate trips. Built by repeating _SOURCE_A well past the 32K cap.
-_OVERSIZE_SOURCE = ("# Big Source\n\n## Section\n\n" + ("detail line.\n" * 4000))
+_OVERSIZE_SOURCE = "# Big Source\n\n## Section\n\n" + ("detail line.\n" * 4000)
 assert len(_OVERSIZE_SOURCE) > MAX_PER_SOURCE_CHARS
 
 
@@ -976,7 +1148,7 @@ async def test_read_source_chunks_plans_chunks_from_stat() -> None:
     assert captures["stat_paths"] == ["big.md"]
     # Multiple read_file_range calls, advancing start by chunk_chars.
     ranges = captures["read_file_ranges"]
-    assert len(ranges) >= 2
+    assert len(ranges) >= _MIN_CHUNKED_RANGES
     # Chunks are ordered, contiguous, and the last carries chunk_eof.
     assert chunks[0].extra["chunk_index"] == 0
     assert chunks[-1].extra.get("chunk_eof") is True
@@ -996,6 +1168,7 @@ async def test_rolling_accumulation_extends_running_doc() -> None:
         stat_sizes={"big.md": len(_OVERSIZE_SOURCE.encode("utf-8"))},
     )
     call_log: list[dict[str, Any]] = []
+
     # Each rolling chunk call returns a short extension referencing its index.
     async def _complete(**kwargs: Any) -> _FakeCompletion:
         messages = kwargs.get("messages", [])
@@ -1004,6 +1177,7 @@ async def test_rolling_accumulation_extends_running_doc() -> None:
             user_content = next((m["content"] for m in messages if m["role"] == "user"), "")
             # Extract chunk index from the template marker.
             import re as _re
+
             m = _re.search(r"chunk (\d+) of", user_content)
             idx = m.group(1) if m else "?"
             call_log.append({"phase": "rolling", "chunk": idx})
@@ -1046,9 +1220,9 @@ async def test_rolling_accumulation_extends_running_doc() -> None:
     assert "Document consolidated and stored" in result.output_text
     # The rolling path must have been taken (multiple rolling completion calls).
     rolling_calls = [c for c in call_log if c["phase"] == "rolling"]
-    assert len(rolling_calls) >= 2
+    assert len(rolling_calls) >= _MIN_CHUNKED_RANGES
     # read_file_range must have been called to chunk the source.
-    assert len(captures["read_file_ranges"]) >= 2
+    assert len(captures["read_file_ranges"]) >= _MIN_CHUNKED_RANGES
     # The op result must report rolling_accumulation_used=True.
     assert result.output_json.get("rolling_accumulation_used") is True
     # The persisted document must contain content from multiple chunks.
@@ -1108,11 +1282,7 @@ async def test_consolidate_lint_advisory_annotation() -> None:
     """Consolidate persists a lint advisory comment when issues remain after repair is disabled."""
     # A merged document that starts with an H2 (no H1) trips MD041.
     no_h1_doc = (
-        "## Strengths\n"
-        "- MCP-native architecture\n"
-        "\n"
-        "## Weaknesses\n"
-        "- Steeper learning curve\n"
+        "## Strengths\n- MCP-native architecture\n\n## Weaknesses\n- Steeper learning curve\n"
     )
     tool_fn, captures = _make_tool_executor(
         stored_sources={"a.md": _SOURCE_A},

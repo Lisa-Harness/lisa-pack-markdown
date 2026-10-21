@@ -92,11 +92,9 @@ def _load_text(ctx: OperationExecutionContext, path: str) -> str:
     """
     host = ctx.host
     if host is None:
-        raise RuntimeError(
-            f"OperationHost is not wired; cannot load authored content at {path}"
-        )
+        raise RuntimeError(f"OperationHost is not wired; cannot load authored content at {path}")
     try:
-        loaded = host.read_authored_text(path).strip()
+        loaded = str(host.read_authored_text(path) or "").strip()
     except Exception as exc:  # pylint: disable=broad-except
         raise RuntimeError(f"read_authored_text failed for {path}: {exc}") from exc
     if not loaded:
@@ -195,6 +193,23 @@ def repair_inline_fences(document: str) -> str:
     return "\n".join(repaired) + "\n"
 
 
+#: A line that ends on a clean sentence/structure boundary. A document whose
+#: last content line ends with one of these reads as a finished paragraph.
+_CLEAN_TAIL_SUFFIXES = ("```", ".", "!", "?", ":", ";", ">", ")")
+
+
+def _ends_on_clean_boundary(last_line: str) -> bool:
+    """Return True when the last content line reads as a finished structure.
+
+    Covers the three shapes that read as "the model stopped on purpose":
+    a sentence-final punctuation, a closed code fence, and a list item with
+    content under it.
+    """
+    if last_line.endswith(_CLEAN_TAIL_SUFFIXES):
+        return True
+    return bool(re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(r"^\s*\d+\. +\S", last_line))
+
+
 def _looks_complete(document: str) -> bool:
     """Heuristic: does the document end on a clean paragraph/list boundary?
 
@@ -207,9 +222,7 @@ def _looks_complete(document: str) -> bool:
     model opened a section ("### 5.1 ...") and stopped before writing its
     body.
     """
-    if not document:
-        return False
-    stripped = document.rstrip()
+    stripped = document.rstrip() if document else ""
     if not stripped:
         return False
     # Dangling list marker (e.g. "- " or "1. " at end of file) = truncated.
@@ -225,17 +238,11 @@ def _looks_complete(document: str) -> bool:
     last_line = stripped.splitlines()[-1].rstrip()
     if not last_line:
         return True  # ends on a blank line — clean
-    if last_line.endswith(("```", ".", "!", "?", ":", ";", ">", ")")):
-        return True
-    if re.match(r"^\s*[\-\*\+] +\S", last_line) or re.match(
-        r"^\s*\d+\. +\S", last_line
-    ):
+    if _ends_on_clean_boundary(last_line):
         return True
     # A heading as the LAST content line is a truncation signal: the model
     # opened a section but wrote no body.
-    if last_line.lstrip().startswith("#"):
-        return False
-    return False
+    return not last_line.lstrip().startswith("#")
 
 
 def _ends_on_dangling_heading(document: str) -> bool:
@@ -341,6 +348,104 @@ async def _continue_llm(
     return content.strip(), truncated, finish_reason
 
 
+def _classify_continuation_text(continuation_text: str) -> tuple[str | None, str]:
+    """Classify one continuation pass's raw text.
+
+    Returns ``(stop_reason_or_None, tail)``. ``stop_reason`` is
+    ``"empty"`` when the pass returned no content, ``"no_markdown_tail"``
+    when the pass returned content that yielded no usable markdown tail
+    (the model emitted prose outside the fence), and ``None`` when the
+    pass produced a usable tail.
+    """
+    if not continuation_text or not continuation_text.strip():
+        return "empty", ""
+    tail = extract_markdown_block(continuation_text)
+    # If the fenced block extracted was empty but the raw continuation
+    # had content, the model emitted prose outside the fence (or an
+    # empty fence). Either way, there is no usable markdown tail to
+    # append.
+    if not tail.strip():
+        return "no_markdown_tail", tail
+    return None, tail
+
+
+async def _run_continuation_passes(
+    ctx: OperationExecutionContext,
+    *,
+    user_input: str,
+    document: str,
+    model_def: Any,
+    first_finish_reason: str | None,
+    max_attempts: int,
+    max_continue_attempts: int,
+    max_continue_tokens: int,
+    continue_prompt_path: str,
+) -> tuple[str, str, int, str | None]:
+    """Run the bounded continuation passes and report how the loop ended.
+
+    Returns ``(document, stop_reason, attempts, final_finish_reason)``.
+    ``stop_reason`` is ``"completed"`` when a pass produced a document that
+    looks complete with a clean provider stop, ``"empty"`` /
+    ``"no_markdown_tail"`` / ``"duplicate_tail"`` when a pass yielded
+    nothing usable, and ``"exhausted"`` when the budget ran out.
+    """
+    attempts = 0
+    final_finish_reason = first_finish_reason
+    current = document
+    stop_reason = "exhausted"
+    for attempt in range(1, max_attempts + 1):
+        attempts = attempt
+        continuation_text, cont_truncated, cont_finish_reason = await _continue_llm(
+            ctx,
+            user_input=user_input,
+            document_so_far=current,
+            model_def=model_def,
+            max_tokens=max_continue_tokens,
+            continue_prompt_path=continue_prompt_path,
+        )
+        final_finish_reason = cont_finish_reason
+        outcome, tail = _classify_continuation_text(continuation_text)
+        if outcome is not None:
+            logger.warning(
+                "forge_document: continuation pass %d %s; giving up",
+                attempt,
+                "returned empty" if outcome == "empty" else "yielded no markdown tail",
+            )
+            stop_reason = outcome
+            break
+        if _tail_is_duplicate(current, tail):
+            logger.warning(
+                "forge_document: continuation pass %d duplicated existing tail; giving up",
+                attempt,
+            )
+            stop_reason = "duplicate_tail"
+            break
+        current = _merge_continuation(current, tail)
+        if _looks_complete(current) and cont_truncated is False:
+            logger.info(
+                "forge_document: continuation pass %d completed the document",
+                attempt,
+            )
+            stop_reason = "completed"
+            logger.info(
+                "forge.continuation_result: stop_reason=completed attempts=%d "
+                "finish_reason=%r document_chars=%d",
+                attempts,
+                cont_finish_reason,
+                len(current),
+            )
+            return current, stop_reason, attempts, final_finish_reason
+        if attempt >= max_continue_attempts:
+            logger.warning(
+                "forge_document: exhausted %d continuation attempts; "
+                "persisting with truncated annotation (final finish_reason=%r)",
+                attempt,
+                cont_finish_reason,
+            )
+            stop_reason = "exhausted"
+    return current, stop_reason, attempts, final_finish_reason
+
+
 async def continue_until_complete(
     ctx: OperationExecutionContext,
     *,
@@ -379,9 +484,7 @@ async def continue_until_complete(
     continuation path's (otherwise the continuation consumes the retry
     budget duplicating a heading-only tail before the density retry runs).
     """
-    structurally_incomplete = (
-        _ends_on_dangling_heading(document) if structural_override else False
-    )
+    structurally_incomplete = _ends_on_dangling_heading(document) if structural_override else False
 
     # Decide whether to continue at all.
     if first_truncated is False and not structurally_incomplete:
@@ -411,75 +514,20 @@ async def continue_until_complete(
             first_truncated,
         )
 
-    attempts = 0
-    final_finish_reason = first_finish_reason
-    current = document
-    stop_reason = "exhausted"
-    for attempt in range(1, max_attempts + 1):
-        attempts = attempt
-        continuation_text, cont_truncated, cont_finish_reason = await _continue_llm(
-            ctx,
-            user_input=user_input,
-            document_so_far=current,
-            model_def=model_def,
-            max_tokens=max_continue_tokens,
-            continue_prompt_path=continue_prompt_path,
-        )
-        final_finish_reason = cont_finish_reason
-        if not continuation_text or not continuation_text.strip():
-            logger.warning(
-                "forge_document: continuation pass %d returned empty; giving up",
-                attempt,
-            )
-            stop_reason = "empty"
-            break
-        tail = extract_markdown_block(continuation_text)
-        # If the fenced block extracted was empty but the raw continuation
-        # had content, the model emitted prose outside the fence (or an
-        # empty fence). Either way, there is no usable markdown tail to
-        # append.
-        if not tail.strip():
-            logger.warning(
-                "forge_document: continuation pass %d yielded no markdown tail; giving up",
-                attempt,
-            )
-            stop_reason = "no_markdown_tail"
-            break
-        if _tail_is_duplicate(current, tail):
-            logger.warning(
-                "forge_document: continuation pass %d duplicated existing tail; giving up",
-                attempt,
-            )
-            stop_reason = "duplicate_tail"
-            break
-        current = _merge_continuation(current, tail)
-        if _looks_complete(current) and cont_truncated is False:
-            logger.info(
-                "forge_document: continuation pass %d completed the document",
-                attempt,
-            )
-            stop_reason = "completed"
-            logger.info(
-                "forge.continuation_result: stop_reason=completed attempts=%d "
-                "finish_reason=%r document_chars=%d",
-                attempts,
-                cont_finish_reason,
-                len(current),
-            )
-            return current, False, attempts, cont_finish_reason, stop_reason
-        if attempt >= max_continue_attempts:
-            logger.warning(
-                "forge_document: exhausted %d continuation attempts; "
-                "persisting with truncated annotation (final finish_reason=%r)",
-                attempt,
-                cont_finish_reason,
-            )
-            stop_reason = "exhausted"
-    if (
-        first_truncated is None
-        and not structurally_incomplete
-        and stop_reason == "exhausted"
-    ):
+    current, stop_reason, attempts, final_finish_reason = await _run_continuation_passes(
+        ctx,
+        user_input=user_input,
+        document=document,
+        model_def=model_def,
+        first_finish_reason=first_finish_reason,
+        max_attempts=max_attempts,
+        max_continue_attempts=max_continue_attempts,
+        max_continue_tokens=max_continue_tokens,
+        continue_prompt_path=continue_prompt_path,
+    )
+    if stop_reason == "completed":
+        return current, False, attempts, final_finish_reason, stop_reason
+    if first_truncated is None and not structurally_incomplete and stop_reason == "exhausted":
         # The unknown-truncated safety-net pass ran and did not complete
         # the document. ``stop_reason`` stays as set by the break path
         # (``"empty"`` / ``"no_markdown_tail"`` / ``"duplicate_tail"``) or
@@ -489,8 +537,7 @@ async def continue_until_complete(
         # exhausted the full budget".
         stop_reason = "safety_net_stopped"
     logger.info(
-        "forge.continuation_result: stop_reason=%s attempts=%d "
-        "finish_reason=%r document_chars=%d",
+        "forge.continuation_result: stop_reason=%s attempts=%d finish_reason=%r document_chars=%d",
         stop_reason,
         attempts,
         final_finish_reason,
@@ -553,9 +600,7 @@ def _norm_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
 
 
-def missing_planned_sections(
-    planned: tuple[str, ...], document: str
-) -> tuple[str, ...]:
+def missing_planned_sections(planned: tuple[str, ...], document: str) -> tuple[str, ...]:
     """Return the planned ``##`` titles with no matching heading in the document.
 
     Matching is a normalized fuzzy containment in either direction: a
@@ -627,6 +672,32 @@ def _planned_section_body(planned_title: str, tail: str) -> str:
     return "\n".join(lines[start:end]).strip()
 
 
+def _collect_expandable_bodies(current: str, tail: str, still: tuple[str, ...]) -> list[str]:
+    """Collect the section bodies an expansion pass actually wrote.
+
+    Returns the heading-anchored bodies the pass produced, skipping
+    duplicates of the existing document tail (looping models). When the
+    tail carries no planned heading at all, falls back to the whole tail
+    ONCE — two missing titles must never merge the same prose twice.
+    """
+    usable: list[str] = []
+    matched_any_heading = False
+    for title in still:
+        body = _planned_section_body(title, tail)
+        if not body:
+            continue
+        matched_any_heading = True
+        if _tail_is_duplicate(current, body):
+            continue
+        usable.append(body)
+    if usable or matched_any_heading:
+        return usable
+    body = tail.strip()
+    if not body or _tail_is_duplicate(current, body):
+        return []
+    return [body]
+
+
 async def expand_missing_sections(
     ctx: OperationExecutionContext,
     *,
@@ -654,9 +725,7 @@ async def expand_missing_sections(
     """
     host = ctx.host
     if host is None:
-        raise RuntimeError(
-            "markdown requires OperationHost.complete to expand missing sections"
-        )
+        raise RuntimeError("markdown requires OperationHost.complete to expand missing sections")
     template = _load_text(ctx, expand_prompt_path)
     current = document
     still = tuple(missing)
@@ -668,9 +737,7 @@ async def expand_missing_sections(
         prompt = (
             template.replace("{user_input}", user_input)
             .replace("{document_so_far}", current)
-            .replace(
-                "{missing_sections}", "\n".join(f"- ## {title}" for title in still)
-            )
+            .replace("{missing_sections}", "\n".join(f"- ## {title}" for title in still))
         )
         completion = await host.complete(
             messages=[{"role": "user", "content": prompt}],
@@ -686,28 +753,9 @@ async def expand_missing_sections(
         tail = extract_markdown_block(content)
         if not tail.strip():
             break
-        # Collect the heading-anchored bodies the pass actually wrote; skip
-        # duplicates of the existing document tail (looping models). When
-        # the tail carries no planned heading at all, fall back to the
-        # whole tail ONCE — two missing titles must never merge the same
-        # prose twice.
-        usable: list[str] = []
-        matched_any_heading = False
-        for title in still:
-            body = _planned_section_body(title, tail)
-            if not body:
-                continue
-            matched_any_heading = True
-            if _tail_is_duplicate(current, body):
-                continue
-            usable.append(body)
+        usable = _collect_expandable_bodies(current, tail, still)
         if not usable:
-            if matched_any_heading:
-                break
-            body = tail.strip()
-            if not body or _tail_is_duplicate(current, body):
-                break
-            usable.append(body)
+            break
         current = _merge_continuation(current, "\n\n".join(usable))
         still = missing_planned_sections(planned, current)
     return current, attempts, bool(still)

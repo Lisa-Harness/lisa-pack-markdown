@@ -24,8 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from kernel.models import OperationExecutionContext, ToolResult
+
 from lisa_packs.markdown.operations.forge_document.forge_document import execute
 
 _CONTENT_ROOT = Path(__file__).resolve().parents[1]
@@ -79,10 +79,7 @@ _VALID_DOCUMENT = (
 )
 
 _PARTIAL_SWOT = (
-    "# SWOT Analysis\n\n"
-    "## Strengths\n"
-    "- Strong technical foundation.\n"
-    "- Experienced team.\n"
+    "# SWOT Analysis\n\n## Strengths\n- Strong technical foundation.\n- Experienced team.\n"
 )
 
 _SWOT_TAIL = (
@@ -108,9 +105,7 @@ def _make_tool_executor() -> tuple[Any, dict[str, Any]]:
         if tool_id == "markdown_generate":
             captures["outline_markdown"] = params.get("markdown")
             md_text = str(params.get("markdown") or "")
-            heading_count = sum(
-                1 for line in md_text.splitlines() if line.lstrip().startswith("#")
-            )
+            heading_count = sum(1 for line in md_text.splitlines() if line.lstrip().startswith("#"))
             return ToolResult(
                 tool_id=tool_id,
                 output_text=f"Outline: {heading_count} headings.",
@@ -210,7 +205,9 @@ async def test_clean_forge_returns_success_status() -> None:
     assert result.is_success is True
     assert result.error_detail is None
     # No continuation block when not truncated.
-    assert "continuation" not in result.extra or result.extra["continuation"]["was_truncated"] is False
+    assert (
+        "continuation" not in result.extra or result.extra["continuation"]["was_truncated"] is False
+    )
 
 
 @pytest.mark.asyncio
@@ -227,7 +224,9 @@ async def test_truncated_forge_returns_degraded_status() -> None:
     assert result.status == "degraded"
     assert result.is_success is False
     assert result.error_detail is not None
-    assert "continuation" in result.error_detail.lower() or "exhausted" in result.error_detail.lower()
+    assert (
+        "continuation" in result.error_detail.lower() or "exhausted" in result.error_detail.lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -261,7 +260,7 @@ async def test_continuation_completed_returns_success_status() -> None:
     ctx = _make_ctx(query="forge a SWOT analysis", complete_fn=complete_fn)
     result = await execute(ctx)
     assert result.status == "success"
-    cont = result.extra.get("continuation")
+    cont: dict[str, Any] = result.extra["continuation"]
     assert cont["was_truncated"] is False
     assert cont["stop_reason"] == "completed"
     assert cont["attempts"] == 1
@@ -286,7 +285,7 @@ async def test_empty_continuation_returns_degraded_with_stop_reason_empty() -> N
     ctx = _make_ctx(query="forge a SWOT analysis", complete_fn=_complete)
     result = await execute(ctx)
     assert result.status == "degraded"
-    cont = result.extra.get("continuation")
+    cont: dict[str, Any] = result.extra["continuation"]
     assert cont["stop_reason"] == "empty"
     assert cont["was_truncated"] is True
 

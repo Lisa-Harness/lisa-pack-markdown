@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import pytest
-
 from kernel.models import ToolExecutionContext, ToolResult
+
 from lisa_packs.markdown.tools.markdown_generate.markdown_generate import (
     TOOL_ID,
     execute,
 )
+
+# The fixture below declares this many headings.
+_EXPECTED_HEADING_COUNT = 4
 
 
 def _ctx(markdown: str) -> ToolExecutionContext:
@@ -37,7 +40,7 @@ async def test_outlines_headings_and_lists() -> None:
     assert isinstance(result, ToolResult)
     assert result.error == ""
     outline = result.output_json
-    assert outline["heading_count"] == 4
+    assert outline["heading_count"] == _EXPECTED_HEADING_COUNT
     texts = [h["text"] for h in outline["headings"]]
     assert "Title" in texts
     assert "Section A" in texts

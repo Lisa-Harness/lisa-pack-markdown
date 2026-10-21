@@ -108,8 +108,7 @@ def _render_entry(entry: dict[str, Any], turn: int) -> str:
             {
                 str(r.get("capability_id") or "")
                 for r in receipts
-                if isinstance(r, dict)
-                and str(r.get("effect", "")) in ("write", "external_write")
+                if isinstance(r, dict) and str(r.get("effect", "")) in ("write", "external_write")
             }
         )
         if write_caps:
@@ -144,9 +143,7 @@ def _extract_turn(params: dict[str, Any]) -> tuple[int, int | None]:
                 f"render_turn: 'end_turn' must be an integer, got {raw_end!r}"
             ) from exc
         if end_turn < turn:
-            raise ValueError(
-                f"render_turn: 'end_turn' ({end_turn}) must be >= 'turn' ({turn})"
-            )
+            raise ValueError(f"render_turn: 'end_turn' ({end_turn}) must be >= 'turn' ({turn})")
 
     return turn, end_turn
 
@@ -184,10 +181,7 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     blocks: list[str] = []
     for offset, entry in enumerate(entries):
         stored_turn = entry.get("turn")
-        if isinstance(stored_turn, int):
-            entry_turn = stored_turn
-        else:
-            entry_turn = turn + offset
+        entry_turn = stored_turn if isinstance(stored_turn, int) else turn + offset
         blocks.append(_render_entry(entry, entry_turn))
 
     return OperationResult(output_text="\n\n---\n\n".join(blocks))

@@ -20,6 +20,7 @@ without value. The allowed set is overridable via the ``forge_lint_rules``
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LintIssue", "lint_markdown", "format_lint_issues", "STRUCTURAL_RULES"]
+__all__ = ["STRUCTURAL_RULES", "LintIssue", "format_lint_issues", "lint_markdown"]
 
 # Curated structural rule subset. These rules flag issues that affect
 # rendering correctness or document integrity, not stylistic preference.
@@ -120,7 +121,7 @@ def lint_markdown(
     set with a CSV of rule ids (e.g. ``"md001,md041"``).
     """
     try:
-        from pymarkdown.api import (  # type: ignore[import-not-found]
+        from pymarkdown.api import (
             PyMarkdownApi,
             PyMarkdownApiException,
         )
@@ -138,11 +139,9 @@ def lint_markdown(
     allowed = {r.lower() for r in _enabled_rules(rules_csv)}
     for rule_id in _NOISY_RULES:
         if rule_id not in allowed:
-            try:
+            # The rule id may not exist in this pymarkdownlnt version; skip it.
+            with contextlib.suppress(Exception):
                 api.disable_rule_by_identifier(rule_id)
-            except Exception:  # pylint: disable=broad-except
-                # Rule id may not exist in this pymarkdownlnt version; skip.
-                pass
 
     try:
         result = api.scan_string(document)
@@ -162,9 +161,7 @@ def lint_markdown(
         description = str(getattr(failure, "rule_description", "") or "") or str(
             getattr(failure, "detail", "") or ""
         )
-        issues.append(
-            LintIssue(rule_id=rule_id, line_number=line_number, description=description)
-        )
+        issues.append(LintIssue(rule_id=rule_id, line_number=line_number, description=description))
     return issues
 
 

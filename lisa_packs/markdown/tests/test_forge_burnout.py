@@ -31,6 +31,12 @@ from lisa_packs.markdown.tests.test_forge_document import (
     _make_tool_executor,
 )
 
+# The flat ceiling the operation retries at, and the budgets under test.
+_FLAT_CEILING = 50_000
+_MODEL_CEILING = 8192
+_FIRST_PASS_BUDGET = 1300
+_TARGET_LENGTH = 1000
+
 
 @dataclass
 class _BurnoutModel:
@@ -49,9 +55,7 @@ class _BurnoutModel:
     context_window: int = 262144
 
 
-def _burnout_completion(
-    *, max_tokens: int, finish_reason: str = "length"
-) -> _FakeCompletion:
+def _burnout_completion(*, max_tokens: int, finish_reason: str = "length") -> _FakeCompletion:
     """One budget-exhausted empty completion at ``max_tokens``.
 
     ``finish_reason='length'`` with empty content is the provider's own
@@ -106,9 +110,7 @@ def _make_ctx_with(
     )
 
 
-def _recording_complete(
-    results: list[_FakeCompletion], *, max_tokens_seen: list[int]
-) -> Any:
+def _recording_complete(results: list[_FakeCompletion], *, max_tokens_seen: list[int]) -> Any:
     """A ``complete_fn`` returning ``results`` in order, recording budgets."""
 
     async def _complete(**kwargs: Any) -> _FakeCompletion:
@@ -123,13 +125,15 @@ def _recording_complete(
 
 
 def test_burnout_retry_budget_jumps_to_flat_ceiling() -> None:
-    """A derived 1300-token budget rescues to the operation's flat ceiling."""
+    """A derived first-pass budget rescues to the operation's flat ceiling."""
 
     assert (
         _burnout_retry_budget(
-            first_pass_max_tokens=1300, model_def=_BurnoutModel(), flat_ceiling=50_000
+            first_pass_max_tokens=_FIRST_PASS_BUDGET,
+            model_def=_BurnoutModel(),
+            flat_ceiling=_FLAT_CEILING,
         )
-        == 50_000
+        == _FLAT_CEILING
     )
 
 
@@ -138,11 +142,11 @@ def test_burnout_retry_budget_respects_model_ceiling() -> None:
 
     assert (
         _burnout_retry_budget(
-            first_pass_max_tokens=1300,
-            model_def=_BurnoutModel(max_completion_tokens=8192),
-            flat_ceiling=50_000,
+            first_pass_max_tokens=_FIRST_PASS_BUDGET,
+            model_def=_BurnoutModel(max_completion_tokens=_MODEL_CEILING),
+            flat_ceiling=_FLAT_CEILING,
         )
-        == 8192
+        == _MODEL_CEILING
     )
 
 
@@ -151,7 +155,9 @@ def test_burnout_retry_budget_none_when_no_higher_budget() -> None:
 
     assert (
         _burnout_retry_budget(
-            first_pass_max_tokens=50_000, model_def=_BurnoutModel(), flat_ceiling=50_000
+            first_pass_max_tokens=_FLAT_CEILING,
+            model_def=_BurnoutModel(),
+            flat_ceiling=_FLAT_CEILING,
         )
         is None
     )
@@ -163,9 +169,9 @@ def test_burnout_retry_budget_none_for_plain_model_budget() -> None:
     plain = _BurnoutModel(max_completion_tokens=0)
     assert (
         _burnout_retry_budget(
-            first_pass_max_tokens=1300, model_def=plain, flat_ceiling=50_000
+            first_pass_max_tokens=_FIRST_PASS_BUDGET, model_def=plain, flat_ceiling=_FLAT_CEILING
         )
-        == 50_000
+        == _FLAT_CEILING
     )
 
 
@@ -177,14 +183,14 @@ async def test_burnout_first_pass_retries_at_flat_ceiling() -> None:
     """``finish_reason=length`` + empty content retries once at the ceiling."""
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=1300), _forged_completion()],
+        [_burnout_completion(max_tokens=_FIRST_PASS_BUDGET), _forged_completion()],
         max_tokens_seen=max_tokens_seen,
     )
-    ctx, captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    ctx, captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Document forged and stored" in result.output_text
-    assert max_tokens_seen[0] == 1300
-    assert max_tokens_seen[1] == 50_000
+    assert max_tokens_seen[0] == _FIRST_PASS_BUDGET
+    assert max_tokens_seen[1] == _FLAT_CEILING
     assert len(captures["writes"]) == 1
 
 
@@ -196,16 +202,16 @@ async def test_clean_stop_burnout_retries_too() -> None:
         finish_reason="stop",
         truncated=False,
         reasoning_content="extended deliberation about the document structure",
-        completion_tokens=1300,
+        completion_tokens=_FIRST_PASS_BUDGET,
     )
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
         [burnout, _forged_completion()], max_tokens_seen=max_tokens_seen
     )
-    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Document forged and stored" in result.output_text
-    assert max_tokens_seen == [1300, 50_000]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET, _FLAT_CEILING]
 
 
 @pytest.mark.asyncio
@@ -216,11 +222,11 @@ async def test_cheap_empty_response_does_not_retry() -> None:
         [_FakeCompletion(content="", finish_reason="stop", completion_tokens=12)],
         max_tokens_seen=max_tokens_seen,
     )
-    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Empty Response" in result.output_text
     # Exactly one provider call — no rescue for a genuine empty response.
-    assert max_tokens_seen == [1300]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET]
 
 
 @pytest.mark.asyncio
@@ -233,10 +239,10 @@ async def test_empty_response_includes_budget_diagnostics() -> None:
     """
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=1300)],
+        [_burnout_completion(max_tokens=_FIRST_PASS_BUDGET)],
         max_tokens_seen=max_tokens_seen,
     )
-    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Empty Response" in result.output_text
     assert "finish_reason=length" in result.output_text
@@ -244,17 +250,20 @@ async def test_empty_response_includes_budget_diagnostics() -> None:
     # budget and the burnout classification.
     assert "max_tokens=50000" in result.output_text
     assert "likely_reasoning_budget_exhaustion" in result.output_text
-    assert max_tokens_seen == [1300, 50000]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET, _FLAT_CEILING]
 
 
 @pytest.mark.asyncio
 async def test_rescue_failure_reports_retry_ceiling() -> None:
     """When the rescue also returns empty, the diagnostics show the retried budget."""
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=1300), _burnout_completion(max_tokens=50_000)],
+        [
+            _burnout_completion(max_tokens=_FIRST_PASS_BUDGET),
+            _burnout_completion(max_tokens=_FLAT_CEILING),
+        ],
         max_tokens_seen=[],
     )
-    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Empty Response" in result.output_text
     assert "max_tokens=50000" in result.output_text
@@ -265,17 +274,17 @@ async def test_rescue_disabled_by_config() -> None:
     """``forge_burnout_rescue: false`` keeps the legacy single-call behavior."""
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=1300)],
+        [_burnout_completion(max_tokens=_FIRST_PASS_BUDGET)],
         max_tokens_seen=max_tokens_seen,
     )
     ctx, _captures = _make_ctx_with(
         complete_fn,
-        params={"target_length": 1000},
+        params={"target_length": _TARGET_LENGTH},
         model_def=_BurnoutModel(),
     )
     ctx = ctx.model_copy(update={"pack_config": {"forge_burnout_rescue": False}})
     result = await execute(ctx)
-    assert max_tokens_seen == [1300]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET]
     assert "Empty Response" in result.output_text
 
 
@@ -284,24 +293,24 @@ async def test_rescue_budget_capped_by_model_ceiling() -> None:
     """A model-declared ceiling below the flat ceiling binds the retry."""
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=1300), _forged_completion()],
+        [_burnout_completion(max_tokens=_FIRST_PASS_BUDGET), _forged_completion()],
         max_tokens_seen=max_tokens_seen,
     )
     ctx, _captures = _make_ctx_with(
         complete_fn,
-        params={"target_length": 1000},
-        model_def=_BurnoutModel(max_completion_tokens=8192),
+        params={"target_length": _TARGET_LENGTH},
+        model_def=_BurnoutModel(max_completion_tokens=_MODEL_CEILING),
     )
     result = await execute(ctx)
     assert "Document forged and stored" in result.output_text
-    assert max_tokens_seen == [1300, 8192]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET, _MODEL_CEILING]
 
 
 @pytest.mark.asyncio
 async def test_no_rescue_when_flat_ceiling_not_higher() -> None:
     """A first pass already at the flat ceiling cannot be rescued."""
     complete_fn = _recording_complete(
-        [_burnout_completion(max_tokens=50_000)],
+        [_burnout_completion(max_tokens=_FLAT_CEILING)],
         max_tokens_seen=[],
     )
     ctx, _captures = _make_ctx_with(complete_fn, params={})
@@ -314,11 +323,9 @@ async def test_no_rescue_when_flat_ceiling_not_higher() -> None:
 async def test_healthy_first_pass_unchanged() -> None:
     """A normal forge result byte-behaves as before the rescue existed."""
     max_tokens_seen: list[int] = []
-    complete_fn = _recording_complete(
-        [_forged_completion()], max_tokens_seen=max_tokens_seen
-    )
-    ctx, captures = _make_ctx_with(complete_fn, params={"target_length": 1000})
+    complete_fn = _recording_complete([_forged_completion()], max_tokens_seen=max_tokens_seen)
+    ctx, captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
     assert "Document forged and stored" in result.output_text
-    assert max_tokens_seen == [1300]
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET]
     assert len(captures["writes"]) == 1

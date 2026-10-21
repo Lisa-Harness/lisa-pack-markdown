@@ -14,9 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from kernel.models import OperationExecutionContext
-from sdk.thread import ThreadStore
 
 from lisa_packs.markdown.operations.render_turn.render_turn import execute
 

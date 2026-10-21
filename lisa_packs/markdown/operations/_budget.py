@@ -48,7 +48,7 @@ def target_words_to_max_tokens(
     if words <= 0:
         return ceiling
     raw = words * max(float(tokens_per_word), 0.1)
-    budget = int(math.ceil(raw))
+    budget = math.ceil(raw)
     if budget < floor:
         return floor
     if budget > ceiling:
