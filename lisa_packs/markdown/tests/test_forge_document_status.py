@@ -321,3 +321,209 @@ async def test_char_cap_truncation_sets_stop_reason_char_cap() -> None:
     cont = result.extra.get("continuation")
     if cont and cont.get("was_truncated"):
         assert cont["stop_reason"] == "char_cap"
+
+
+# ── 2026-10-22 char-cap incident fixes ────────────────────────────────
+
+
+_LONG_REVISION = (
+    "# Plan\n\n"
+    "## Zero\n\n" + ("z" * 80) + "\n\n"
+    "## One\n\n" + ("1" * 80) + "\n\n"
+    "## Two\n\n" + ("2" * 80) + "\n\n"
+    "## Three\n\n" + ("3" * 400) + "\n"
+)
+
+
+def _make_recording_ctx(
+    *,
+    complete_fn: Any,
+    params: dict[str, Any] | None = None,
+    pack_config: dict[str, Any] | None = None,
+    query: str = "forge a runbook",
+) -> tuple[OperationExecutionContext, list[dict[str, Any]]]:
+    """Return a ctx whose write_file calls are captured for assertions."""
+    captured: list[dict[str, Any]] = []
+
+    async def executor(tool_id: str, tctx: Any) -> ToolResult:
+        params_inner = getattr(tctx, "parameters", {}) or {}
+        if tool_id == "write_file":
+            content = str(params_inner.get("content") or "")
+            path = str(params_inner.get("path") or "")
+            captured.append({"path": path, "content": content})
+            return ToolResult(
+                tool_id=tool_id,
+                output_text=json.dumps(
+                    {"ok": True, "path": path, "bytes": len(content.encode("utf-8"))}
+                ),
+            )
+        if tool_id == "markdown_generate":
+            md = str(params_inner.get("markdown") or "")
+            heading_count = sum(1 for line in md.splitlines() if line.lstrip().startswith("#"))
+            return ToolResult(
+                tool_id=tool_id,
+                output_text=f"Outline: {heading_count} headings.",
+                output_json={"heading_count": heading_count, "headings": []},
+            )
+        if tool_id == "memory.search":
+            return ToolResult(tool_id=tool_id, output_text="No relevant memories found.")
+        return ToolResult(
+            tool_id=tool_id,
+            output_text=json.dumps({"error": "file not found: docs/forge.md"}),
+        )
+
+    from kernel.seams.host_adapter import _CallableHost
+
+    host = _CallableHost(
+        complete_fn=complete_fn,
+        resolve_model_fn=lambda _alias: _FakeModel(),
+        read_authored_text_fn=_make_loader(),
+        execute_tool_fn=executor,
+    )
+    ctx = OperationExecutionContext(
+        workspace_id="test",
+        user_id="test-user",
+        user_slug="test-user",
+        surface_type="personal_dm",
+        surface_id="test",
+        memory_scope="personal",
+        mode_id="markdown",
+        query=query,
+        host=host,
+        params=params or {},
+        pack_config=pack_config,
+    )
+    return ctx, captured
+
+
+@pytest.mark.asyncio
+async def test_revision_not_clamped_below_existing_document_size() -> None:
+    """A revision is never clamped below the size of the document it revises.
+
+    The 2026-10-22 incident: a 32.9k-char plan was revised cleanly to
+    46.6k chars, then the flat 20k post-hoc clamp destroyed 26.6k chars of
+    approved content and degraded the result into an unverified write. The
+    cap now floors at the existing document's length, so a legitimate
+    growth revision persists whole.
+    """
+    existing = "# Plan\n\noriginal approved content. " * 400  # ~13.3k chars
+    ctx, captured = _make_recording_ctx(
+        complete_fn=_fake_complete_returning(_LONG_REVISION),
+        params={"existing_document": existing, "document_path": "docs/plan.md"},
+        pack_config={"forge_max_document_chars": 100},
+    )
+    result = await execute(ctx)
+    assert result.status == "success"
+    assert len(captured) == 1
+    content = captured[0]["content"]
+    # Every planned section survived the (already floored-away) cap.
+    for section in ("## Zero", "## One", "## Two", "## Three"):
+        assert section in content
+    assert ("3" * 400) in content
+    assert "<!-- forge: capped -->" not in content
+    assert "<!-- truncated -->" not in content
+
+
+@pytest.mark.asyncio
+async def test_char_cap_cuts_at_heading_boundary_with_omitted_list() -> None:
+    """A char-cap cut lands on a heading boundary and names omitted sections.
+
+    The old mid-sentence slice left documents ending mid-word with no
+    signal of what was dropped (the 2026-10-22 artifact ended
+    ``"...delay for the s``). The cut now backs off to the last heading
+    that fits and appends an explicit omitted-sections comment.
+    """
+    ctx, captured = _make_recording_ctx(
+        complete_fn=_fake_complete_returning(_LONG_REVISION),
+        pack_config={"forge_max_document_chars": 200},
+    )
+    result = await execute(ctx)
+    assert captured, "write_file must have been called"
+    content = captured[0]["content"]
+    assert "<!-- forge: capped -->" in content
+    # The note names the dropped downstream headings.
+    assert "omitted" in content
+    assert "## Three" in content
+    # The retained body ends at a heading boundary: the last retained
+    # line is one of the section bodies, not a cut mid-word.
+    body = content.split("<!-- forge: capped -->")[0].rstrip()
+    assert body.endswith(("z", "1", "2"))
+    assert result.status == "degraded"
+    assert result.extra["continuation"]["stop_reason"] == "char_cap"
+
+
+@pytest.mark.asyncio
+async def test_revision_prompt_carries_size_headroom_guidance() -> None:
+    """A revision prompt tells the model its char budget before it writes.
+
+    The model planned 46.6k chars against an invisible 20k clamp. The
+    guidance line surfaces the cap and the headroom so it can plan inside
+    the budget (and preserve approved content) instead of discovering the
+    clamp post-generation.
+    """
+    prompts: list[str] = []
+
+    async def complete(**kwargs: Any) -> _FakeCompletion:
+        prompts.append(kwargs["messages"][1]["content"])
+        return _FakeCompletion(content=f"```markdown\n{_LONG_REVISION}\n```")
+
+    from kernel.seams.host_adapter import _CallableHost
+
+    existing = "# Plan\n\n" + ("approved " * 500)  # ~4k chars
+    ctx = OperationExecutionContext(
+        workspace_id="test",
+        user_id="test-user",
+        user_slug="test-user",
+        surface_type="personal_dm",
+        surface_id="test",
+        memory_scope="personal",
+        mode_id="markdown",
+        query="revise",
+        host=_CallableHost(
+            complete_fn=complete,
+            resolve_model_fn=lambda _alias: _FakeModel(),
+            read_authored_text_fn=_make_loader(),
+            execute_tool_fn=_make_tool_executor()[0],
+        ),
+        params={"existing_document": existing},
+        pack_config={"forge_max_document_chars": 6000},
+    )
+    await execute(ctx)
+    assert prompts, "completion must have been called"
+    assert "persistence budget" in prompts[0]
+    # The op strips the loaded document, so the guidance reports the
+    # stripped length (4507 here, not the 4508 with the trailing space).
+    assert str(len(existing.strip())) in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_fresh_forge_prompt_stays_byte_identical() -> None:
+    """No existing document → no size-guidance line (legacy prompt shape)."""
+    prompts: list[str] = []
+
+    async def complete(**kwargs: Any) -> _FakeCompletion:
+        prompts.append(kwargs["messages"][1]["content"])
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    from kernel.seams.host_adapter import _CallableHost
+
+    ctx = OperationExecutionContext(
+        workspace_id="test",
+        user_id="test-user",
+        user_slug="test-user",
+        surface_type="personal_dm",
+        surface_id="test",
+        memory_scope="personal",
+        mode_id="markdown",
+        query="forge a runbook",
+        host=_CallableHost(
+            complete_fn=complete,
+            resolve_model_fn=lambda _alias: _FakeModel(),
+            read_authored_text_fn=_make_loader(),
+            execute_tool_fn=_make_tool_executor()[0],
+        ),
+        params={},
+    )
+    await execute(ctx)
+    assert prompts and "persistence budget" not in prompts[0]
+    assert "Target length" not in prompts[0]

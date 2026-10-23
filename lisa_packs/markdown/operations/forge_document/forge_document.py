@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -361,6 +362,7 @@ async def _call_llm(
     *,
     max_tokens: int,
     target_length_guidance: str = "",
+    max_document_chars: int = _MAX_DOCUMENT_CHARS,
 ) -> tuple[str, Any, bool | None, str | None]:
     """Call the host's completion function with the forging prompt.
 
@@ -391,7 +393,9 @@ async def _call_llm(
         user_input=user_input,
         memory_context=memory_context or "(no recalled context)",
         existing_document=existing_document or "(no existing document — start fresh)",
-        target_length_guidance=target_length_guidance,
+        target_length_guidance=(
+            target_length_guidance or _size_headroom_guidance(existing_document, max_document_chars)
+        ),
     )
 
     messages = [
@@ -410,6 +414,35 @@ async def _call_llm(
     truncated = getattr(completion, "truncated", None)
     finish_reason = getattr(completion, "finish_reason", None)
     return content.strip(), model_def, truncated, finish_reason
+
+
+def _size_headroom_guidance(existing_document: str, max_document_chars: int) -> str:
+    """Return the prompt guidance line describing the persistence char budget.
+
+    The 2026-10-22 forge char-cap incident: a 32.9k-char plan revision grew
+    to 46.6k chars, the post-hoc clamp silently cut it to 20k, and the
+    degraded result negated the write. Telling the model the budget
+    *before* it writes lets it plan inside the cap instead of discovering
+    it after a multi-minute generation. Empty on the fresh-forge path
+    (no existing document) so the legacy fresh prompt stays byte-identical
+    even when the cap is generous.
+    """
+    if not existing_document:
+        return ""
+    existing_len = len(existing_document)
+    headroom = max_document_chars - existing_len
+    if headroom <= 0:
+        return (
+            f"Size guidance: the existing document is {existing_len} characters; the "
+            f"persistence budget allows growth beyond it, so preserve ALL existing approved "
+            f"content verbatim while adding the requested changes."
+        )
+    return (
+        f"Size guidance: the existing document is {existing_len} characters and the "
+        f"persistence budget is about {max_document_chars} characters ({headroom} characters "
+        f"of headroom). Preserve ALL existing approved content verbatim and keep your "
+        f"additions within the headroom."
+    )
 
 
 def _empty_response_diagnostics(finish_reason: Any, max_tokens: int) -> str:
@@ -473,6 +506,7 @@ async def _complete_raw(
     max_tokens: int,
     target_length_guidance: str,
     model_def: Any,
+    max_document_chars: int = _MAX_DOCUMENT_CHARS,
 ) -> Any:
     """Issue one forge completion and return the raw host completion object.
 
@@ -488,7 +522,9 @@ async def _complete_raw(
         user_input=user_input,
         memory_context=memory_context or "(no recalled context)",
         existing_document=existing_document or "(no existing document — start fresh)",
-        target_length_guidance=target_length_guidance,
+        target_length_guidance=(
+            target_length_guidance or _size_headroom_guidance(existing_document, max_document_chars)
+        ),
     )
     return await ctx.host.complete(
         messages=[
@@ -525,6 +561,7 @@ async def _call_llm_forge(
     target_length_guidance: str,
     flat_ceiling: int,
     burnout_rescue: bool,
+    max_document_chars: int = _MAX_DOCUMENT_CHARS,
 ) -> tuple[str, Any, bool | None, str | None, int]:
     """Forge first pass plus one budget-shape rescue.
 
@@ -561,6 +598,7 @@ async def _call_llm_forge(
         max_tokens=max_tokens,
         target_length_guidance=target_length_guidance,
         model_def=model_def,
+        max_document_chars=max_document_chars,
     )
     content = (getattr(completion, "content", "") or "").strip()
     truncated = getattr(completion, "truncated", None)
@@ -589,6 +627,7 @@ async def _call_llm_forge(
                 max_tokens=retry_tokens,
                 target_length_guidance=target_length_guidance,
                 model_def=model_def,
+                max_document_chars=max_document_chars,
             )
             return (
                 (getattr(retry_completion, "content", "") or "").strip(),
@@ -655,14 +694,15 @@ def _resolve_target_length(
     *,
     max_document_chars: int,
     tokens_per_word: float,
+    existing_document: str = "",
 ) -> tuple[int | None, str, int]:
     """Resolve the optional ``target_length`` into ``(words, guidance, max_tokens)``.
 
-    Returns ``(None, "", cfg.max_completion_tokens-equivalent)`` when no
-    target is supplied — the legacy flat-budget path. When a target is
-    supplied, returns the resolved word count, a prompt guidance line, and
-    a derived ``max_tokens`` budget (clamped to the document char cap so a
-    huge target cannot exceed what the char-cap would clip anyway).
+    Returns ``(None, "", 0)`` when no target is supplied — the legacy
+    flat-budget path. When a target is supplied, returns the resolved word
+    count, a prompt guidance line, and a derived ``max_tokens`` budget
+    (clamped to the document char cap so a huge target cannot exceed what
+    the char-cap would clip anyway).
     """
     raw = params.get("target_length")
     if raw is None:
@@ -966,6 +1006,61 @@ def _format_markdown(document: str) -> str:
         return document
 
 
+def _cap_document_at_heading(document: str, char_cap: int) -> str:
+    """Cap ``document`` at ``char_cap`` chars without cutting mid-section.
+
+    The old slice cut at an arbitrary character offset — mid-sentence,
+    often mid-word — leaving a document that ended
+    ``"...worth it; a two-week delay for the s`` with no closure and no
+    signal of what was dropped. This helper instead backs off to the last
+    heading boundary (a line-start ``#`` marker) that fits inside the
+    cap and appends an explicit ``<!-- forge: capped -->`` comment that
+    names every section heading beyond the cut, so the model and the
+    reader can see exactly what was omitted and re-request it.
+
+    Falls back to the legacy mid-text slice (with the same trailing
+    comment) only when no heading boundary fits at all — a document with
+    no earlier heading cannot be split safely.
+    """
+    stripped = document.rstrip()
+    lines = stripped.splitlines(keepends=True)
+
+    # Record the start offset of every line; heading lines are candidate cuts.
+    offsets: list[tuple[int, str, bool]] = []
+    offset = 0
+    for line in lines:
+        offsets.append((offset, line, bool(re.match(r"^#{1,6}\s", line))))
+        offset += len(line)
+
+    best_cut_line_count = 0
+    for line_index, (line_offset, _line, is_heading) in enumerate(offsets):
+        if is_heading and 0 < line_offset < char_cap:
+            best_cut_line_count = line_index
+
+    if best_cut_line_count:
+        body = "".join(lines[:best_cut_line_count]).rstrip()
+    else:
+        body = stripped[:char_cap].rstrip()
+
+    cut_at = offsets[best_cut_line_count][0] if best_cut_line_count else char_cap
+    dropped_section_heads = [
+        line.strip()
+        for line_offset, line, is_heading in offsets
+        if is_heading and line_offset >= cut_at
+    ]
+    comment = "<!-- forge: capped -->"
+    if dropped_section_heads:
+        note = (
+            f"the document exceeded the {char_cap}-character persistence cap and was cut at a "
+            "section boundary; the following section(s) were omitted: "
+            + "; ".join(dropped_section_heads)
+            + ". Re-run the forge with a higher ``forge_max_document_chars`` to keep them."
+        )
+    else:
+        note = f"the document exceeded the {char_cap}-character persistence cap and was cut."
+    return f"{body}\n\n{comment}\n{note}\n"
+
+
 # ── Forging phases ──────────────────────────────────────────────────
 #
 # ``execute`` is the pipeline's orchestrator, not its implementation. The
@@ -1064,9 +1159,10 @@ def _resolve_forge_budgets(state: _ForgeState) -> None:
     exactly — no behavior change on the default path.
     """
     cfg = state.cfg
+    effective_char_cap = max(cfg.max_document_chars, len(state.existing_document))
     target_words, target_guidance, derived_max_tokens = _resolve_target_length(
         state.params,
-        max_document_chars=cfg.max_document_chars,
+        max_document_chars=effective_char_cap,
         tokens_per_word=cfg.tokens_per_word,
     )
     state.target_words = target_words
@@ -1108,6 +1204,7 @@ async def _forge_document_body(
         target_length_guidance=state.target_guidance,
         flat_ceiling=cfg.max_completion_tokens,
         burnout_rescue=cfg.burnout_rescue,
+        max_document_chars=max(cfg.max_document_chars, len(state.existing_document)),
     )
     state.model_def = model_def
     state.first_truncated = first_truncated
@@ -1249,12 +1346,21 @@ def _finalize_forged_document(ctx: OperationExecutionContext, state: _ForgeState
     Inline-fence repair runs BEFORE formatting: mdformat treats a closing
     fence appended to the last code line as legal CommonMark and preserves
     it, so the hygiene split must land first.
+
+    The char cap floors at the existing document's size: a revision can
+    never be smaller than what it revises. A 32.9k-char plan revision that
+    synthesizes cleanly at 46.6k chars is legitimate *growth* — clamping
+    it to a fixed 20k ceiling destroyed approved content mid-sentence and
+    degraded the result to an unverified write (the 2026-10-22 forge
+    char-cap incident). A fresh forge (no existing document) keeps the
+    flat configured ceiling unchanged.
     """
     cfg = state.cfg
     document = repair_inline_fences(state.document)
     document = _format_markdown(document)
-    if len(document) > cfg.max_document_chars:
-        document = document[: cfg.max_document_chars] + "\n\n<!-- truncated -->\n"
+    effective_char_cap = max(cfg.max_document_chars, len(state.existing_document))
+    if len(document) > effective_char_cap:
+        document = _cap_document_at_heading(document, effective_char_cap)
         state.was_truncated = True
         state.continuation_stop_reason = "char_cap"
     annotate_model = bool(state.params.get("annotate_model", True))

@@ -3,6 +3,11 @@ description: Combine user input with recalled memory context (and optionally an 
 effect: write
 module_path: lisa_packs.markdown.operations.forge_document.forge_document
 tool_ids: [markdown_generate, write_file, read_file, memory.search]
-timeout_seconds: 300
+# A full-document revision through a cloud reasoning model runs one large
+# completion inside the op (the 2026-10-22 char-cap incident: ~207 s for a
+# 46.6k-char revision). 300 s left almost no margin; continuation passes and
+# the burnout rescue add more calls after the first pass. 600 s matches the
+# consolidate op's budget.
+timeout_seconds: 600
 preferred_model_id: default
 exportable: true
