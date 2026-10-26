@@ -1478,3 +1478,89 @@ async def test_target_length_scales_continue_budget() -> None:
     # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.3) = 650.
     assert result.output_json["truncated"] is False
     assert result.output_json["continue_attempts"] == 1
+
+
+# ── Unstated invocation (2026-10-26 forge incident) ────────────────────────
+#
+# A zero-argument call was schema-valid (every field has a default), fell back
+# to the ambient turn query, and overwrote `docs/forge.md` with invented
+# content. The guard refuses a call that states no intent, without breaking the
+# documented revise-by-auto-load contract.
+
+
+@pytest.mark.asyncio
+async def test_zero_argument_call_is_refused_without_writing() -> None:
+    """An invocation naming nothing to forge must not synthesize or persist."""
+    tool_fn, captures = _make_tool_executor()
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return _FakeCompletion(content="```markdown\n# Invented\n\n## Made up\n```")
+
+    ctx = _make_ctx(
+        query="",  # no ambient instruction either
+        params={},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "error"
+    assert result.error_detail and "no query" in result.error_detail
+    assert "No Input" in result.output_text
+    assert calls == [], "no model call may run for an unstated invocation"
+    assert captures["writes"] == [], "nothing may be written"
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_query_does_not_fall_back_to_ambient() -> None:
+    """An explicit ``query: ''`` means no instruction, not "use the turn's"."""
+    tool_fn, captures = _make_tool_executor()
+
+    async def _complete(**_kwargs: Any) -> Any:  # pragma: no cover - must not run
+        raise AssertionError("the model must not be called")
+
+    ctx = _make_ctx(
+        query="something the operator typed earlier in the turn",
+        params={"query": "", "document_path": "docs/x.md"},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert "No Input" in result.output_text
+    assert result.status == "error"
+    assert captures["writes"] == []
+
+
+@pytest.mark.asyncio
+async def test_auto_load_revise_still_works() -> None:
+    """Omitting ``existing_document`` for an existing path is the revise path.
+
+    The guard must not turn the documented iteration contract into a refusal:
+    the operation reads the stored document and revises it.
+    """
+    original = "# Runbook\n\n## Steps\n1. Old step.\n"
+    revised = "# Runbook\n\n## Steps\n1. New step.\n2. Added step.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/runbook.md": original})
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content=f"```markdown\n{revised}\n```")
+
+    ctx = _make_ctx(
+        query="add a verification step",
+        params={"document_path": "docs/runbook.md"},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert "Document forged and stored" in result.output_text
+    assert len(captures["writes"]) == 1

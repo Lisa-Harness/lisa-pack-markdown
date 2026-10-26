@@ -285,8 +285,23 @@ def _resolve_settings(ctx: OperationExecutionContext) -> _ResolvedSettings:
 def _extract_query(
     ctx: OperationExecutionContext, params: dict[str, Any], max_query_chars: int
 ) -> str:
-    """Return the user-supplied instruction, bounded in length."""
-    raw = str(params.get("query") or ctx.query or "").strip()
+    """Return the user-supplied instruction, bounded in length.
+
+    An explicit empty ``query`` means "no instruction" and fails closed. It
+    must not fall back to the ambient turn query: a call that passes
+    ``query: ""`` is asking for nothing specific, and filling it from the
+    turn's conversation forges a document the caller never requested. That
+    fallback is how a zero-argument invocation produced 2,450 bytes of
+    invented content (the 2026-10-26 forge incident).
+
+    The ambient ``ctx.query`` remains the fallback only when the ``query``
+    parameter is *absent*, which is the ordinary "the operation was invoked
+    with the turn's own request" shape.
+    """
+    if "query" in params:
+        raw = str(params.get("query") or "").strip()
+    else:
+        raw = str(ctx.query or "").strip()
     if len(raw) > max_query_chars:
         raw = raw[:max_query_chars] + "…"
     return raw
@@ -603,46 +618,55 @@ async def _call_llm_forge(
     content = (getattr(completion, "content", "") or "").strip()
     truncated = getattr(completion, "truncated", None)
     finish_reason = getattr(completion, "finish_reason", None)
-    if not content and burnout_rescue and _completion_spent(completion, requested=max_tokens):
+    # Gate on empty visible content, not on a budget diagnosis. A document
+    # forge has no valid empty outcome, so "the model returned nothing" is
+    # fatal whatever the finish reason — including the cheap clean stop that
+    # the shared 90% burnout share deliberately declines to rescue (the
+    # 2026-10-26 incident: finish_reason='stop', sparse spend, no rescue, and
+    # the operation reported success with an empty artifact).
+    #
+    # The raw attribute is the gate, never ``completion_content``: that helper
+    # folds ``reasoning_content`` into its return when content is empty, so
+    # gating on it would persist the model's chain-of-thought as the document.
+    if not content and burnout_rescue:
+        diagnosis = model_budgets._burnout_or_truncation(
+            completion, base_max_tokens=max_tokens
+        )
         retry_tokens = _burnout_retry_budget(
             first_pass_max_tokens=max_tokens,
             model_def=model_def,
             flat_ceiling=flat_ceiling,
         )
-        if retry_tokens is not None:
-            logger.warning(
-                "forge_document: first pass consumed its budget with empty content "
-                "(finish_reason=%r, max_tokens=%d); retrying once with a higher "
-                "budget (model=%s, to=%d)",
-                finish_reason,
-                max_tokens,
-                getattr(model_def, "model_id", ""),
-                retry_tokens,
-            )
-            retry_completion = await _complete_raw(
-                ctx,
-                user_input=user_input,
-                memory_context=memory_context,
-                existing_document=existing_document,
-                max_tokens=retry_tokens,
-                target_length_guidance=target_length_guidance,
-                model_def=model_def,
-                max_document_chars=max_document_chars,
-            )
-            return (
-                (getattr(retry_completion, "content", "") or "").strip(),
-                model_def,
-                getattr(retry_completion, "truncated", None),
-                getattr(retry_completion, "finish_reason", None),
-                retry_tokens,
-            )
+        if retry_tokens is None:
+            # Raising the ceiling cannot help, but a stochastic empty response
+            # is still worth one more attempt at the same budget.
+            retry_tokens = max_tokens
         logger.warning(
-            "forge_document: first pass consumed its budget with empty content "
-            "(finish_reason=%r, max_tokens=%d) and no higher budget is available; "
-            "not retrying (model=%s)",
+            "forge_document empty content: finish_reason=%s completion_tokens=%s "
+            "max_tokens=%d diagnosis=%s; retrying once (model=%s, to=%d)",
             finish_reason,
+            model_budgets._completion_usage_tokens(completion),
             max_tokens,
+            diagnosis,
             getattr(model_def, "model_id", ""),
+            retry_tokens,
+        )
+        retry_completion = await _complete_raw(
+            ctx,
+            user_input=user_input,
+            memory_context=memory_context,
+            existing_document=existing_document,
+            max_tokens=retry_tokens,
+            target_length_guidance=target_length_guidance,
+            model_def=model_def,
+            max_document_chars=max_document_chars,
+        )
+        return (
+            (getattr(retry_completion, "content", "") or "").strip(),
+            model_def,
+            getattr(retry_completion, "truncated", None),
+            getattr(retry_completion, "finish_reason", None),
+            retry_tokens,
         )
     return content, model_def, truncated, finish_reason, max_tokens
 
@@ -1119,7 +1143,14 @@ async def _prepare_forge(
     state = _ForgeState(params=params, cfg=cfg)
     user_input = _extract_query(ctx, params, cfg.max_query_chars)
     if not user_input:
-        return state, OperationResult(output_text=_load_text(ctx, _NO_INPUT_PATH))
+        # No instruction is a failure to report, not a successful forge: a
+        # default ``status="success"`` here made the turn treat the operation
+        # as satisfied while nothing was produced.
+        return state, OperationResult(
+            output_text=_load_text(ctx, _NO_INPUT_PATH),
+            status="error",
+            error_detail="no instruction was provided in query",
+        )
     state.user_input = user_input
     try:
         state.document_path = _extract_document_path(params)
@@ -1136,19 +1167,23 @@ async def _load_existing_document(
 ) -> OperationResult | None:
     """Read the document the caller wants revised, when one is not supplied.
 
-    When the caller omits ``existing_document`` but the target path
-    already exists in storage, read it so the LLM revises rather than
-    replacing wholesale. Returns a terminal ``OperationResult`` when the
-    read fails.
+    When the caller omits ``existing_document`` but the target path already
+    exists in storage, read it so the LLM revises rather than replacing
+    wholesale. This is the documented iteration contract, not an implicit
+    overwrite.
+
+    Returns a terminal ``OperationResult`` when the read fails.
     """
     existing_document = str(state.params.get("existing_document") or "").strip()
     if existing_document:
+        # The caller has read the file it is replacing, so the overwrite is
+        # demonstrably intentional.
         state.existing_document = existing_document
         return None
     try:
         state.existing_document = await _read_existing_document(ctx, state.document_path)
     except RuntimeError as exc:
-        return OperationResult(output_text=str(exc))
+        return OperationResult(output_text=str(exc), status="error")
     return None
 
 
@@ -1210,11 +1245,22 @@ async def _forge_document_body(
     state.first_truncated = first_truncated
     state.first_finish_reason = first_finish_reason
     if not completion_text or not completion_text.strip():
+        # Never report success for an empty body. The operation's entire
+        # purpose is to produce a document, so an empty one is a hard failure
+        # regardless of finish_reason — the 2026-10-26 incident returned
+        # ``finish_reason='stop'`` with zero content, and a default
+        # ``status="success"`` made the turn treat the forge as satisfied and
+        # hand the caller an empty artifact.
         return OperationResult(
             output_text=_format_template(
                 _load_text(ctx, _EMPTY_RESPONSE_PATH),
                 diagnostics=_empty_response_diagnostics(first_finish_reason, effective_max_tokens),
-            )
+            ),
+            status="error",
+            error_detail=(
+                f"model returned no content after the rescue pass "
+                f"(finish_reason={first_finish_reason!r}, max_tokens={effective_max_tokens})"
+            ),
         )
     document = extract_markdown_block(completion_text)
     if not document.strip():
@@ -1222,7 +1268,11 @@ async def _forge_document_body(
             _load_text(ctx, _EMPTY_DOCUMENT_PATH),
             response_preview=completion_text[:400],
         )
-        return OperationResult(output_text=text)
+        return OperationResult(
+            output_text=text,
+            status="error",
+            error_detail="completion contained no extractable markdown document",
+        )
     # Outline contract: strip the declared section plan from the body and
     # remember it for the post-continuation completeness check. No marker →
     # no plan → the gate is skipped entirely (legacy path, no extra calls).
@@ -1510,24 +1560,37 @@ def _build_forge_summary(
     issues: list[LintIssue],
     repair_used: bool,
 ) -> str:
-    """Build the user-facing summary of the forge result."""
-    summary = (
-        f"Document forged and stored at `{stored_path}` "
-        f"({byte_count} bytes, {heading_count} headings)."
-    )
+    """Build the user-facing summary of the forge result.
+
+    A degraded result leads with the warning. The earlier shape opened with
+    "Document forged and stored" and appended " WARNING:" in the same
+    sentence, so a caller reading the first clause — or a model skimming the
+    result — saw success and stopped there. The 2026-10-26 incident dropped
+    five of eight planned sections and the summary still began with
+    "Document forged and stored".
+    """
     if state.was_truncated:
         if state.missing_plan_sections:
-            summary += (
-                f" WARNING: document is missing planned section(s) after "
-                f"{state.outline_contract_attempts} expansion attempt(s): "
-                f"{', '.join(state.missing_plan_sections)}. See annotation in document."
+            summary = (
+                f"INCOMPLETE: document persisted at `{stored_path}` "
+                f"({byte_count} bytes, {heading_count} headings) but is missing "
+                f"planned section(s) after {state.outline_contract_attempts} "
+                f"expansion attempt(s): {', '.join(state.missing_plan_sections)}. "
+                f"See annotation in document."
             )
         else:
-            summary += (
-                f" WARNING: persisted truncated after {state.continue_attempts} "
-                f"continuation attempt(s) (final finish_reason="
-                f"{state.final_finish_reason!r}). See annotation in document."
+            summary = (
+                f"INCOMPLETE: document persisted at `{stored_path}` "
+                f"({byte_count} bytes, {heading_count} headings) but was truncated "
+                f"after {state.continue_attempts} continuation attempt(s) "
+                f"(final finish_reason={state.final_finish_reason!r}). "
+                f"See annotation in document."
             )
+    else:
+        summary = (
+            f"Document forged and stored at `{stored_path}` "
+            f"({byte_count} bytes, {heading_count} headings)."
+        )
     if issues:
         summary += (
             f" Note: {len(issues)} structural lint warning(s) remain "
@@ -1586,6 +1649,10 @@ async def _persist_forged_document(
             "lint_repair_used": repair_used,
             "target_words": state.target_words,
             "missing_plan_sections": list(state.missing_plan_sections),
+            # A caller must be able to branch on completeness without parsing
+            # the human summary. ``truncated`` covers both a provider cut and
+            # missing planned sections.
+            "complete": not state.was_truncated,
         },
         status="degraded" if state.was_truncated else "success",
         error_detail=(
@@ -1621,6 +1688,51 @@ async def _persist_forged_document(
     )
 
 
+#: Parameters that, together, identify what a caller wants forged. A call
+#: carrying none of them is not a request for a document.
+_FORGING_INTENT_PARAMS: tuple[str, ...] = (
+    "query",
+    "existing_document",
+    "document_path",
+    "target_length",
+)
+
+
+def _reject_unstated_invocation(
+    ctx: OperationExecutionContext,
+    params: dict[str, Any],
+) -> OperationResult | None:
+    """Refuse a call that names nothing to forge.
+
+    Every ``Parameters`` field has a default, so a zero-argument call is
+    schema-valid and used to fall through to the ambient ``ctx.query`` — which
+    forged 2,450 bytes of invented content and overwrote ``docs/forge.md``
+    with no one having asked for it (the 2026-10-26 forge incident).
+
+    This is deliberately *not* an overwrite guard. Revising an existing
+    document by omitting ``existing_document`` is the documented iteration
+    contract and still works: the auto-load reads the file first. What is
+    refused is an invocation that states no intent at all, because there is
+    nothing to forge *from* and nothing the caller asked for.
+
+    Returns a terminal ``OperationResult`` when the call states no intent.
+    """
+    if any(name in params for name in _FORGING_INTENT_PARAMS):
+        return None
+    if str(getattr(ctx, "query", "") or "").strip():
+        # The host passed the turn's request as ambient context, which is the
+        # ordinary "the operation serves this turn" shape.
+        return None
+    return OperationResult(
+        output_text=_load_text(ctx, _NO_INPUT_PATH),
+        status="error",
+        error_detail=(
+            "refused a forge invocation carrying no query, existing_document, "
+            "document_path, or target_length and no ambient query"
+        ),
+    )
+
+
 async def execute(ctx: OperationExecutionContext) -> OperationResult:
     """Forge a markdown document from user input + recalled memory and persist it.
 
@@ -1631,6 +1743,9 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     advisory lint), and persist. Each phase lives in its own helper; this
     function only wires them together.
     """
+    unstated = _reject_unstated_invocation(ctx, ctx.params or {})
+    if unstated is not None:
+        return unstated
     state, failure = await _prepare_forge(ctx)
     if failure is not None:
         return failure

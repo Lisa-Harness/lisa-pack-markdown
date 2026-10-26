@@ -289,9 +289,13 @@ async def test_expansion_still_missing_persists_degraded_with_warning() -> None:
         ]
     )
     result = await execute(ctx)
-    assert "Document forged" in result.output_text
+    # The summary leads with the incompleteness, not with "Document forged":
+    # a caller (or a model skimming the result) that reads only the first
+    # clause must not mistake a truncated artifact for a complete one.
+    assert result.output_text.startswith("INCOMPLETE:")
+    assert "Document forged" not in result.output_text
     assert result.status == "degraded"
-    assert "WARNING" in result.output_text
+    assert result.output_json["complete"] is False
     assert "Launch sequence" in result.output_text
     assert "Competitive FAQ" in result.output_text
     contract = result.extra["outline_contract"]

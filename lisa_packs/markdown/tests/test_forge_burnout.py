@@ -215,18 +215,51 @@ async def test_clean_stop_burnout_retries_too() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cheap_empty_response_does_not_retry() -> None:
-    """A cheap provider-empty completion stays a one-call empty result."""
+async def test_cheap_empty_response_retries_once_then_fails_loudly() -> None:
+    """A cheap clean stop is retried once and then reported as a failure.
+
+    Regression for the 2026-10-26 incident: an empty body with
+    ``finish_reason='stop'`` and sparse spend. The shared 90% burnout share
+    deliberately declines this shape, so the operation must own the gate — a
+    document forge has no valid empty outcome.
+
+    The retry escalates to the flat ceiling per the spec's §4.4, matching
+    every other rescue path in this operation.
+    """
     max_tokens_seen: list[int] = []
     complete_fn = _recording_complete(
-        [_FakeCompletion(content="", finish_reason="stop", completion_tokens=12)],
+        [
+            _FakeCompletion(content="", finish_reason="stop", completion_tokens=12),
+            _FakeCompletion(content="", finish_reason="stop", completion_tokens=11),
+        ],
         max_tokens_seen=max_tokens_seen,
     )
     ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
     result = await execute(ctx)
+
     assert "Empty Response" in result.output_text
-    # Exactly one provider call — no rescue for a genuine empty response.
-    assert max_tokens_seen == [_FIRST_PASS_BUDGET]
+    assert result.status == "error", "an empty forge must never report success"
+    assert result.error_detail and "finish_reason='stop'" in result.error_detail
+    # Two calls: the first pass and one escalated retry.
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET, _FLAT_CEILING]
+
+
+@pytest.mark.asyncio
+async def test_cheap_empty_response_succeeds_on_retry() -> None:
+    """The spec's case 1: empty clean stop, low spend, then success."""
+    max_tokens_seen: list[int] = []
+    complete_fn = _recording_complete(
+        [
+            _FakeCompletion(content="", finish_reason="stop", completion_tokens=12),
+            _forged_completion(),
+        ],
+        max_tokens_seen=max_tokens_seen,
+    )
+    ctx, _captures = _make_ctx_with(complete_fn, params={"target_length": _TARGET_LENGTH})
+    result = await execute(ctx)
+
+    assert "Document forged and stored" in result.output_text
+    assert max_tokens_seen == [_FIRST_PASS_BUDGET, _FLAT_CEILING]
 
 
 @pytest.mark.asyncio
