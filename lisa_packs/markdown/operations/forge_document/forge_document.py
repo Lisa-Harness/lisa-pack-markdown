@@ -95,6 +95,12 @@ _STORAGE_FAILED_PATH = f"{_PROMPT_DIR}/forge_document_storage_failed.md"
 _CONTINUE_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_continue.md"
 _EXPAND_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_expand.md"
 _LINT_REPAIR_PROMPT_PATH = f"{_PROMPT_DIR}/forge_document_lint_repair.md"
+_UNNAMED_OVERWRITE_PATH = f"{_PROMPT_DIR}/forge_document_unnamed_overwrite.md"
+
+#: Destination used when the caller names no ``document_path``. A call that
+#: never named the path may not overwrite an existing document here — the
+#: 2026-10-26 incident clobbered exactly this file from a zero-argument call.
+_DEFAULT_DOCUMENT_PATH = "docs/forge.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
@@ -186,9 +192,11 @@ class Parameters(BaseModel):
     """
 
     document_path: str = Field(
-        default="docs/forge.md",
+        default=_DEFAULT_DOCUMENT_PATH,
         description="Relative path within the lisa-storage files sandbox where the forged document "
-        "is persisted.",
+        "is persisted. Omitting it defaults to 'docs/forge.md', but an existing document at "
+        "that default is not overwritten unless this field is set explicitly or "
+        "existing_document is supplied.",
     )
     query: str = Field(
         default="",
@@ -231,7 +239,7 @@ def _extract_document_path(params: dict[str, Any]) -> str:
     """Return the target storage path, sanitized to a safe relative form."""
     raw = str(params.get("document_path") or "").strip()
     if not raw:
-        return "docs/forge.md"
+        return _DEFAULT_DOCUMENT_PATH
     normalized = raw.replace("\\", "/").lstrip("/")
     if ".." in normalized.split("/"):
         raise RuntimeError("document_path may not contain '..' segments")
@@ -629,9 +637,7 @@ async def _call_llm_forge(
     # folds ``reasoning_content`` into its return when content is empty, so
     # gating on it would persist the model's chain-of-thought as the document.
     if not content and burnout_rescue:
-        diagnosis = model_budgets._burnout_or_truncation(
-            completion, base_max_tokens=max_tokens
-        )
+        diagnosis = model_budgets._burnout_or_truncation(completion, base_max_tokens=max_tokens)
         retry_tokens = _burnout_retry_budget(
             first_pass_max_tokens=max_tokens,
             model_def=model_def,
@@ -1172,7 +1178,14 @@ async def _load_existing_document(
     wholesale. This is the documented iteration contract, not an implicit
     overwrite.
 
-    Returns a terminal ``OperationResult`` when the read fails.
+    A document found at the *default* path, reached by a call that never named
+    ``document_path``, is refused instead: the destination was not chosen by
+    the caller, so replacing what is there would destroy content nobody asked
+    to replace (the 2026-10-26 incident). A first forge at that path still
+    proceeds — the guard is about overwriting, not about the default itself.
+
+    Returns a terminal ``OperationResult`` when the read fails or the
+    overwrite is refused.
     """
     existing_document = str(state.params.get("existing_document") or "").strip()
     if existing_document:
@@ -1184,7 +1197,31 @@ async def _load_existing_document(
         state.existing_document = await _read_existing_document(ctx, state.document_path)
     except RuntimeError as exc:
         return OperationResult(output_text=str(exc), status="error")
+    if (
+        state.document_path == _DEFAULT_DOCUMENT_PATH
+        and not _named_document_path(state)
+        and state.existing_document
+    ):
+        # A first forge at the default path is fine; replacing a document the
+        # caller never named the path of is not. Refused before any model call.
+        return OperationResult(
+            output_text=_format_template(
+                _load_text(ctx, _UNNAMED_OVERWRITE_PATH),
+                document_path=state.document_path,
+            ),
+            status="error",
+            error_detail=(
+                "refused to overwrite the default document path "
+                f"'{state.document_path}' from a call that did not name it; "
+                "pass document_path explicitly to overwrite"
+            ),
+        )
     return None
+
+
+def _named_document_path(state: _ForgeState) -> bool:
+    """Whether the caller named the destination instead of defaulting to it."""
+    return str(state.params.get("document_path") or "").strip() != ""
 
 
 def _resolve_forge_budgets(state: _ForgeState) -> None:
@@ -1709,11 +1746,13 @@ def _reject_unstated_invocation(
     forged 2,450 bytes of invented content and overwrote ``docs/forge.md``
     with no one having asked for it (the 2026-10-26 forge incident).
 
-    This is deliberately *not* an overwrite guard. Revising an existing
-    document by omitting ``existing_document`` is the documented iteration
-    contract and still works: the auto-load reads the file first. What is
-    refused is an invocation that states no intent at all, because there is
-    nothing to forge *from* and nothing the caller asked for.
+    This is deliberately *not* an overwrite guard — overwriting is handled by
+    ``_load_existing_document``, which refuses an unnamed default-path
+    replacement. Revising an existing document by omitting
+    ``existing_document`` is the documented iteration contract and still
+    works: the auto-load reads the file first. What is refused here is an
+    invocation that states no intent at all, because there is nothing to
+    forge *from* and nothing the caller asked for.
 
     Returns a terminal ``OperationResult`` when the call states no intent.
     """
@@ -1749,11 +1788,11 @@ async def execute(ctx: OperationExecutionContext) -> OperationResult:
     state, failure = await _prepare_forge(ctx)
     if failure is not None:
         return failure
-    recall_limit = int(state.params.get("limit") or state.cfg.max_recall_records)
-    state.memory_context = await _recall_memory(ctx, state.user_input, limit=recall_limit)
     failure = await _load_existing_document(ctx, state)
     if failure is not None:
         return failure
+    recall_limit = int(state.params.get("limit") or state.cfg.max_recall_records)
+    state.memory_context = await _recall_memory(ctx, state.user_input, limit=recall_limit)
     _resolve_forge_budgets(state)
     failure = await _forge_document_body(ctx, state)
     if failure is not None:

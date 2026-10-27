@@ -457,21 +457,33 @@ async def test_memory_context_passed_to_llm() -> None:
 
 @pytest.mark.asyncio
 async def test_reads_existing_document_from_storage_when_omitted() -> None:
-    """When existing_document is not supplied, the operation reads it from storage."""
+    """When existing_document is not supplied, the operation reads it from storage.
+
+    The path is named here on purpose: an unnamed call reaching an occupied
+    default path is refused rather than revised (see the default-path
+    overwrite guard tests), so naming the path is what exercises the
+    auto-load contract.
+    """
     existing = "# Existing Doc\n\nOld content.\n"
     tool_fn, captures = _make_tool_executor(stored_documents={"docs/forge.md": existing})
+    prompts: list[str] = []
 
-    async def _complete(**_kwargs: Any) -> _FakeCompletion:
+    async def _complete(**kwargs: Any) -> _FakeCompletion:
+        prompts.append(kwargs["messages"][1]["content"])
         return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
 
     ctx = _make_ctx(
+        params={"document_path": "docs/forge.md"},
         complete_fn=_complete,
         resolve_model_fn=_fake_resolve_model(),
         execute_tool_fn=tool_fn,
     )
-    await execute(ctx)
+    result = await execute(ctx)
     # The operation must have read the existing document from storage.
     assert "docs/forge.md" in captures["read_paths"]
+    # ...and handed it to the model so the forge revises rather than replaces.
+    assert result.status == "success"
+    assert prompts and "Old content." in prompts[0]
 
 
 @pytest.mark.asyncio
@@ -1564,3 +1576,159 @@ async def test_auto_load_revise_still_works() -> None:
 
     assert "Document forged and stored" in result.output_text
     assert len(captures["writes"]) == 1
+
+
+# ── Default-path overwrite guard (2026-10-26 forge incident, part II) ─────
+#
+# Same incident, second half: the zero-argument call was schema-valid, fell
+# back to the ambient turn query, and *overwrote an existing* `docs/forge.md`
+# with content nobody asked for. The ambient fallback itself is the documented
+# "serve this turn" contract and cannot be removed without breaking ~95 call
+# sites, so the guard is keyed on the destination: a call that did not name
+# `document_path` may not clobber an existing document at the default path.
+
+
+@pytest.mark.asyncio
+async def test_unnamed_default_path_overwrite_is_refused() -> None:
+    """A call that named no path may not overwrite an existing default document."""
+    original = "# Approved Runbook\n\n## Steps\n1. Reviewed by the team.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/forge.md": original})
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content="```markdown\n# Invented\n\n## Made up\n```")
+
+    ctx = _make_ctx(
+        # The ambient turn query is present — the exact incident shape.
+        query="forge a design document",
+        params={},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "error"
+    assert "docs/forge.md" in result.output_text
+    assert captures["writes"] == [], "an unnamed overwrite must not persist"
+
+
+@pytest.mark.asyncio
+async def test_unnamed_default_path_first_forge_still_writes() -> None:
+    """With no existing document, an unnamed default-path forge still succeeds."""
+    tool_fn, captures = _make_tool_executor()  # nothing stored yet
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        query="forge a runbook for restarting a stuck VM",
+        params={},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "success"
+    assert len(captures["writes"]) == 1
+    assert captures["writes"][0]["path"] == "docs/forge.md"
+
+
+@pytest.mark.asyncio
+async def test_named_default_path_overwrite_is_allowed() -> None:
+    """Naming the default path explicitly keeps the overwrite legal."""
+    original = "# Approved Runbook\n\n## Steps\n1. Reviewed by the team.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/forge.md": original})
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        query="extend the runbook with verification steps",
+        params={"document_path": "docs/forge.md"},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "success"
+    assert len(captures["writes"]) == 1
+    assert captures["writes"][0]["path"] == "docs/forge.md"
+
+
+@pytest.mark.asyncio
+async def test_unnamed_non_default_path_overwrite_is_allowed() -> None:
+    """A named non-default path is always an explicit destination."""
+    original = "# Runbook\n\n## Steps\n1. Old step.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/runbook.md": original})
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        query="add a verification step",
+        params={"document_path": "docs/runbook.md"},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "success"
+    assert len(captures["writes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_existing_document_allows_unnamed_default_overwrite() -> None:
+    """Supplying ``existing_document`` proves the caller saw the file it replaces."""
+    original = "# Approved Runbook\n\n## Steps\n1. Reviewed by the team.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/forge.md": original})
+
+    async def _complete(**_kwargs: Any) -> Any:
+        return _FakeCompletion(content=f"```markdown\n{_VALID_DOCUMENT}\n```")
+
+    ctx = _make_ctx(
+        query="extend the runbook with verification steps",
+        params={"existing_document": original},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "success"
+    assert len(captures["writes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_unnamed_default_overwrite_refusal_calls_no_model_or_recall() -> None:
+    """The refusal happens before recall and before any completion call."""
+    original = "# Approved Runbook\n\n## Steps\n1. Reviewed by the team.\n"
+    tool_fn, captures = _make_tool_executor(stored_documents={"docs/forge.md": original})
+    calls: list[dict[str, Any]] = []
+
+    async def _complete(**kwargs: Any) -> Any:  # pragma: no cover - must not run
+        calls.append(kwargs)
+        raise AssertionError("the model must not be called")
+
+    ctx = _make_ctx(
+        query="forge a design document",
+        params={},
+        complete_fn=_complete,
+        resolve_model_fn=_fake_resolve_model(),
+        execute_tool_fn=tool_fn,
+    )
+
+    result = await execute(ctx)
+
+    assert result.status == "error"
+    assert calls == []
+    assert captures["memory_query"] is None, "recall must not run for a refused overwrite"
+    # The only tool work is the existence check that produced the refusal.
+    assert captures["read_paths"] == ["docs/forge.md"]

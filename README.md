@@ -16,6 +16,12 @@ The pack turns a user instruction into a markdown document that is (a) grounded 
 - **`markdown_forge_document`** — combine user input with recalled memory context (and optionally an existing document), synthesize or revise a markdown document via an LLM, validate its structure, and persist it to `lisa-storage`.
 - **`markdown_consolidate_sources`** — consolidate multiple source documents into one coherent markdown document, preserving per-source detail (anti-abridgment). Reads every source via `lisa-storage`, injects them with per-source NL priority notes, applies map-reduce when the aggregate is large, enforces a density floor against lossy summarization, and captures OKF provenance.
 
+### Overwrite safety
+
+`markdown_forge_document` defaults to `docs/forge.md`, but a call that never named `document_path` will not replace a document that already exists there. The operation reads the destination first; if it is occupied and the caller neither named the path nor supplied `existing_document`, it returns `status="error"` before recalling memory or calling the model. The refusal is the authored `prompts/forge_document_unnamed_overwrite.md` text.
+
+Naming the path (`document_path: docs/forge.md`) is the ordinary revise contract — the existing document is read and revised rather than replaced — and any named non-default destination is unaffected.
+
 ### Truncation handling
 
 When the LLM stops mid-document, the operation issues continuation passes until the document looks complete or the continuation budget is exhausted. The decision is driven by the **provider-owned `truncated` signal** on the completion result (`ctx.host.complete(...).truncated`), not by guessing from `finish_reason` strings:
