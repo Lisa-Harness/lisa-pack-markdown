@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,28 @@ def _enabled_rules(override: str | None) -> tuple[str, ...]:
     return STRUCTURAL_RULES
 
 
+@contextlib.contextmanager
+def _preserve_root_logger() -> Iterator[None]:
+    """Restore the root logger's level and handlers after a pymarkdown scan.
+
+    ``PyMarkdownApi.scan_string`` configures logging as if it owned the
+    process: it raises the root level to WARNING and ``basicConfig`` attaches
+    a stdout ``StreamHandler``. Inside a host that silenced every INFO record
+    after the first lint and wrote log lines onto the transport's stdout.
+    """
+    root = logging.getLogger()
+    level, handlers = root.level, list(root.handlers)
+    try:
+        yield
+    finally:
+        root.setLevel(level)
+        for handler in [h for h in root.handlers if h not in handlers]:
+            root.removeHandler(handler)
+        for handler in handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+
+
 def lint_markdown(
     document: str,
     *,
@@ -144,7 +166,8 @@ def lint_markdown(
                 api.disable_rule_by_identifier(rule_id)
 
     try:
-        result = api.scan_string(document)
+        with _preserve_root_logger():
+            result = api.scan_string(document)
     except PyMarkdownApiException as exc:
         logger.warning("markdown lint: pymarkdownlnt scan raised: %s", exc)
         return []
