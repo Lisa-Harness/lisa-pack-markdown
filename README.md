@@ -88,16 +88,19 @@ The pack `lisa-pack-markdown` must be installed in the host environment.
 
 ## Configuration
 
-Budgets and behavior are resolved from `ctx.pack_config` (the session manifest's `resources.packs.configuration.markdown.<key>` block) with module-constant fallbacks. Notable keys:
+Budgets and behavior are resolved from `ctx.pack_config` (the session manifest's `resources.packs.configuration.lisa-pack-markdown.<key>` block) with module-constant fallbacks. Defaults below apply when a key is not configured.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `forge_max_completion_tokens` | 50000 | First-pass LLM token budget. |
-| `forge_max_continue_attempts` | 4 | Max continuation passes on truncation. |
-| `forge_max_document_chars` | 20000 | Hard char cap on the persisted doc. |
+| `forge_max_continue_tokens` | 50000 | LLM token budget for each continuation pass. |
+| `forge_max_continue_attempts` | 10 | Max continuation passes on truncation. |
+| `forge_max_document_chars` | 1750000 | Hard character cap for a single forged document. |
+| `forge_max_document_chars_with_sources` | 2000000 | Hard character cap for consolidated documents. |
+| `forge_per_source_max_tokens` | 50000 | Token budget for each source pass during map-reduce consolidation. |
+| `forge_tokens_per_word` | 1.5 | Words-to-tokens factor for `target_length`-driven budgeting. |
 | `forge_lint_rules` | (curated subset) | CSV of `pymarkdownlnt` rule IDs; overrides the structural default. |
 | `forge_lint_repair` | true | Gate the single lint repair pass; false persists an advisory comment. |
-| `forge_tokens_per_word` | 1.3 | Words→tokens translation factor for `target_length`-driven budgeting. |
 | `forge_outline_contract` | true | Expand passes for planned-but-missing sections when the model declares a `forge-plan`. |
 | `forge_outline_contract_attempts` | 2 | Max expansion passes per forge for the outline contract. |
 

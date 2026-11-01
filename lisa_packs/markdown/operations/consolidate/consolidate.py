@@ -111,21 +111,17 @@ _NO_ANNOTATE_PHRASES = (
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
-# ``resources.packs.configuration.markdown.<key>`` block, surfaced to the
+# ``resources.packs.configuration.lisa-pack-markdown.<key>`` block, surfaced to the
 # op at runtime as ``ctx.pack_config``. These constants are the last-resort
 # fallback when no manifest config is supplied so the op still works in a
 # bare host.
 _MAX_COMPLETION_TOKENS = 50_000
 _MAX_CONTINUE_TOKENS = _MAX_COMPLETION_TOKENS
-_MAX_CONTINUE_ATTEMPTS = 4
+_MAX_CONTINUE_ATTEMPTS = 10
 _MAX_RECALL_RECORDS = 25
-# Per-source token cap (map-reduce). A single preserve-detail section from
-# one bounded source rarely needs the full 50K; capping per-source passes
-# keeps every model call's context small enough for a local backend to
-# satisfy the preserve-detail directive without truncating. This is the
-# budget reconciliation that removes the whole-document truncation driver.
-_PER_SOURCE_MAX_TOKENS = 16_000
-_MAX_DOCUMENT_CHARS = 1_500_000
+# Per-source token cap (map-reduce).
+_PER_SOURCE_MAX_TOKENS = 50_000
+_MAX_DOCUMENT_CHARS = 2_000_000
 _MAX_QUERY_CHARS = 20_000
 # Map-reduce consolidation thresholds.
 _MAP_REDUCE_BYTE_THRESHOLD = 8_000

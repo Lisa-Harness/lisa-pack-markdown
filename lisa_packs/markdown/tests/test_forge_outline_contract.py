@@ -125,7 +125,7 @@ def _make_ctx(
 ) -> tuple[Any, dict[str, Any]]:
     """Build a wired context plus the captures dict from the fake tools.
 
-    ``pack_config`` seeds the session-manifest ``configuration.markdown``
+    ``pack_config`` seeds the session-manifest ``configuration.lisa-pack-markdown``
     block the settings resolver reads (e.g. ``forge_outline_contract``).
     """
     from kernel.models import OperationExecutionContext

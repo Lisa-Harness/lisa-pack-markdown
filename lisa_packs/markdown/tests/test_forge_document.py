@@ -22,6 +22,7 @@ from kernel.models import OperationExecutionContext, ToolResult
 from lisa_packs.markdown.operations._lint import LintIssue
 from lisa_packs.markdown.operations.forge_document.forge_document import (
     Parameters,
+    _resolve_settings,
     execute,
 )
 
@@ -269,6 +270,16 @@ def _fake_resolve_model() -> Any:
         return _FakeModel()
 
     return _resolve
+
+
+def test_pack_budget_defaults_match_documented_values() -> None:
+    settings = _resolve_settings(_make_ctx())
+
+    assert settings.max_completion_tokens == 50_000
+    assert settings.max_continue_tokens == 50_000
+    assert settings.max_continue_attempts == 10
+    assert settings.max_document_chars == 1_750_000
+    assert settings.tokens_per_word == 1.5
 
 
 # ── Operation tests ────────────────────────────────────────────────────
@@ -1381,7 +1392,7 @@ async def test_target_length_scales_max_tokens() -> None:
     await execute(ctx)
     import math
 
-    expected = min(50_000, max(512, math.ceil(500 * 1.3)))
+    expected = min(50_000, max(512, math.ceil(500 * 1.5)))
     assert calls[0]["max_tokens"] == expected
 
 
@@ -1415,7 +1426,7 @@ async def test_target_length_zero_coerced_to_default() -> None:
 
     from lisa_packs.markdown.operations.forge_document.forge_document import _DEFAULT_TARGET_WORDS
 
-    expected = min(50_000, max(512, math.ceil(_DEFAULT_TARGET_WORDS * 1.3)))
+    expected = min(50_000, max(512, math.ceil(_DEFAULT_TARGET_WORDS * 1.5)))
     assert calls[0]["max_tokens"] == expected
 
 
@@ -1424,18 +1435,19 @@ async def test_target_length_exceeds_char_cap_is_clamped() -> None:
     """A target whose char equivalent exceeds max_document_chars is clamped down."""
     _complete, calls = _fake_complete_spy()
     tool_fn, _captures = _make_tool_executor()
-    # 10000 words * ~5 chars = 50000 chars, well over the 20000 default char cap.
+    # Keep a small configured cap so the clamp is observable below the token ceiling.
     ctx = _make_ctx(
         complete_fn=_complete,
         resolve_model_fn=_fake_resolve_model(),
         execute_tool_fn=tool_fn,
         params={"target_length": 10_000},
+        pack_config={"forge_max_document_chars": 20_000},
     )
     await execute(ctx)
-    # Clamped to 20000 // 5 = 4000 words -> ceil(4000 * 1.3) = 5200 tokens.
+    # Clamped to 20000 // 5 = 4000 words -> ceil(4000 * 1.5) = 6000 tokens.
     import math
 
-    expected = min(50_000, max(512, math.ceil(4000 * 1.3)))
+    expected = min(50_000, max(512, math.ceil(4000 * 1.5)))
     assert calls[0]["max_tokens"] == expected
 
 
@@ -1487,7 +1499,7 @@ async def test_target_length_scales_continue_budget() -> None:
         params={"target_length": 500},
     )
     result = await execute(ctx)
-    # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.3) = 650.
+    # Continue budget = min(50000, first_pass*2). first_pass = ceil(500*1.5) = 750.
     assert result.output_json["truncated"] is False
     assert result.output_json["continue_attempts"] == 1
 

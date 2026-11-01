@@ -28,7 +28,10 @@ from typing import Any
 import pytest
 from kernel.models import OperationExecutionContext, ToolResult
 
-from lisa_packs.markdown.operations.consolidate.consolidate import execute
+from lisa_packs.markdown.operations.consolidate.consolidate import (
+    _resolve_settings,
+    execute,
+)
 
 _CONTENT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -439,6 +442,16 @@ def _map_reduce_pack_config() -> dict[str, Any]:
         "forge_map_reduce_byte_threshold": 0,
         "forge_map_reduce_source_threshold": 0,
     }
+
+
+def test_consolidation_budget_defaults_match_documented_values() -> None:
+    settings = _resolve_settings(_make_ctx())
+
+    assert settings.max_completion_tokens == 50_000
+    assert settings.max_continue_tokens == 50_000
+    assert settings.max_continue_attempts == 10
+    assert settings.max_document_chars == 2_000_000
+    assert settings.per_source_max_tokens == 50_000
 
 
 def _fake_resolve_model() -> Any:

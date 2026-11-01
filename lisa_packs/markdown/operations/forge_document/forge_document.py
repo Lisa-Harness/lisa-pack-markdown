@@ -104,15 +104,15 @@ _DEFAULT_DOCUMENT_PATH = "docs/forge.md"
 
 # Fallback defaults for the operation's configurable budgets. The
 # authoritative source is the session manifest's
-# ``resources.packs.configuration.markdown.<key>`` block, surfaced to the
+# ``resources.packs.configuration.lisa-pack-markdown.<key>`` block, surfaced to the
 # op at runtime as ``ctx.pack_config``. These constants are the last-resort
 # fallback when no manifest config is supplied so the op still works in a
 # bare host.
 _MAX_COMPLETION_TOKENS = 50_000
 _MAX_CONTINUE_TOKENS = _MAX_COMPLETION_TOKENS
-_MAX_CONTINUE_ATTEMPTS = 4
+_MAX_CONTINUE_ATTEMPTS = 10
 _MAX_RECALL_RECORDS = 25
-_MAX_DOCUMENT_CHARS = 20_000
+_MAX_DOCUMENT_CHARS = 1_750_000
 _MAX_QUERY_CHARS = 20_000
 
 # Phase B: target-length-driven budgeting defaults. When ``target_length`` is
@@ -121,7 +121,7 @@ _MAX_QUERY_CHARS = 20_000
 # should be and truncation becomes rare. ``None`` (the default) preserves the
 # legacy flat budget exactly — no behavior change on the default path.
 _DEFAULT_TARGET_WORDS = 1200
-_DEFAULT_TOKENS_PER_WORD = 1.3
+_DEFAULT_TOKENS_PER_WORD = 1.5
 _MIN_TARGET_WORDS = 100
 
 # Phase A: advisory lint gate defaults. ``forge_lint_rules`` overrides the

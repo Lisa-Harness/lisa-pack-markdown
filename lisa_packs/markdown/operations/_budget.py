@@ -8,10 +8,10 @@ line — how long the document should be, so mid-stream truncation becomes
 rare and the continuation machinery shrinks from a primary path to a
 safety net.
 
-This module owns the single words→tokens translation so both the
+This module owns the single words-to-tokens translation so both the
 ``markdown_forge_document`` operation and (potentially) other callers
-share one heuristic. The factor defaults to 1.3 (the standard English
-heuristic) and is overridable per-workspace via the
+share one heuristic. The factor defaults to 1.5 for this pack and is
+overridable per-workspace via the
 ``forge_tokens_per_word`` ``pack_config`` key.
 """
 
@@ -35,15 +35,15 @@ _MAX_MAX_TOKENS = 50_000
 def target_words_to_max_tokens(
     words: int,
     *,
-    tokens_per_word: float = 1.3,
+    tokens_per_word: float = 1.5,
     floor: int = _MIN_MAX_TOKENS,
     ceiling: int = _MAX_MAX_TOKENS,
 ) -> int:
     """Return a ``max_tokens`` budget for an approximate ``words`` target.
 
     ``words * tokens_per_word``, clamped to ``[floor, ceiling]`` and rounded
-    up. ``tokens_per_word`` defaults to 1.3 (English heuristic); non-English
-    content may need ~2.0 (override via ``forge_tokens_per_word``).
+    up. ``tokens_per_word`` defaults to 1.5; non-English content may need
+    ~2.0 (override via ``forge_tokens_per_word``).
     """
     if words <= 0:
         return ceiling
